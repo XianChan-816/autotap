@@ -49,19 +49,22 @@ static pid_t FTFindAppPID(void) {
     return found;
 }
 
-// 用 sandbox_get_container_for_pid 拿 App 沙盒 Caches 路径
+// 用 sandbox_container_path_for_pid 拿 App 沙盒根路径，然后拼 Caches/ 子目录
+// iOS 私有 API（libsystem_sandbox.dylib），签名：
+//   int sandbox_container_path_for_pid(pid_t pid, char *buf, size_t bufsize);
+// 返回 0 成功，buf 写入 /var/mobile/Containers/Data/Application/<UUID>/
 static NSString *FTResolveAppCaches(pid_t pid) {
     if (pid <= 0) return nil;
     char buf[PATH_MAX] = {0};
-    // sandbox_get_container_for_pid 是 iOS 私有 API，定义在 libsystem_sandbox.dylib
-    // 返回 0 成功，buf 写入 App 沙盒指定子目录路径
-    int ret = sandbox_get_container_for_pid(pid, "Caches", buf, sizeof(buf));
+    int ret = sandbox_container_path_for_pid(pid, buf, sizeof(buf));
     if (ret != 0 || buf[0] == '\0') {
-        NSLog(@"[FloatingTap] sandbox_get_container_for_pid 失败: pid=%d ret=%d", pid, ret);
+        NSLog(@"[FloatingTap] sandbox_container_path_for_pid 失败: pid=%d ret=%d", pid, ret);
         return nil;
     }
-    NSString *path = [NSString stringWithUTF8String:buf];
-    return path;
+    NSString *root = [NSString stringWithUTF8String:buf];
+    NSString *caches = [root stringByAppendingPathComponent:@"Library/Caches/"];
+    NSLog(@"[FloatingTap] App 沙盒 Caches 路径: %@", caches);
+    return caches;
 }
 
 // 收到 App 启动通知后：找 App PID → 拿沙盒路径 → 立即写心跳 + 导出
