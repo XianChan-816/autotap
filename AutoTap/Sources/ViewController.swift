@@ -42,6 +42,11 @@ final class ViewController: UIViewController {
     private let clearPointsButton = UIButton(type: .system)
     private let pointsLabel = UILabel()
 
+    // 目标 App（越狱悬浮球）
+    private let targetLabel = UILabel()
+    private let pickTargetButton = UIButton(type: .system)
+    private let enterTargetButton = UIButton(type: .system)
+
     private var longPress: UILongPressGestureRecognizer!
 
     // MARK: - 生命周期
@@ -56,9 +61,53 @@ final class ViewController: UIViewController {
         setupLongPress()
         syncUI()
         loadSavedConfig()
+        refreshTargetInfo()
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(refreshTargetInfo),
+                                               name: .targetsDidChange,
+                                               object: nil)
         // 启动即尝试连接 HID（提前暴露权限问题）
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             _ = HIDBridge.shared.connect()
+        }
+    }
+
+    @objc private func refreshTargetInfo() {
+        let targets = TargetAppManager.loadTargets()
+        if targets.isEmpty {
+            targetLabel.text = "未选择目标。点击「选择目标 App」勾选要连点的 App，进入后悬浮球自动出现。"
+            enterTargetButton.isEnabled = false
+            enterTargetButton.alpha = 0.4
+        } else {
+            let names = targets.compactMap { id in
+                TargetAppManager.installedApps().first { $0.bundleID == id }?.name
+            }
+            let display = names.isEmpty ? targets.joined(separator: "、") : names.joined(separator: "、")
+            targetLabel.text = "目标：\(display)（\(targets.count) 个）\n悬浮球只会在这些 App 内显示。"
+            enterTargetButton.isEnabled = true
+            enterTargetButton.alpha = 1
+        }
+    }
+
+    @objc private func pickTargetTapped() {
+        let picker = TargetPickerViewController()
+        let nav = UINavigationController(rootViewController: picker)
+        nav.modalPresentationStyle = .fullScreen
+        present(nav, animated: true)
+    }
+
+    @objc private func enterTargetTapped() {
+        let targets = TargetAppManager.loadTargets()
+        guard let first = targets.first else {
+            toast("请先选择目标 App")
+            return
+        }
+        // 同步连点间隔到共享配置，tweak 使用
+        TargetAppManager.saveIntervalMs(readInterval())
+        if TargetAppManager.openApp(bundleID: first) {
+            toast("已进入 \(first)，悬浮球将自动显示")
+        } else {
+            toast("打开失败：目标 App 可能未安装或权限不足")
         }
     }
 
@@ -163,6 +212,26 @@ final class ViewController: UIViewController {
         continuousRow.spacing = 8
         continuousRow.alignment = .center
 
+        // ---- 目标 App（越狱悬浮球） ----
+        targetLabel.font = .systemFont(ofSize: 13)
+        targetLabel.textColor = .secondaryLabel
+        targetLabel.numberOfLines = 0
+
+        pickTargetButton.setTitle("选择目标 App…", for: .normal)
+        pickTargetButton.addTarget(self, action: #selector(pickTargetTapped), for: .touchUpInside)
+
+        enterTargetButton.setTitle("进入目标 App（显示悬浮球）", for: .normal)
+        enterTargetButton.setTitleColor(.white, for: .normal)
+        enterTargetButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+        enterTargetButton.backgroundColor = .systemIndigo
+        enterTargetButton.layer.cornerRadius = 10
+        enterTargetButton.addTarget(self, action: #selector(enterTargetTapped), for: .touchUpInside)
+
+        let targetRow = UIStackView(arrangedSubviews: [pickTargetButton, enterTargetButton])
+        targetRow.axis = .horizontal
+        targetRow.spacing = 10
+        targetRow.distribution = .fillEqually
+
         // 状态
         statusLabel.text = "未运行"
         statusLabel.textAlignment = .center
@@ -197,6 +266,9 @@ final class ViewController: UIViewController {
             orientationControl,
             makeSectionTitle("点击点位"),
             pointsRow,
+            makeSectionTitle("越狱悬浮球（目标 App）"),
+            targetLabel,
+            targetRow,
             makeSectionTitle("运行方式"),
             continuousRow,
             statusLabel,

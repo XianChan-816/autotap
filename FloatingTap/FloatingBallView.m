@@ -13,6 +13,11 @@
 #import "HIDInject.h"
 #import <objc/runtime.h>
 
+// 共享配置（AutoTap App 与 tweak 共同读写；rootless 下系统偏好目录不变）
+NSString *const kFloatingTapConfigPath = @"/var/mobile/Library/Preferences/FloatingTap.plist";
+NSString *const kFTKeyTargets   = @"Targets";
+NSString *const kFTKeyIntervalMs= @"IntervalMs";
+
 // 等价 systemRed / systemBlue 的显式 RGB（不依赖 SDK 缺失的 system 颜色属性）
 static UIColor *FTTapColor(BOOL clicking) {
     return clicking
@@ -262,9 +267,63 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 }
 
 - (double)clickInterval {
+    // 优先读共享配置（AutoTap App 设置），其次回退 NSUserDefaults
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kFloatingTapConfigPath];
+    id v = cfg[kFTKeyIntervalMs];
+    if ([v respondsToSelector:@selector(doubleValue)]) {
+        double ms = [v doubleValue];
+        if (ms >= 1 && ms <= 60000) return ms;
+    }
     NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
     double ms = [def doubleForKey:kPrefsIntervalMs];
     return (ms >= 1 && ms <= 60000) ? ms : 200.0;
+}
+
+// MARK: - 前台 App 检测 / 显隐控制
+
+/// 读取共享配置中的目标 App 列表
+- (NSArray<NSString *> *)loadTargets {
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kFloatingTapConfigPath];
+    NSArray *targets = cfg[kFTKeyTargets];
+    return [targets isKindOfClass:[NSArray class]] ? targets : @[];
+}
+
+/// 获取当前前台 App 的 bundleIdentifier（SpringBoard 私有 API，KVC 动态访问）
+- (NSString *)frontmostBundleID {
+    // 方式 1：SBApplicationController.frontmostApplication
+    Class sbClass = NSClassFromString(@"SBApplicationController");
+    if (sbClass) {
+        id controller = [sbClass valueForKey:@"sharedInstance"];
+        id app = [controller valueForKey:@"frontmostApplication"];
+        NSString *bid = [app valueForKey:@"bundleIdentifier"];
+        if (bid.length > 0) return bid;
+    }
+    // 方式 2：UIApplication.activeApplications 取第一个
+    id active = [[UIApplication sharedApplication] valueForKey:@"activeApplications"];
+    if ([active isKindOfClass:[NSArray class]] && [active count] > 0) {
+        id app = [active firstObject];
+        NSString *bid = [app valueForKey:@"bundleIdentifier"];
+        if (bid.length > 0) return bid;
+    }
+    return nil;
+}
+
+- (void)updateVisibilityForFrontmostApp {
+    NSString *frontID = [self frontmostBundleID];
+    NSArray *targets = [self loadTargets];
+    BOOL shouldShow = (frontID.length > 0 && [targets containsObject:frontID]);
+
+    if (shouldShow) {
+        if (!self.ballWindow) {
+            [self present];
+            NSLog(@"[FloatingTap] 目标 App %@ 在前台，显示悬浮球", frontID);
+        }
+    } else {
+        if (self.ballWindow) {
+            [self dismiss];
+            NSLog(@"[FloatingTap] 离开目标 App，隐藏悬浮球");
+        }
+    }
 }
 
 - (void)injectClick {

@@ -10,6 +10,13 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// 共享配置文件路径（AutoTap App 与 tweak 共同读写）
+extern NSString *const kFloatingTapConfigPath;
+
+/// 共享配置键
+extern NSString *const kFTKeyTargets;   // NSArray<NSString *>：目标 App bundleID 列表
+extern NSString *const kFTKeyIntervalMs;// NSNumber：连点间隔（毫秒）
+
 @interface FloatingBallView : UIView
 
 + (instancetype)shared;
@@ -19,6 +26,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// 移除悬浮球
 - (void)dismiss;
+
+/// 依据前台 App 是否在目标列表，自动显示/隐藏悬浮球（由 Tweak.xm 定时调用）
+- (void)updateVisibilityForFrontmostApp;
 
 @end
 

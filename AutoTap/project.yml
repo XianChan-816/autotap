@@ -44,6 +44,8 @@ targets:
         ITSAppUsesNonExemptEncryption: false
     entitlements:
       path: Resources/AutoTap.entitlements
+    dependencies:
+      - framework: MobileCoreServices.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.autotap.app
