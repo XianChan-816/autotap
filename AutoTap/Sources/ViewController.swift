@@ -3,11 +3,11 @@
 //  AutoTap
 //
 //  界面功能：
-//  - X / Y 坐标输入（归一化 0~1，相对所选屏幕方向）
-//  - 点击间隔（毫秒）输入
-//  - 屏幕方向选择（竖屏 / 横屏Home右 / 横屏Home左）
-//  - 触摸取点：点击画布直接填入坐标并显示标记
-//  - 长按"开始点击"按钮触发，松手停止；连续模式锁死到按音量键或回 App 停止
+//  - 可拖动圆圈标记点击位置（画布上实时显示，拖动即取点）
+//  - 滑块 / 捏合调节圆圈大小（视觉辅助，点击点为圆心）
+//  - 长按圆圈 → 触发点击；松开 → 停止（连续模式切后台用音量键停）
+//  - X / Y 坐标输入、间隔毫秒、屏幕方向、多点循环
+//  - 长按按钮触发（备用）
 //
 
 import UIKit
@@ -18,7 +18,6 @@ final class ViewController: UIViewController {
     private var points: [TapPoint] = [TapPoint(x: 0.5, y: 0.5)]
     private var currentOrientation: ScreenOrientation = .portrait
     private var continuousMode = false
-    private var previewView: UIView?
 
     // MARK: - UI 组件
     private let scrollView = UIScrollView()
@@ -26,6 +25,7 @@ final class ViewController: UIViewController {
 
     private let canvas = UIView()
     private let canvasLabel = UILabel()
+    private let clickCircle = ClickCircleView()
 
     private let xField = UITextField()
     private let yField = UITextField()
@@ -36,6 +36,7 @@ final class ViewController: UIViewController {
     private let countLabel = UILabel()
     private let triggerButton = UIButton(type: .custom)
     private let hintLabel = UILabel()
+    private let sizeSlider = UISlider()
 
     private let addPointButton = UIButton(type: .system)
     private let clearPointsButton = UIButton(type: .system)
@@ -50,6 +51,7 @@ final class ViewController: UIViewController {
         view.backgroundColor = .systemBackground
         title = "AutoTap"
         setupUI()
+        setupCircleCallbacks()
         setupCallbacks()
         setupLongPress()
         syncUI()
@@ -62,7 +64,7 @@ final class ViewController: UIViewController {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        updatePreviewDot()
+        updateCirclePosition()
     }
 
     // MARK: - UI 搭建
@@ -85,7 +87,7 @@ final class ViewController: UIViewController {
             contentView.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor)
         ])
 
-        // ---- 取点画布 ----
+        // ---- 取点画布（圆圈叠加层） ----
         canvas.backgroundColor = UIColor.secondarySystemBackground
         canvas.layer.cornerRadius = 12
         canvas.clipsToBounds = true
@@ -94,21 +96,17 @@ final class ViewController: UIViewController {
         let tapOnCanvas = UITapGestureRecognizer(target: self, action: #selector(canvasTapped(_:)))
         canvas.addGestureRecognizer(tapOnCanvas)
 
-        canvasLabel.text = "点击此处取点（显示 0~1 归一化坐标）"
+        canvasLabel.text = "拖动圆圈调整点击位置，长按圆圈开始/停止"
         canvasLabel.textColor = .secondaryLabel
         canvasLabel.font = .systemFont(ofSize: 13)
         canvasLabel.textAlignment = .center
+        canvasLabel.numberOfLines = 0
         canvasLabel.translatesAutoresizingMaskIntoConstraints = false
         canvas.addSubview(canvasLabel)
 
-        // 预览点
-        previewView = UIView(frame: CGRect(x: 0, y: 0, width: 20, height: 20))
-        previewView?.backgroundColor = .systemRed
-        previewView?.layer.cornerRadius = 10
-        previewView?.layer.borderColor = UIColor.white.cgColor
-        previewView?.layer.borderWidth = 2
-        previewView?.isHidden = true
-        if let previewView { canvas.addSubview(previewView) }
+        // 可交互圆圈（圆心 = 点击位置）
+        canvas.addSubview(clickCircle)
+        clickCircle.setNormalizedPosition(x: 0.5, y: 0.5, in: canvas)
 
         // ---- 输入区 ----
         let xLabel = makeLabel("X (0~1)")
@@ -129,6 +127,16 @@ final class ViewController: UIViewController {
         inputRow.axis = .horizontal
         inputRow.spacing = 10
         inputRow.distribution = .fillEqually
+
+        // ---- 圆圈大小 ----
+        sizeSlider.minimumValue = 24
+        sizeSlider.maximumValue = 160
+        sizeSlider.value = Float(clickCircle.diameter)
+        sizeSlider.addTarget(self, action: #selector(sizeSliderChanged(_:)), for: .valueChanged)
+        let sizeRow = UIStackView(arrangedSubviews: [makeLabel("圆圈大小"), sizeSlider])
+        sizeRow.axis = .horizontal
+        sizeRow.spacing = 10
+        sizeRow.alignment = .center
 
         // 方向选择
         orientationControl.selectedSegmentIndex = ScreenOrientation.portrait.rawValue
@@ -165,7 +173,7 @@ final class ViewController: UIViewController {
         countLabel.font = .monospacedDigitSystemFont(ofSize: 15, weight: .regular)
         countLabel.textColor = .secondaryLabel
 
-        // 长按触发按钮
+        // 长按触发按钮（备用）
         triggerButton.setTitle("长按开始点击", for: .normal)
         triggerButton.setTitleColor(.white, for: .normal)
         triggerButton.titleLabel?.font = .systemFont(ofSize: 18, weight: .bold)
@@ -174,7 +182,7 @@ final class ViewController: UIViewController {
         triggerButton.translatesAutoresizingMaskIntoConstraints = false
         triggerButton.heightAnchor.constraint(equalToConstant: 64).isActive = true
 
-        hintLabel.text = "按住开始，松手停止。连续模式下松手不停止，切到目标 App 后按音量键停止。"
+        hintLabel.text = "拖动圆圈调位置，长按圆圈开始点击、松开停止。\n连续模式：长按圆圈启动后切到目标 App，按音量键停止。"
         hintLabel.font = .systemFont(ofSize: 12)
         hintLabel.textColor = .secondaryLabel
         hintLabel.numberOfLines = 0
@@ -183,6 +191,7 @@ final class ViewController: UIViewController {
         // ---- 组装 ----
         let stack = UIStackView(arrangedSubviews: [
             canvas,
+            sizeRow,
             inputRow,
             makeSectionTitle("屏幕方向"),
             orientationControl,
@@ -245,6 +254,42 @@ final class ViewController: UIViewController {
         return l
     }
 
+    // MARK: - 圆圈交互
+
+    private func setupCircleCallbacks() {
+        // 拖动圆圈 → 更新坐标与第一个点击点
+        clickCircle.onPositionChanged = { [weak self] x, y in
+            guard let self else { return }
+            self.xField.text = String(format: "%.3f", Double(x))
+            self.yField.text = String(format: "%.3f", Double(y))
+            if !self.points.isEmpty {
+                self.points[0] = TapPoint(x: x, y: y)
+            }
+            self.updatePointsLabel()
+        }
+        // 长按圆圈 → 开始点击
+        clickCircle.onLongPressBegan = { [weak self] in
+            _ = self?.validateAndStart()
+        }
+        // 松开 → 停止（连续模式除外）
+        clickCircle.onLongPressEnded = { [weak self] in
+            guard let self else { return }
+            if ClickerEngine.shared.state == .running && !self.continuousMode {
+                ClickerEngine.shared.stop()
+            }
+            self.updateButtonUI()
+        }
+        // 捏合 → 同步滑块
+        clickCircle.onPinchChanged = { [weak self] d in
+            self?.sizeSlider.value = Float(d)
+        }
+    }
+
+    @objc private func sizeSliderChanged(_ s: UISlider) {
+        clickCircle.diameter = CGFloat(s.value)
+        saveConfig()
+    }
+
     // MARK: - 交互
 
     private func setupLongPress() {
@@ -259,7 +304,7 @@ final class ViewController: UIViewController {
             if validateAndStart() {
                 UIView.animate(withDuration: 0.15) {
                     self.triggerButton.backgroundColor = .systemRed
-                    self.triggerButton.setTitle( self.continuousMode ? "运行中（音量键停止）" : "运行中…按住", for: .normal)
+                    self.triggerButton.setTitle(self.continuousMode ? "运行中（音量键停止）" : "运行中…按住", for: .normal)
                 }
             }
         case .ended, .cancelled, .failed:
@@ -283,11 +328,11 @@ final class ViewController: UIViewController {
         let ny = CGFloat(p.y) / h
         xField.text = String(format: "%.3f", Double(nx))
         yField.text = String(format: "%.3f", Double(ny))
-        // 替换第一个点
+        // 替换第一个点并移动圆圈
         if points.count == 1 {
             points[0] = TapPoint(x: nx, y: ny)
         }
-        updatePreviewDot()
+        updateCirclePosition()
         updatePointsLabel()
     }
 
@@ -298,7 +343,6 @@ final class ViewController: UIViewController {
         }
         points.append(TapPoint(x: x, y: y))
         updatePointsLabel()
-        updatePreviewDot()
     }
 
     @objc private func clearPointsTapped() {
@@ -306,12 +350,11 @@ final class ViewController: UIViewController {
         xField.text = "0.5"
         yField.text = "0.5"
         updatePointsLabel()
-        updatePreviewDot()
+        updateCirclePosition()
     }
 
     @objc private func orientationChanged() {
         currentOrientation = ScreenOrientation(rawValue: orientationControl.selectedSegmentIndex) ?? .portrait
-        updatePreviewDot()
         saveConfig()
     }
 
@@ -385,6 +428,7 @@ final class ViewController: UIViewController {
                 self.statusLabel.text = "运行中"
                 self.statusLabel.textColor = .systemGreen
             }
+            self.clickCircle.isActive = (state == .running)
             self.updateButtonUI()
             self.updateCount()
         }
@@ -403,19 +447,12 @@ final class ViewController: UIViewController {
         triggerButton.setTitle(running ? (continuousMode ? "运行中（音量键停止）" : "运行中…按住") : "长按开始点击", for: .normal)
     }
 
-    private func updatePreviewDot() {
-        guard let previewView else { return }
+    /// 将圆圈移动到第一个点击点位置
+    private func updateCirclePosition() {
         let w = canvas.bounds.width
         let h = canvas.bounds.height
-        guard w > 0, h > 0 else { return }
-
-        // 画布始终以当前方向展示，取第一个点
-        guard let first = points.first else {
-            previewView.isHidden = true
-            return
-        }
-        previewView.isHidden = false
-        previewView.center = CGPoint(x: first.x * w, y: first.y * h)
+        guard w > 0, h > 0, let first = points.first else { return }
+        clickCircle.setNormalizedPosition(x: first.x, y: first.y, in: canvas)
     }
 
     private func updatePointsLabel() {
@@ -425,8 +462,9 @@ final class ViewController: UIViewController {
     private func syncUI() {
         orientationControl.selectedSegmentIndex = currentOrientation.rawValue
         continuousSwitch.isOn = continuousMode
+        sizeSlider.value = Float(clickCircle.diameter)
         updatePointsLabel()
-        updatePreviewDot()
+        updateCirclePosition()
     }
 
     private func toast(_ msg: String) {
@@ -443,6 +481,7 @@ final class ViewController: UIViewController {
         UserDefaults.standard.set(intervalField.text ?? "", forKey: "cfg.interval")
         UserDefaults.standard.set(currentOrientation.rawValue, forKey: "cfg.orientation")
         UserDefaults.standard.set(continuousMode, forKey: "cfg.continuous")
+        UserDefaults.standard.set(Double(clickCircle.diameter), forKey: "cfg.circleSize")
     }
 
     private func loadSavedConfig() {
@@ -452,6 +491,8 @@ final class ViewController: UIViewController {
         if let i = d.string(forKey: "cfg.interval"), !i.isEmpty { intervalField.text = i }
         currentOrientation = ScreenOrientation(rawValue: d.integer(forKey: "cfg.orientation")) ?? .portrait
         continuousMode = d.bool(forKey: "cfg.continuous")
+        let size = d.double(forKey: "cfg.circleSize")
+        if size >= 24, size <= 160 { clickCircle.diameter = CGFloat(size) }
         syncUI()
     }
 }
@@ -464,7 +505,7 @@ extension ViewController: UITextFieldDelegate {
         if textField == xField || textField == yField {
             if let (x, y) = readXY() {
                 points[0] = TapPoint(x: x, y: y)
-                updatePreviewDot()
+                updateCirclePosition()
             }
         }
     }
