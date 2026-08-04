@@ -21,7 +21,17 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang ldid dpkg-dev fakeroot libc6-dev libplist-dev git-lfs
+          sudo apt-get install -y \
+            clang dpkg-dev fakeroot libc6-dev libplist-dev make libssl-dev
+
+      # Ubuntu 官方源没有 ldid 包，从源码编译（Theos 签名工具）
+      - name: Install ldid from source
+        run: |
+          git clone --depth 1 https://github.com/theos/ldid.git /tmp/ldid-src
+          cd /tmp/ldid-src
+          make -j2
+          sudo cp ldid /usr/local/bin/ldid
+          ldid 2>&1 | head -1 || true
 
       - name: Clone Theos
         run: |
