@@ -53,13 +53,14 @@ jobs:
             echo "theos: fetched via tarball (no submodules)"
           }
 
-      - name: Download iOS 16.4 SDK
+      - name: Download iOS SDK (git-lfs)
         run: |
+          sudo apt-get install -y git-lfs
           mkdir -p $HOME/theos/sdks
-          curl -sL \
-            https://raw.githubusercontent.com/theos/sdks/master/iPhoneOS16.4.sdk.zip \
-            -o /tmp/sdk.zip
-          unzip -q -o /tmp/sdk.zip -d $HOME/theos/sdks
+          git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks
+          cd $HOME/sdks
+          git lfs pull --include "iPhoneOS16.4.sdk.zip"
+          unzip -q -o iPhoneOS16.4.sdk.zip -d $HOME/theos/sdks
           ls $HOME/theos/sdks
 
       - name: Build .deb
