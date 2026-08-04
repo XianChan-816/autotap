@@ -1,0 +1,50 @@
+# 云端构建 FloatingTap 越狱 tweak（.deb，rootless arm64e）
+#
+# 无需 Mac：Ubuntu runner + Theos 交叉编译。
+# 产出 FloatingTap.deb，Sileo/Zebra 或 Filza+dpkg 安装（Dopamine 越狱环境）。
+
+name: Build FloatingTap Tweak
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["FloatingTap/**"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang ldid dpkg-dev fakeroot libc6-dev libplist-dev git-lfs
+
+      - name: Clone Theos
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git $HOME/theos
+
+      - name: Download iOS 16.4 SDK
+        run: |
+          mkdir -p $HOME/theos/sdks
+          curl -sL \
+            https://raw.githubusercontent.com/theos/sdks/master/iPhoneOS16.4.sdk.zip \
+            -o /tmp/sdk.zip
+          unzip -q -o /tmp/sdk.zip -d $HOME/theos/sdks
+          ls $HOME/theos/sdks
+
+      - name: Build .deb
+        run: |
+          export THEOS=$HOME/theos
+          cd FloatingTap
+          make clean package FINALPACKAGE=1
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: FloatingTap.deb
+          path: FloatingTap/packages/*.deb
+          if-no-files-found: error

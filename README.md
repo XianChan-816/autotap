@@ -107,3 +107,25 @@ A：确认 Info.plist 的 `UIBackgroundModes` 包含 `audio`，且"连续模式"
 
 **Q：间隔 1ms 太快没反应？**
 A：部分游戏有最低输入间隔限制；建议从 50~200ms 起步测试。
+
+---
+
+# 悬浮球版（越狱 tweak）
+
+> AutoTap App 的圆圈只能在自己界面里显示。若要在**任意 App（游戏）上看到可交互悬浮球**，
+> 需要越狱环境，使用 `FloatingTap/` 目录的 tweak 工程：
+>
+> - 注入 SpringBoard，悬浮球全局显示，任意 App 上可见可操作
+> - 拖动调位置、捏合调大小、**长按悬浮球触发点击 / 松手停止**
+> - 点击位置 = 悬浮球圆心，点击注入复用 IOHIDEvent 方案（越狱环境权限完整）
+> - 配置（位置/大小/间隔）保存在 `FloatingTap.intervalMs` 等 NSUserDefaults 键
+
+**构建**（无需 Mac）：推送到 GitHub 自动触发 **Build FloatingTap Tweak** workflow，
+在 Artifacts 下载 `FloatingTap.deb`。
+
+**安装**（Dopamine 越狱）：把 .deb 传到 iPad → Sileo 里点"+ 添加本地包"导入，
+或 Filza 打开 .deb 选择"安装" → 重启 SpringBoard（sbreload）生效。
+
+**调整点击间隔**：默认 200ms。间隔与悬浮球位置/大小保存在 SpringBoard 进程的
+NSUserDefaults（键 `FloatingTap.intervalMs` 等，见 `FloatingBallView.m`）。
+v1 暂未做设置界面，后续版本会增加悬浮球菜单设置；当前可改源码默认值后重编。
