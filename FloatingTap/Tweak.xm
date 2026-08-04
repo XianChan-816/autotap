@@ -13,16 +13,25 @@
 #import "FloatingBallView.h"
 
 %ctor {
-    // SpringBoard 完全启动后再启动监控（3 秒延迟，避免启动期冲突）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+    // SpringBoard 完全启动后再启动监控（8 秒延迟，避免启动期 KVC 私有 API 导致 SB 崩溃）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.5
                                                           repeats:YES
                                                             block:^(NSTimer *t) {
-            [[FloatingBallView shared] updateVisibilityForFrontmostApp];
+            // 整个轮询用 @try/@catch 包裹，KVC 抛异常不会拖死 SpringBoard
+            @try {
+                [[FloatingBallView shared] updateVisibilityForFrontmostApp];
+            } @catch (NSException *ex) {
+                NSLog(@"[FloatingTap] 轮询异常: %@", ex);
+            }
         }];
         [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
-        [[FloatingBallView shared] updateVisibilityForFrontmostApp];
+        @try {
+            [[FloatingBallView shared] updateVisibilityForFrontmostApp];
+        } @catch (NSException *ex) {
+            NSLog(@"[FloatingTap] 启动首检异常: %@", ex);
+        }
         NSLog(@"[FloatingTap] 前台 App 监控已启动（0.5s 轮询）");
     });
 }

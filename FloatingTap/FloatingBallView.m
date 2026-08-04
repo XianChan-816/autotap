@@ -290,39 +290,42 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 
 /// 获取当前前台 App 的 bundleIdentifier（SpringBoard 私有 API，KVC 动态访问）
 - (NSString *)frontmostBundleID {
-    // 方式 1：SBApplicationController.frontmostApplication
-    Class sbClass = NSClassFromString(@"SBApplicationController");
-    if (sbClass) {
+    // 仅使用 SBApplicationController.frontmostApplication（SpringBoard 进程内可用、稳定）
+    // 不再回退到 UIApplication.sharedApplication（启动早期调用容易崩 SB）
+    @try {
+        Class sbClass = NSClassFromString(@"SBApplicationController");
+        if (!sbClass) return nil;
         id controller = [sbClass valueForKey:@"sharedInstance"];
+        if (!controller) return nil;
         id app = [controller valueForKey:@"frontmostApplication"];
+        if (!app) return nil;
         NSString *bid = [app valueForKey:@"bundleIdentifier"];
-        if (bid.length > 0) return bid;
-    }
-    // 方式 2：UIApplication.activeApplications 取第一个
-    id active = [[UIApplication sharedApplication] valueForKey:@"activeApplications"];
-    if ([active isKindOfClass:[NSArray class]] && [active count] > 0) {
-        id app = [active firstObject];
-        NSString *bid = [app valueForKey:@"bundleIdentifier"];
-        if (bid.length > 0) return bid;
+        if ([bid isKindOfClass:[NSString class]] && bid.length > 0) return bid;
+    } @catch (NSException *ex) {
+        NSLog(@"[FloatingTap] frontmostBundleID 异常: %@", ex);
     }
     return nil;
 }
 
 - (void)updateVisibilityForFrontmostApp {
-    NSString *frontID = [self frontmostBundleID];
-    NSArray *targets = [self loadTargets];
-    BOOL shouldShow = (frontID.length > 0 && [targets containsObject:frontID]);
+    // 整个方法 try/catch 保护：SpringBoard 启动期/异常态 KVC 抛异常也不会拖死 SB
+    @try {
+        NSString *frontID = [self frontmostBundleID];
+        NSArray *targets = [self loadTargets];
+        BOOL shouldShow = (frontID.length > 0 && [targets containsObject:frontID]);
 
-    if (shouldShow) {
-        if (!self.ballWindow) {
-            [self present];
-            NSLog(@"[FloatingTap] 目标 App %@ 在前台，显示悬浮球", frontID);
+        if (shouldShow) {
+            if (!self.ballWindow) {
+                [self present];
+                NSLog(@"[FloatingTap] 目标 App %@ 在前台，显示悬浮球", frontID);
+            }
+        } else {
+            if (self.ballWindow) {
+                [self dismiss];
+            }
         }
-    } else {
-        if (self.ballWindow) {
-            [self dismiss];
-            NSLog(@"[FloatingTap] 离开目标 App，隐藏悬浮球");
-        }
+    } @catch (NSException *ex) {
+        NSLog(@"[FloatingTap] updateVisibility 异常: %@", ex);
     }
 }
 
