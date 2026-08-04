@@ -4,9 +4,9 @@
 //
 //  实现：悬浮球 window、拖动/捏合/长按手势、点击注入引擎、配置持久化。
 //
-//  注入穿透说明：悬浮球占据点击点，若悬浮球 window 处于交互状态会拦截注入的
-//  系统触摸。因此每次注入前临时关闭 window 交互（毫秒级），让新触摸穿透到
-//  下层 App，注入完成立即恢复。用户按住的触摸序列不受影响。
+//  穿透说明：悬浮球 window 全屏透明，用 FTPassthroughView 的 hitTest 实现
+//  「空白区域穿透」——只有球本体接收手势，其余触摸原样交给下层 App/游戏。
+//  注入的 HID 事件走系统事件管线，不经由 window 命中测试，无需开关交互。
 //
 
 #import "FloatingBallView.h"
@@ -19,6 +19,16 @@ static UIColor *FTTapColor(BOOL clicking) {
         ? [UIColor colorWithRed:1.0 green:0.231 blue:0.188 alpha:1.0]   // ~systemRed
         : [UIColor colorWithRed:0.0 green:0.478 blue:1.0   alpha:1.0];  // ~systemBlue
 }
+
+// 全屏透明容器：空白区域把触摸穿透给下层 App，只有悬浮球自身接收手势
+@interface FTPassthroughView : UIView
+@end
+@implementation FTPassthroughView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = [super hitTest:point withEvent:event];
+    return (hit == self) ? nil : hit; // 命中自己=空白区，放行给下层
+}
+@end
 
 static NSString *const kPrefsBallX      = @"FloatingTap.ballX";
 static NSString *const kPrefsBallY      = @"FloatingTap.ballY";
@@ -68,13 +78,15 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
     window.userInteractionEnabled = YES;
 
     UIViewController *rootVC = [UIViewController new];
-    rootVC.view.backgroundColor = [UIColor clearColor];
+    FTPassthroughView *container = [[FTPassthroughView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    container.backgroundColor = [UIColor clearColor];
+    rootVC.view = container;
     window.rootViewController = rootVC;
-    [window makeKeyAndVisible];
+    [window setHidden:NO]; // 不抢 keyWindow，避免干扰下层 App 的输入焦点
 
     // 悬浮球挂到 rootVC.view（避免被 SpringBoard 普通 window 遮挡）
-    [rootVC.view addSubview:self];
-    [rootVC.view bringSubviewToFront:self];
+    [container addSubview:self];
+    [container bringSubviewToFront:self];
 
     self.ballWindow = window;
 
@@ -126,6 +138,16 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 
     UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(handlePinch:)];
     [self addGestureRecognizer:pinch];
+
+    // 双击：关闭悬浮球（不再显示；想恢复时 sbreload 重载即可）
+    UITapGestureRecognizer *doubleTap =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleDoubleTap:)];
+    doubleTap.numberOfTapsRequired = 2;
+    [self addGestureRecognizer:doubleTap];
+}
+
+- (void)handleDoubleTap:(UITapGestureRecognizer *)g {
+    [self dismiss];
 }
 
 - (void)updateAppearance {
@@ -255,12 +277,8 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
     tap.normalizedX = x;
     tap.normalizedY = y;
 
-    // 主线程临时关闭 window 交互，让注入触摸穿透到下层 App
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.ballWindow.userInteractionEnabled = NO;
-        [[HIDInject shared] tapAt:tap];
-        self.ballWindow.userInteractionEnabled = YES;
-    });
+    // 直接注入 HID 事件（穿透已由 FTPassthroughView 保证，无需开关 window）
+    [[HIDInject shared] tapAt:tap];
 }
 
 // MARK: - 持久化
