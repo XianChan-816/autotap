@@ -138,7 +138,10 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 
     UILongPressGestureRecognizer *longPress =
         [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleLongPress:)];
-    longPress.minimumPressDuration = 0.35;
+    // 0.15s 即触发（手指一按住就开连点），allowableMovement 放宽到 30pt
+    // 避免按住时手指自然抖动被误判为取消，导致连点意外停止
+    longPress.minimumPressDuration = 0.15;
+    longPress.allowableMovement = 30;
     [self addGestureRecognizer:longPress];
 
     UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(handlePinch:)];
@@ -209,6 +212,12 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
         c.y = MIN(MAX(c.y, r), MAX(r, ss.height - r));
         self.center = c;
         [self persistPosition];
+    } else if (g.state == UIGestureRecognizerStateEnded ||
+               g.state == UIGestureRecognizerStateCancelled ||
+               g.state == UIGestureRecognizerStateFailed) {
+        // 拖动结束时也强制停止连点：防止 UIPan 抢走触摸后
+        // UILongPress 的 Ended 不派发，导致 stopClicking 永不调用而一直触发
+        [self stopClicking];
     }
 }
 
