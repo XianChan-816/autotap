@@ -1,8 +1,10 @@
 name: AutoTap
 options:
   bundleIdPrefix: com.autotap
-  # 固定生成 Xcode 15 兼容的工程格式，避免最新 xcodegen 输出 objectVersion 77
-  # （Xcode 16+ 格式）导致旧版 Xcode 无法打开
+  # 显式指定 Xcode 15 工程格式（objectVersion 60）。最新版 xcodegen 默认输出
+  # objectVersion 77（Xcode 16+ 格式），Xcode 15 无法打开；xcodeVersion 选项
+  # 在新版中会被忽略，必须用 objectVersion 强制。
+  objectVersion: 60
   xcodeVersion: "15.0"
   deploymentTarget:
     iOS: "14.0"
