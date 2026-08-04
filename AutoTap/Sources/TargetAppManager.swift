@@ -64,8 +64,8 @@ enum TargetAppManager {
     /// 枚举所有已安装 App（含系统 App，可按需过滤），按显示名排序
     static func installedApps(includeSystem: Bool = false) -> [AppInfo] {
         if let cached = cachedApps { return cached }
-        let workspace = LSApplicationWorkspace.defaultWorkspace()
-        let apps = workspace.allApplications() ?? []
+        // defaultWorkspace() 在 Swift 3+ 被重命名为 default()，返回 Self!（隐式解包可选）
+        let apps = LSApplicationWorkspace.default()?.allApplications() ?? []
         var result: [AppInfo] = []
 
         for proxy in apps {
@@ -86,7 +86,6 @@ enum TargetAppManager {
     /// 通过 LSApplicationWorkspace 打开目标 App
     @discardableResult
     static func openApp(bundleID: String) -> Bool {
-        let workspace = LSApplicationWorkspace.defaultWorkspace()
-        return workspace.openApplication(withBundleID: bundleID)
+        return LSApplicationWorkspace.default()?.openApplication(withBundleID: bundleID) ?? false
     }
 }
