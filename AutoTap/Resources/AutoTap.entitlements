@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 平台应用标记（TrollStore 注入 / 越狱替身证书会带上） -->
+	<key>platform-application</key>
+	<true/>
+	<!-- 关闭沙盒：注入 HID 事件必需（TrollStore / 越狱环境自动生效） -->
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+	<!-- 允许连接 HID 系统服务（注入全局触摸事件的核心权限） -->
+	<key>com.apple.hid.system.server-access</key>
+	<true/>
+	<!-- 允许事件派发到系统服务 -->
+	<key>com.apple.private.hid.client.event-dispatch</key>
+	<true/>
+	<!-- 通过音量键监听急停时使用 -->
+	<key>com.apple.springboard.volume-events</key>
+	<true/>
+</dict>
+</plist>

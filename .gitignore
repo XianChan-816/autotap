@@ -1,0 +1,12 @@
+# XcodeGen 自动生成，不入库
+AutoTap.xcodeproj/
+
+# 构建产物
+build/
+DerivedData/
+
+# macOS
+.DS_Store
+
+# WorkBuddy 本地工作数据（不入库）
+.workbuddy/

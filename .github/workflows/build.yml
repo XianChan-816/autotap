@@ -1,0 +1,55 @@
+# 云端构建无签名 IPA（无需本地 Mac）
+#
+# 把本仓库推到 GitHub，在 Actions 页面手动触发 "Build IPA"，
+# 几分钟后在 Artifacts 里下载 AutoTap.ipa，用 TrollStore 安装。
+#
+# 注意：由于使用私有 IOHIDEvent 接口 + 私有 entitlement，
+# 普通免费证书/侧载（AltStore、Sideloadly）无法生效，仅 TrollStore 或越狱可用。
+
+name: Build IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec AutoTap/project.yml
+
+      - name: Build app (unsigned)
+        run: |
+          xcodebuild \
+            -project AutoTap.xcodeproj \
+            -scheme AutoTap \
+            -configuration Debug \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package IPA
+        run: |
+          mkdir -p build/Payload
+          cp -R build/DerivedData/Build/Products/Debug-iphoneos/AutoTap.app build/Payload/
+          cd build && zip -qry AutoTap.ipa Payload/
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoTap.ipa
+          path: build/AutoTap.ipa
+          if-no-files-found: error
