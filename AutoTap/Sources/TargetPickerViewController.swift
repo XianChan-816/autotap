@@ -60,8 +60,21 @@ final class TargetPickerViewController: UIViewController {
             DispatchQueue.main.async {
                 self?.allApps = apps
                 self?.tableView.reloadData()
+                if apps.isEmpty {
+                    self?.toast("未找到已安装 App：LSApplicationWorkspace 权限受限，且文件扫描失败")
+                }
             }
         }
+    }
+
+    private func toast(_ message: String) {
+        let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+        if let pop = alert.popoverPresentationController {
+            pop.sourceView = view
+            pop.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 0, height: 0)
+        }
+        present(alert, animated: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { alert.dismiss(animated: true) }
     }
 
     @objc private func doneTapped() {

@@ -17,5 +17,12 @@
 	<!-- 通过音量键监听急停时使用 -->
 	<key>com.apple.springboard.volume-events</key>
 	<true/>
+	<!-- 解锁 LSApplicationWorkspace 枚举全部已装 App（TrollStore 可带私有 entitlement） -->
+	<key>com.apple.private.mobileinstall.allowedSPI</key>
+	<array>
+		<string>MIInstallAllApps</string>
+	</array>
+	<key>com.apple.private.lsapplicationworkspace.getapp</key>
+	<true/>
 </dict>
 </plist>

@@ -62,37 +62,52 @@ enum TargetAppManager {
     }
 
     /// 枚举所有已安装 App（含系统 App，可按需过滤），按显示名排序
-    /// 注意：普通 App（含 TrollStore）调用 LSApplicationWorkspace.allApplications()
-    /// 受沙盒限制返回空，因此改用**文件系统扫描**安装目录，不依赖私有 API 权限。
+    /// 优先用 LSApplicationWorkspace.allApplications()（需私有 entitlement 解锁，
+    /// TrollStore 可带），失败回退文件系统扫描安装目录。
     static func installedApps(includeSystem: Bool = false) -> [AppInfo] {
         if let cached = cachedApps { return cached }
 
-        // 候选根目录：覆盖 rootless（Dopamine /var/jb）与非 rootless 两种布局
-        let roots: [String] = [
-            "/var/containers/Bundle/Application",          // 非 rootless 用户 App
-            "/var/jb/var/containers/Bundle/Application",   // Dopamine rootless 用户 App
-            "/Applications",                               // 系统 App（非 rootless）
-            "/var/jb/Applications"                          // 系统 App（rootless）
-        ]
-
         var found: [String: AppInfo] = [:]  // bundleID -> info（去重）
-        let fm = FileManager.default
 
-        for root in roots {
-            guard let dirs = try? fm.contentsOfDirectory(atPath: root) else { continue }
-            for dir in dirs {
-                let appDir = (root as NSString).appendingPathComponent(dir)
-                guard let apps = try? fm.contentsOfDirectory(atPath: appDir) else { continue }
-                for appName in apps where appName.hasSuffix(".app") {
-                    let infoPath = ((appDir as NSString).appendingPathComponent(appName)
-                                    as NSString).appendingPathComponent("Info.plist")
-                    guard let dict = NSDictionary(contentsOfFile: infoPath),
-                          let bid = dict["CFBundleIdentifier"] as? String, !bid.isEmpty else { continue }
-                    if !includeSystem && bid.hasPrefix("com.apple.") { continue }
-                    let display = (dict["CFBundleDisplayName"] as? String)
-                        ?? (dict["CFBundleName"] as? String)
-                        ?? bid
-                    found[bid] = AppInfo(bundleID: bid, name: display)
+        // 方式 1：LSApplicationWorkspace（私有 entitlement 解锁后能枚举全部）
+        if let workspace = LSApplicationWorkspace.default() {
+            let apps = workspace.allApplications() ?? []
+            for proxy in apps {
+                guard let bid = (proxy as AnyObject).value(forKey: "bundleIdentifier") as? String,
+                      !bid.isEmpty else { continue }
+                if !includeSystem && bid.hasPrefix("com.apple.") { continue }
+                let name = ((proxy as AnyObject).value(forKey: "localizedName") as? String) ?? bid
+                found[bid] = AppInfo(bundleID: bid, name: name)
+            }
+        }
+
+        // 方式 2：文件系统扫描兜底（TrollStore/no-sandbox 可读安装目录）
+        if found.isEmpty {
+            let roots: [String] = [
+                "/private/var/containers/Bundle/Application",
+                "/var/containers/Bundle/Application",
+                "/var/jb/var/containers/Bundle/Application",
+                "/private/var/jb/var/containers/Bundle/Application",
+                "/Applications",
+                "/var/jb/Applications"
+            ]
+            let fm = FileManager.default
+            for root in roots {
+                guard let dirs = try? fm.contentsOfDirectory(atPath: root) else { continue }
+                for dir in dirs {
+                    let appDir = (root as NSString).appendingPathComponent(dir)
+                    guard let apps = try? fm.contentsOfDirectory(atPath: appDir) else { continue }
+                    for appName in apps where appName.hasSuffix(".app") {
+                        let infoPath = ((appDir as NSString).appendingPathComponent(appName)
+                                        as NSString).appendingPathComponent("Info.plist")
+                        guard let dict = NSDictionary(contentsOfFile: infoPath),
+                              let bid = dict["CFBundleIdentifier"] as? String, !bid.isEmpty else { continue }
+                        if !includeSystem && bid.hasPrefix("com.apple.") { continue }
+                        let display = (dict["CFBundleDisplayName"] as? String)
+                            ?? (dict["CFBundleName"] as? String)
+                            ?? bid
+                        found[bid] = AppInfo(bundleID: bid, name: display)
+                    }
                 }
             }
         }
