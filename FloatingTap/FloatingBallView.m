@@ -142,9 +142,9 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 
     UILongPressGestureRecognizer *longPress =
         [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleLongPress:)];
-    // 0.15s 即触发（手指一按住就开连点），allowableMovement 放宽到 30pt
-    // 避免按住时手指自然抖动被误判为取消，导致连点意外停止
-    longPress.minimumPressDuration = 0.15;
+    // 立即触发：手指一碰圆圈就开始连点（minimumPressDuration=0）
+    // allowableMovement 放宽到 30pt，避免按住时手指自然抖动被误判为取消
+    longPress.minimumPressDuration = 0.0;
     longPress.allowableMovement = 30;
     [self addGestureRecognizer:longPress];
 
