@@ -8,25 +8,52 @@
 //  「空白区域穿透」——只有球本体接收手势，其余触摸原样交给下层 App/游戏。
 //  注入的 HID 事件走系统事件管线，不经由 window 命中测试，无需开关交互。
 //
+//  跨进程通信：tweak 写 App 沙盒 Caches（不是 /var/mobile/*，那些目录 App 沙盒不可写）。
+//  路径由 Tweak.xm 在收到 AutoTap.app 启动的 Darwin notification 后，用
+//  sandbox_get_container_for_pid(pid, "Caches") 动态解析。
+//
 
 #import "FloatingBallView.h"
 #import "HIDInject.h"
 #import <objc/runtime.h>
+#import <notify.h>
+#import <libproc.h>
+#import <sandbox.h>
 
-// 共享配置（AutoTap App 与 tweak 共同读写；rootless 下系统偏好目录不变）
-NSString *const kFloatingTapConfigPath = @"/var/mobile/Documents/FloatingTap/config.plist";
+// 共享配置（AutoTap App 与 tweak 共同读写；写到 App 沙盒 Caches）
+// kFloatingTapConfigPath 是可变全局变量，Tweak.xm 在拿到 App 沙盒路径后赋值
+NSString *kFloatingTapConfigPath = nil;
 NSString *const kFTKeyTargets   = @"Targets";
 NSString *const kFTKeyIntervalMs= @"IntervalMs";
 NSString *const kFTKeyClickX     = @"ClickX";
 NSString *const kFTKeyClickY     = @"ClickY";
 
-// tweak（SpringBoard 特权进程）枚举出的已装 App 清单，供 AutoTap App 读取
-// 注意：必须放在 mobile 用户的 Documents 目录下（/var/mobile/Library/Preferences/ 受 iOS TCC 保护，
-// App 看不到 root 写在那里的文件，会被拒为"不可写"/"不存在"）
-NSString *const kFTDataDir = @"/var/mobile/Documents/FloatingTap/";
-NSString *const kFloatingTapAppsDumpPath   = @"/var/mobile/Documents/FloatingTap/apps.plist";
-NSString *const kFloatingTapAppsStatusPath = @"/var/mobile/Documents/FloatingTap/apps.status.plist";
-NSString *const kFloatingTapTweakStatusPath = @"/var/mobile/Documents/FloatingTap/tweak.plist";
+// tweak 写给 App 读的所有文件路径（指向 App 沙盒 Caches）
+// 必须在收到 App 启动的 Darwin notification 后用 sandbox_get_container_for_pid 解析,
+// 解析前 gAppCachesDir 为 nil，写入时直接跳过。
+static NSString *gAppCachesDir = nil;  // 例如 /var/mobile/Containers/Data/Application/<UUID>/Library/Caches/
+
+// 路径辅助函数：未拿到 App 沙盒路径时返回 nil
+static NSString *FTAppsPath(void)        { return gAppCachesDir ? [gAppCachesDir stringByAppendingPathComponent:@"FloatingTap.apps.plist"] : nil; }
+static NSString *FTAppsStatusPath(void)  { return gAppCachesDir ? [gAppCachesDir stringByAppendingPathComponent:@"FloatingTap.apps.status.plist"] : nil; }
+static NSString *FTTweakStatusPath(void) { return gAppCachesDir ? [gAppCachesDir stringByAppendingPathComponent:@"FloatingTap.tweak.plist"] : nil; }
+static NSString *FTConfigPath(void)      { return gAppCachesDir ? [gAppCachesDir stringByAppendingPathComponent:@"AutoTapConfig.plist"] : nil; }
+
+// 拿到 App 沙盒 Caches 路径后由 Tweak.xm 调用（注册 Darwin notification 钩子）
+void FTSetAppCachesDir(NSString *dir) {
+    @synchronized ([FloatingBallView class]) {
+        gAppCachesDir = [dir copy];
+        kFloatingTapConfigPath = [[dir stringByAppendingPathComponent:@"AutoTapConfig.plist"] copy];
+        NSLog(@"[FloatingTap] App Caches 路径已设置: %@", dir);
+    }
+}
+NSString *FTGetAppCachesDir(void) { return gAppCachesDir; }
+
+// 兼容旧引用（外部可能直接引用 kFloatingTapAppsDumpPath 之类的名字）
+// 实际写请用 FTAppsPath() / FTAppsStatusPath() / FTTweakStatusPath() / FTConfigPath()
+NSString *const kFloatingTapAppsDumpPath    = @"__USE_FTAppsPath__";
+NSString *const kFloatingTapAppsStatusPath  = @"__USE_FTAppsStatusPath__";
+NSString *const kFloatingTapTweakStatusPath = @"__USE_FTTweakStatusPath__";
 
 // 等价 systemRed / systemBlue 的显式 RGB（不依赖 SDK 缺失的 system 颜色属性）
 static UIColor *FTTapColor(BOOL clicking) {
@@ -306,10 +333,17 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
     }
 }
 
-/// 枚举系统内所有已装 App，写入 kFloatingTapAppsDumpPath 供 AutoTap App 读取。
-/// SpringBoard 是特权进程，LSApplicationWorkspace 枚举无限制；写到的路径对 mobile 用户可读。
-/// 普通 App 受沙盒 + 文件权限（/var/containers 属 root 0700）双重限制无法枚举，故由 tweak 代劳。
+/// 枚举系统内所有已装 App，写到 App 沙盒 Caches（必须先收到 App 启动通知）。
+/// SpringBoard 是特权进程，LSApplicationWorkspace 枚举无限制。
+/// 路径走 App 沙盒 Caches（root 写的 mobile App 读得到，因为 App 自己是 owner）。
 - (void)dumpInstalledApps {
+    NSString *appsPath = FTAppsPath();
+    NSString *statusPath = FTAppsStatusPath();
+    if (!appsPath || !statusPath) {
+        NSLog(@"[FloatingTap] dumpInstalledApps 跳过：App 沙盒路径未就绪");
+        return;
+    }
+
     NSMutableDictionary *status = [NSMutableDictionary dictionary];
     [status setObject:@(YES) forKey:@"_dumped"];
     [status setObject:@((long long)([[NSDate date] timeIntervalSince1970] * 1000)) forKey:@"_time"];
@@ -357,54 +391,24 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 
     if (errorMsg) [status setObject:errorMsg forKey:@"_error"];
     [status setObject:@(dict.count) forKey:@"_count"];
-    FTEnsureDataDir();
-    [dict writeToFile:kFloatingTapAppsDumpPath atomically:YES];
-    [status writeToFile:kFloatingTapAppsStatusPath atomically:YES];
-    FTEnsureReadable(kFloatingTapAppsDumpPath);
-    FTEnsureReadable(kFloatingTapAppsStatusPath);
+    [dict writeToFile:appsPath atomically:YES];
+    [status writeToFile:statusPath atomically:YES];
     NSLog(@"[FloatingTap] 导出 %lu 个已装 App（%@）", (unsigned long)dict.count, errorMsg ?: @"成功");
-}
-
-/// 确保文件对 mobile 用户可读（root 进程写的文件默认 owner=root + mode=0600，App(mobile) 读不到会误判 tweak 未加载）。
-/// 同时 chown 给 mobile:mobile (uid/gid 501)，否则即便有 r 位 mobile 也未必能跨用户读 root 文件。
-static void FTEnsureReadable(NSString *path) {
-    if (!path) return;
-    @try {
-        NSDictionary *attrs = @{
-            NSFilePosixPermissions: @(0644),
-            NSFileOwnerAccountID: @(501),  // mobile uid on iOS
-            NSFileGroupOwnerAccountID: @(501),  // mobile gid on iOS
-        };
-        [[NSFileManager defaultManager] setAttributes:attrs ofItemAtPath:path error:NULL];
-    } @catch (NSException *ex) {
-        NSLog(@"[FloatingTap] chmod/chown 失败 %@: %@", path, ex);
-    }
-}
-
-/// 确保数据目录存在（mobile Documents/FloatingTap/ 不一定存在）
-static void FTEnsureDataDir(void) {
-    @try {
-        [[NSFileManager defaultManager] createDirectoryAtPath:kFTDataDir
-                                  withIntermediateDirectories:YES
-                                                   attributes:nil
-                                                        error:NULL];
-    } @catch (NSException *ex) {
-        NSLog(@"[FloatingTap] mkdir %@ 失败: %@", kFTDataDir, ex);
-    }
 }
 
 /// tweak 加载心跳：%ctor 立即写入，供 AutoTap App 判断 tweak 是否在线。
 /// 注意：必须是类方法，绝不碰 shared/UIKit —— %ctor 阶段 SpringBoard 界面未就绪，
 /// 若在 %ctor 调 [FloatingBallView shared] 会触发 UIView 初始化，卡死 SB 启动（表现为死机）。
+/// 必须发通知后由 Tweak.xm 拿到 App 沙盒路径才真正写入；在 App 启动前写入会被丢弃。
 + (void)writeHeartbeat {
     @try {
-        FTEnsureDataDir();
+        NSString *path = FTTweakStatusPath();
+        if (!path) return;  // 还没拿到 App 沙盒路径，跳过；Tweak.xm 拿到后会自动调一次
         NSMutableDictionary *hb = [NSMutableDictionary dictionary];
         [hb setObject:@(YES) forKey:@"_loaded"];
-        [hb setObject:@"1.0.3" forKey:@"_version"];
+        [hb setObject:@"1.0.4" forKey:@"_version"];
         [hb setObject:@((long long)([[NSDate date] timeIntervalSince1970] * 1000)) forKey:@"_time"];
-        [hb writeToFile:kFloatingTapTweakStatusPath atomically:YES];
-        FTEnsureReadable(kFloatingTapTweakStatusPath);
+        [hb writeToFile:path atomically:YES];
     } @catch (NSException *ex) {
         NSLog(@"[FloatingTap] writeHeartbeat 异常: %@", ex);
     }

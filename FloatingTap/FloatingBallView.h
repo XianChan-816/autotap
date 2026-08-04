@@ -10,12 +10,17 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/// 共享配置文件路径（AutoTap App 与 tweak 共同读写）
-extern NSString *const kFloatingTapConfigPath;
+/// 共享配置文件路径（运行时由 FTSetAppCachesDir 设置为 App 沙盒 Caches 路径）
+extern NSString *kFloatingTapConfigPath;
 
 /// 共享配置键
 extern NSString *const kFTKeyTargets;   // NSArray<NSString *>：目标 App bundleID 列表
 extern NSString *const kFTKeyIntervalMs;// NSNumber：连点间隔（毫秒）
+
+/// 拿到 AutoTap.app 沙盒 Caches 路径后由 Tweak.xm 调用（Darwin notification 回调里执行）
+/// 之后所有跨进程 plist 读写都走此路径（App 100% 可读自己沙盒）
+extern void FTSetAppCachesDir(NSString *dir);
+extern NSString *FTGetAppCachesDir(void);
 
 @interface FloatingBallView : UIView
 

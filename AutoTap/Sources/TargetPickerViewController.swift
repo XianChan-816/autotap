@@ -69,9 +69,16 @@ final class TargetPickerViewController: UIViewController {
         ])
 
         loadApps()
-    }
 
-    private func loadApps() {
+        // 监听 tweak 写完数据（Darwin notification 转发到 NotificationCenter）
+        // 收到后 reload 状态 + App 列表 — 双向通信的核心
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(refreshTapped),
+            name: .floatingTapTweakDataUpdated,
+            object: nil
+        )
+    }
         TargetAppManager.invalidateCache()  // 每次打开都重新读取（tweak 清单可能已更新）
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let diag = TargetAppManager.tweakDiagnostic()

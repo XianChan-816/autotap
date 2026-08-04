@@ -2,34 +2,82 @@
 //  TargetAppManager.swift
 //  AutoTap
 //
-//  目标 App 管理：与 FloatingTap tweak 通过共享 plist 通信。
-//  - 枚举已安装 App（LSApplicationWorkspace 私有 API）
-//  - 读写 /var/mobile/Documents/FloatingTap/config.plist（Targets / IntervalMs / ClickX / ClickY）
-//  - 打开目标 App
+//  目标 App 管理：与 FloatingTap tweak 通过「App 沙盒 + Darwin notification」通信。
+//  - 配置文件读写 ~/Library/Caches/AutoTapConfig.plist（App 沙盒内，100% 可写）
+//  - tweak 写入 App 沙盒 Caches 目录的 apps.plist / status.plist / tweak.plist
+//  - 通知走系统级 Darwin notification（CFNotificationCenter GetDarwinNotifyCenter）
+//  - tweak 端通过 sandbox_get_container_for_pid(pid) 反查 App 沙盒路径后写入
+//
+//  失败史：尝试过 /var/mobile/Library/Preferences/（TCC 拒）和 /var/mobile/Documents/
+//  （TCC 拒），两条系统目录对 App 都不可写。最终方案直接用 App 沙盒 Caches。
 //
 //  App 需在 TrollStore/越狱环境运行（platform-application + no-sandbox entitlement），
-//  否则无法枚举全部 App 与写入系统偏好目录。
+//  否则无法枚举全部 App 与跨进程通信。
 //
 
 import UIKit
 
 enum TargetAppManager {
 
-    static let configPath = "/var/mobile/Documents/FloatingTap/config.plist"
+    // MARK: - 路径（全部在 App 沙盒 Caches 内，App 100% 可写可读）
 
-    /// tweak（SpringBoard）导出的已装 App 清单（mobile 可读路径）
-    /// 普通 App 受沙盒 + 文件权限限制无法枚举已装 App，故由 FloatingTap tweak 代劳写入
-    /// 路径必须在 /var/mobile/Documents/ 下，/var/mobile/Library/Preferences/ 受 iOS TCC 保护
-    static let appsDumpPath = "/var/mobile/Documents/FloatingTap/apps.plist"
+    /// App 自己的 Caches 目录（每启动时不变；UUID 由 iOS 固定）
+    static let appCachesDir: String = {
+        return NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first!
+    }()
 
-    /// 枚举诊断状态文件（tweak 写）：_count / _error / _time
-    static let appsStatusPath = "/var/mobile/Documents/FloatingTap/apps.status.plist"
+    /// App 写、tweak 读：目标 App 列表 + 间隔 + 点击位置
+    static let configPath = appCachesDir + "/AutoTapConfig.plist"
 
-    /// tweak 心跳文件（%ctor 立即写）：_loaded / _version / _time
-    static let tweakStatusPath = "/var/mobile/Documents/FloatingTap/tweak.plist"
+    /// tweak 写、App 读：已装 App 清单
+    static let appsDumpPath = appCachesDir + "/FloatingTap.apps.plist"
 
-    /// 共享数据目录（tweak 写、App 读，约定一致）
-    static let dataDir = "/var/mobile/Documents/FloatingTap/"
+    /// tweak 写、App 读：枚举状态（_count / _error / _time）
+    static let appsStatusPath = appCachesDir + "/FloatingTap.apps.status.plist"
+
+    /// tweak 写、App 读：心跳（证明 tweak 已加载并运行）
+    static let tweakStatusPath = appCachesDir + "/FloatingTap.tweak.plist"
+
+    // MARK: - Darwin notification 名（跨进程 ABI，tweak 端必须一字不差）
+
+    /// App 启动后发送，tweak 收到后用 proc 找到 App 反查沙盒路径
+    static let notifyAppStarted = "com.floatingtap.autotap.appStarted" as CFString
+
+    /// App 写完 config 后发送，tweak 收到后重新读取目标 App / 间隔 / 点击位置
+    static let notifyConfigUpdated = "com.floatingtap.autotap.configUpdated" as CFString
+
+    /// tweak 写完心跳/枚举后发送，App 收到后重新读取 tweak status / apps
+    static let notifyTweakDataUpdated = "com.floatingtap.autotap.tweakDataUpdated" as CFString
+
+    // MARK: - 启动与监听
+
+    /// App 启动时调用：通知 tweak 反查沙盒路径开始写数据
+    static func notifyAppStarted() {
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            CFNotificationName(notifyAppStarted),
+            nil, nil, true
+        )
+    }
+
+    /// App 监听 tweak 数据更新（心跳、App 列表）。收到后回调 handler，由 UI reload。
+    static func startListeningForTweakUpdates(handler: @escaping () -> Void) {
+        let observer = Unmanaged.passUnretained(handler as AnyObject).toOpaque()
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            observer,
+            { _, observer, _, _, _ in
+                guard let observer = observer else { return }
+                let h = Unmanaged<AnyObject>.fromOpaque(observer).takeUnretainedValue()
+                DispatchQueue.main.async {
+                    (h as? () -> Void)?()
+                }
+            },
+            notifyTweakDataUpdated,
+            nil,
+            .deliverImmediately
+        )
+    }
 
     // MARK: - 共享配置
 
@@ -40,7 +88,7 @@ enum TargetAppManager {
         return targets
     }
 
-    /// 保存目标 App bundleID 列表
+    /// 保存目标 App bundleID 列表（写完会通知 tweak）
     static func saveTargets(_ ids: [String]) {
         let dict = NSMutableDictionary(contentsOfFile: configPath) ?? NSMutableDictionary()
         dict["Targets"] = ids
@@ -54,7 +102,7 @@ enum TargetAppManager {
         return max(1, min(v.intValue, 60_000))
     }
 
-    /// 保存连点间隔（毫秒）
+    /// 保存连点间隔（毫秒，写完会通知 tweak）
     static func saveIntervalMs(_ ms: Int) {
         let dict = NSMutableDictionary(contentsOfFile: configPath) ?? NSMutableDictionary()
         dict["IntervalMs"] = max(1, min(ms, 60_000))
@@ -77,13 +125,14 @@ enum TargetAppManager {
         writeConfig(dict)
     }
 
-    /// 写配置：先确保目录存在（mobile Documents/FloatingTap/ 可能尚未创建）
+    /// 写配置 + 通知 tweak（Darwin notification 无 payload，tweak 收到后从 App 沙盒反查读 config）
     private static func writeConfig(_ dict: NSDictionary) {
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: dataDir) {
-            try? fm.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
-        }
         dict.write(toFile: configPath, atomically: true)
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            CFNotificationName(notifyConfigUpdated),
+            nil, nil, true
+        )
     }
 
     // MARK: - 已安装 App 枚举
@@ -101,7 +150,7 @@ enum TargetAppManager {
     }
 
     /// 枚举所有已安装 App（含系统 App，可按需过滤），按显示名排序。
-    /// 主方案：读 FloatingTap tweak（SpringBoard 特权进程）写入的 appsDumpPath 清单。
+    /// 主方案：读 FloatingTap tweak（SpringBoard 特权进程）写入的 appsDumpPath。
     /// 兜底：文件系统扫描安装目录（部分环境可读）。
     /// 注意：App 进程内直接调 LSApplicationWorkspace.allApplications() 在沙盒/权限下
     /// 返回空，故枚举完全依赖 tweak 导出的清单。
@@ -178,7 +227,7 @@ enum TargetAppManager {
             if !tweakLoaded {
                 var detail = "tweak 未加载："
                 if !hbExists {
-                    detail += "App 看不到心跳文件（\(tweakStatusPath) 不存在）"
+                    detail += "App 看不到心跳文件（\(tweakStatusPath) 不存在；tweak 还未通过 Darwin notification 拿到 App 沙盒路径）"
                 } else if let rd = hbReadDetail {
                     detail += "心跳文件在，但读取失败：\(rd)"
                 } else {
@@ -218,15 +267,15 @@ enum TargetAppManager {
                 hbReadDetail = "NSDictionary 解析返回 nil（权限或格式问题）"
             }
         }
-        // 写测试：App 能否写入同一目录（判断 App 对该路径的访问能力）
+        // 写测试：App 写自己沙盒 Caches 一定可写，这里改成纯粹测沙盒目录的写能力
         var writeTest: String?
-        let testPath = tweakStatusPath + ".apptest"
+        let testPath = appCachesDir + "/tweak.plist.apptest"
         do {
             try "ok".write(toFile: testPath, atomically: true, encoding: .utf8)
-            writeTest = "可写"
+            writeTest = "可写（App 沙盒 Caches 写入成功）"
             try? FileManager.default.removeItem(atPath: testPath)
         } catch {
-            writeTest = "不可写（\(error.localizedDescription)）"
+            writeTest = "不可写：\(error.localizedDescription)"
         }
         // 枚举状态
         let dumpExists = FileManager.default.fileExists(atPath: appsDumpPath)
