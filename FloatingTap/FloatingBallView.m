@@ -18,6 +18,10 @@ NSString *const kFloatingTapConfigPath = @"/var/mobile/Library/Preferences/Float
 NSString *const kFTKeyTargets   = @"Targets";
 NSString *const kFTKeyIntervalMs= @"IntervalMs";
 
+// tweak（SpringBoard 特权进程）枚举出的已装 App 清单，供 AutoTap App 读取
+// 普通 App 受沙盒/文件权限限制无法枚举，故由 tweak 代劳并写入 mobile 可读路径
+NSString *const kFloatingTapAppsDumpPath = @"/var/mobile/Library/Preferences/FloatingTap.apps.plist";
+
 // 等价 systemRed / systemBlue 的显式 RGB（不依赖 SDK 缺失的 system 颜色属性）
 static UIColor *FTTapColor(BOOL clicking) {
     return clicking
@@ -335,6 +339,36 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
         }
     } @catch (NSException *ex) {
         NSLog(@"[FloatingTap] updateVisibility 异常: %@", ex);
+    }
+}
+
+/// 枚举系统内所有已装 App，写入 kFloatingTapAppsDumpPath 供 AutoTap App 读取。
+/// SpringBoard 是特权进程，LSApplicationWorkspace 枚举无限制；写到的路径对 mobile 用户可读。
+/// 普通 App 受沙盒 + 文件权限（/var/containers 属 root 0700）双重限制无法枚举，故由 tweak 代劳。
+- (void)dumpInstalledApps {
+    @try {
+        Class lsClass = NSClassFromString(@"LSApplicationWorkspace");
+        if (!lsClass) return;
+        SEL selDef = NSSelectorFromString(@"defaultWorkspace");
+        if (![lsClass respondsToSelector:selDef]) return;
+        id ws = [lsClass performSelector:selDef];
+        if (!ws) return;
+        SEL selAll = NSSelectorFromString(@"allApplications");
+        if (![ws respondsToSelector:selAll]) return;
+        NSArray *apps = [ws performSelector:selAll];
+        NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+        for (id proxy in apps) {
+            NSString *bid = [proxy performSelector:NSSelectorFromString(@"bundleIdentifier")];
+            if (![bid isKindOfClass:[NSString class]] || bid.length == 0) continue;
+            NSString *name = [proxy performSelector:NSSelectorFromString(@"localizedName")];
+            if (![name isKindOfClass:[NSString class]] || name.length == 0) name = bid;
+            dict[bid] = name;
+        }
+        [dict writeToFile:kFloatingTapAppsDumpPath atomically:YES];
+        NSLog(@"[FloatingTap] 已导出 %lu 个已装 App 到 %@",
+              (unsigned long)dict.count, kFloatingTapAppsDumpPath);
+    } @catch (NSException *ex) {
+        NSLog(@"[FloatingTap] dumpInstalledApps 异常: %@", ex);
     }
 }
 

@@ -17,6 +17,10 @@ enum TargetAppManager {
 
     static let configPath = "/var/mobile/Library/Preferences/FloatingTap.plist"
 
+    /// tweak（SpringBoard）导出的已装 App 清单（mobile 可读路径）
+    /// 普通 App 受沙盒 + 文件权限限制无法枚举已装 App，故由 FloatingTap tweak 代劳写入
+    static let appsDumpPath = "/var/mobile/Library/Preferences/FloatingTap.apps.plist"
+
     // MARK: - 共享配置
 
     /// 读取当前目标 App bundleID 列表
@@ -61,27 +65,26 @@ enum TargetAppManager {
         cachedApps = nil
     }
 
-    /// 枚举所有已安装 App（含系统 App，可按需过滤），按显示名排序
-    /// 优先用 LSApplicationWorkspace.allApplications()（需私有 entitlement 解锁，
-    /// TrollStore 可带），失败回退文件系统扫描安装目录。
+    /// 枚举所有已安装 App（含系统 App，可按需过滤），按显示名排序。
+    /// 主方案：读 FloatingTap tweak（SpringBoard 特权进程）写入的 appsDumpPath 清单。
+    /// 兜底：文件系统扫描安装目录（部分环境可读）。
+    /// 注意：App 进程内直接调 LSApplicationWorkspace.allApplications() 在沙盒/权限下
+    /// 返回空，故枚举完全依赖 tweak 导出的清单。
     static func installedApps(includeSystem: Bool = false) -> [AppInfo] {
         if let cached = cachedApps { return cached }
 
         var found: [String: AppInfo] = [:]  // bundleID -> info（去重）
 
-        // 方式 1：LSApplicationWorkspace（私有 entitlement 解锁后能枚举全部）
-        if let workspace = LSApplicationWorkspace.default() {
-            let apps = workspace.allApplications() ?? []
-            for proxy in apps {
-                guard let bid = (proxy as AnyObject).value(forKey: "bundleIdentifier") as? String,
-                      !bid.isEmpty else { continue }
+        // 方式 1（主）：读 tweak 导出的已装 App 清单
+        if let dict = NSDictionary(contentsOfFile: appsDumpPath) as? [String: String] {
+            for (bid, name) in dict {
                 if !includeSystem && bid.hasPrefix("com.apple.") { continue }
-                let name = ((proxy as AnyObject).value(forKey: "localizedName") as? String) ?? bid
-                found[bid] = AppInfo(bundleID: bid, name: name)
+                let display = name.isEmpty ? bid : name
+                found[bid] = AppInfo(bundleID: bid, name: display)
             }
         }
 
-        // 方式 2：文件系统扫描兜底（TrollStore/no-sandbox 可读安装目录）
+        // 方式 2（兜底）：文件系统扫描安装目录
         if found.isEmpty {
             let roots: [String] = [
                 "/private/var/containers/Bundle/Application",

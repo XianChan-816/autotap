@@ -28,6 +28,10 @@ final class TargetPickerViewController: UIViewController {
         navigationItem.rightBarButtonItem = UIBarButtonItem(barButtonSystemItem: .done,
                                                             target: self,
                                                             action: #selector(doneTapped))
+        navigationItem.leftBarButtonItem = UIBarButtonItem(title: "刷新",
+                                                           style: .plain,
+                                                           target: self,
+                                                           action: #selector(refreshTapped))
         view.backgroundColor = .systemBackground
 
         selectedIDs = Set(TargetAppManager.loadTargets())
@@ -55,16 +59,21 @@ final class TargetPickerViewController: UIViewController {
     }
 
     private func loadApps() {
+        TargetAppManager.invalidateCache()  // 每次打开都重新读取（tweak 清单可能已更新）
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let apps = TargetAppManager.installedApps()
             DispatchQueue.main.async {
                 self?.allApps = apps
                 self?.tableView.reloadData()
                 if apps.isEmpty {
-                    self?.toast("未找到已安装 App：LSApplicationWorkspace 权限受限，且文件扫描失败")
+                    self?.toast("列表为空：请确认 FloatingTap tweak 已安装并 sbreload（App 清单由 tweak 导出）")
                 }
             }
         }
+    }
+
+    @objc private func refreshTapped() {
+        loadApps()
     }
 
     private func toast(_ message: String) {

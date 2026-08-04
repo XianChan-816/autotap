@@ -32,6 +32,22 @@
         } @catch (NSException *ex) {
             NSLog(@"[FloatingTap] 启动首检异常: %@", ex);
         }
+
+        // 导出已装 App 清单给 AutoTap App 读取（SpringBoard 特权枚举，普通 App 做不到）
+        @try {
+            [[FloatingBallView shared] dumpInstalledApps];
+        } @catch (NSException *ex) {
+            NSLog(@"[FloatingTap] 导出 App 清单异常: %@", ex);
+        }
+        // 每 60s 刷新一次，覆盖新安装的 App
+        NSTimer *dumpTimer = [NSTimer scheduledTimerWithTimeInterval:60
+                                                              repeats:YES
+                                                                block:^(NSTimer *t) {
+            @try { [[FloatingBallView shared] dumpInstalledApps]; }
+            @catch (NSException *ex) { NSLog(@"[FloatingTap] 刷新 App 清单异常: %@", ex); }
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:dumpTimer forMode:NSRunLoopCommonModes];
+
         NSLog(@"[FloatingTap] 前台 App 监控已启动（0.5s 轮询）");
     });
 }
