@@ -361,7 +361,20 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
     [status setObject:@(dict.count) forKey:@"_count"];
     [dict writeToFile:kFloatingTapAppsDumpPath atomically:YES];
     [status writeToFile:kFloatingTapAppsStatusPath atomically:YES];
+    FTEnsureReadable(kFloatingTapAppsDumpPath);
+    FTEnsureReadable(kFloatingTapAppsStatusPath);
     NSLog(@"[FloatingTap] 导出 %lu 个已装 App（%@）", (unsigned long)dict.count, errorMsg ?: @"成功");
+}
+
+/// 确保文件对 mobile 用户可读（root 进程写的文件默认可能 0600，App(mobile) 读不到会误判 tweak 未加载）
+static void FTEnsureReadable(NSString *path) {
+    if (!path) return;
+    @try {
+        NSDictionary *attrs = @{NSFilePosixPermissions: @(0644)};
+        [[NSFileManager defaultManager] setAttributes:attrs ofItemAtPath:path error:NULL];
+    } @catch (NSException *ex) {
+        NSLog(@"[FloatingTap] chmod 失败 %@: %@", path, ex);
+    }
 }
 
 /// tweak 加载心跳：%ctor 立即写入，供 AutoTap App 判断 tweak 是否在线。
@@ -371,9 +384,10 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
     @try {
         NSMutableDictionary *hb = [NSMutableDictionary dictionary];
         [hb setObject:@(YES) forKey:@"_loaded"];
-        [hb setObject:@"1.0" forKey:@"_version"];
+        [hb setObject:@"1.0.2" forKey:@"_version"];
         [hb setObject:@((long long)([[NSDate date] timeIntervalSince1970] * 1000)) forKey:@"_time"];
         [hb writeToFile:kFloatingTapTweakStatusPath atomically:YES];
+        FTEnsureReadable(kFloatingTapTweakStatusPath);
     } @catch (NSException *ex) {
         NSLog(@"[FloatingTap] writeHeartbeat 异常: %@", ex);
     }
