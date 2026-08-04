@@ -13,6 +13,13 @@
 #import "HIDInject.h"
 #import <objc/runtime.h>
 
+// 等价 systemRed / systemBlue 的显式 RGB（不依赖 SDK 缺失的 system 颜色属性）
+static UIColor *FTTapColor(BOOL clicking) {
+    return clicking
+        ? [UIColor colorWithRed:1.0 green:0.231 blue:0.188 alpha:1.0]   // ~systemRed
+        : [UIColor colorWithRed:0.0 green:0.478 blue:1.0   alpha:1.0];  // ~systemBlue
+}
+
 static NSString *const kPrefsBallX      = @"FloatingTap.ballX";
 static NSString *const kPrefsBallY      = @"FloatingTap.ballY";
 static NSString *const kPrefsBallSize   = @"FloatingTap.ballSize";
@@ -129,7 +136,7 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
     self.ring.frame = self.bounds;
     self.ring.layer.cornerRadius = d / 2;
     self.ring.layer.borderWidth = 2.5;
-    self.ring.layer.borderColor = (self.isClicking ? UIColor.systemRed : UIColor.systemBlue).CGColor;
+    self.ring.layer.borderColor = FTTapColor(self.isClicking).CGColor;
     self.ring.backgroundColor = [UIColor colorWithRed:(self.isClicking ? 0.85 : 0.15)
                                                 green:(self.isClicking ? 0.10 : 0.35)
                                                  blue:(self.isClicking ? 0.10 : 0.85)
@@ -138,7 +145,7 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
     CGFloat dotSize = 10;
     self.dot.frame = CGRectMake((d - dotSize) / 2, (d - dotSize) / 2, dotSize, dotSize);
     self.dot.layer.cornerRadius = dotSize / 2;
-    self.dot.backgroundColor = self.isClicking ? UIColor.whiteColor : UIColor.systemBlue;
+    self.dot.backgroundColor = self.isClicking ? [UIColor whiteColor] : FTTapColor(NO);
 
     // 准星（圆心 = 点击点）
     [self.layer.sublayers enumerateObjectsUsingBlock:^(CALayer *layer, NSUInteger idx, BOOL *stop) {
@@ -146,7 +153,7 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
     }];
     CAShapeLayer *cross = [CAShapeLayer layer];
     cross.name = @"FloatingTap.cross";
-    cross.strokeColor = (self.isClicking ? UIColor.systemRed : UIColor.systemBlue).CGColor;
+    cross.strokeColor = FTTapColor(self.isClicking).CGColor;
     cross.lineWidth = 1;
     cross.frame = self.bounds;
     UIBezierPath *path = [UIBezierPath bezierPath];
