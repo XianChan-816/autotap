@@ -32,7 +32,7 @@ jobs:
       - name: Build app (unsigned)
         run: |
           xcodebuild \
-            -project AutoTap.xcodeproj \
+            -project AutoTap/AutoTap.xcodeproj \
             -scheme AutoTap \
             -configuration Debug \
             -sdk iphoneos \
