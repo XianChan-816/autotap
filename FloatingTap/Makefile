@@ -12,6 +12,8 @@ TWEAK_NAME = FloatingTap
 
 FloatingTap_FILES = Tweak.xm FloatingBallView.m HIDInject.m
 FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+FloatingTap_FRAMEWORKS = UIKit CoreGraphics
+FloatingTap_PRIVATE_FRAMEWORKS = IOKit
 FloatingTap_LDFLAGS = -lz
 
 include $(THEOS_MAKE_PATH)/tweak.mk

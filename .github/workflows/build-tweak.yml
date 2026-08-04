@@ -53,6 +53,19 @@ jobs:
             echo "theos: fetched via tarball (no submodules)"
           }
 
+      # 新版 Ubuntu 自带 Perl(5.34+) 禁止 logos 旧代码里的 `shift $args` 写法，
+      # 会让 logos.pl 在预处理阶段崩溃（表现为 Preprocessing Tweak.xm Error 2）。
+      # 社区标准修复：把 shift $args 改成 shift @{$args}。
+      - name: Patch logos for modern perl
+        run: |
+          GP="$HOME/theos/vendor/logos/bin/lib/Logos/Group.pm"
+          if [ -f "$GP" ]; then
+            sudo sed -i 's/shift \$args;/shift @{$args};/g' "$GP"
+            echo "patched Group.pm for modern perl"
+          else
+            echo "Group.pm not found, skip perl patch"
+          fi
+
       - name: Download iOS SDK (theos/sdks git-lfs dir)
         run: |
           sudo apt-get install -y git-lfs
@@ -76,7 +89,7 @@ jobs:
         run: |
           export THEOS=$HOME/theos
           cd FloatingTap
-          make clean package FINALPACKAGE=1
+          make clean package FINALPACKAGE=1 2>&1 | tee build.log
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
@@ -84,3 +97,11 @@ jobs:
           name: FloatingTap.deb
           path: FloatingTap/packages/*.deb
           if-no-files-found: error
+
+      - name: Upload build log (on failure or success)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: FloatingTap/build.log
+          if-no-files-found: ignore
