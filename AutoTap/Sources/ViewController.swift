@@ -46,6 +46,7 @@ final class ViewController: UIViewController {
     private let targetLabel = UILabel()
     private let pickTargetButton = UIButton(type: .system)
     private let enterTargetButton = UIButton(type: .system)
+    private let targetIntervalField = UITextField()
 
     private var longPress: UILongPressGestureRecognizer!
 
@@ -102,13 +103,20 @@ final class ViewController: UIViewController {
             toast("请先选择目标 App")
             return
         }
-        // 同步连点间隔到共享配置，tweak 使用
-        TargetAppManager.saveIntervalMs(readInterval())
+        // 同步悬浮球连点间隔到共享配置，tweak 使用
+        TargetAppManager.saveIntervalMs(readTargetInterval())
         if TargetAppManager.openApp(bundleID: first) {
             toast("已进入 \(first)，悬浮球将自动显示")
         } else {
             toast("打开失败：目标 App 可能未安装或权限不足")
         }
+    }
+
+    /// 读取悬浮球连点间隔输入（1~60000 ms）
+    private func readTargetInterval() -> Int {
+        guard let s = targetIntervalField.text?.trimmingCharacters(in: .whitespaces),
+              let ms = Int(s) else { return 200 }
+        return max(1, min(ms, 60_000))
     }
 
     override func viewDidLayoutSubviews() {
@@ -232,6 +240,11 @@ final class ViewController: UIViewController {
         targetRow.spacing = 10
         targetRow.distribution = .fillEqually
 
+        // 悬浮球连点间隔（写入共享配置，tweak 读取）
+        configureField(targetIntervalField, placeholder: "200", keyboard: .numberPad)
+        targetIntervalField.text = "\(TargetAppManager.loadIntervalMs())"
+        let targetIntervalRow = makeFieldContainer(label: makeLabel("悬浮球连点间隔(ms)"), field: targetIntervalField)
+
         // 状态
         statusLabel.text = "未运行"
         statusLabel.textAlignment = .center
@@ -269,6 +282,7 @@ final class ViewController: UIViewController {
             makeSectionTitle("越狱悬浮球（目标 App）"),
             targetLabel,
             targetRow,
+            targetIntervalRow,
             makeSectionTitle("运行方式"),
             continuousRow,
             statusLabel,
@@ -574,6 +588,9 @@ final class ViewController: UIViewController {
 extension ViewController: UITextFieldDelegate {
     func textFieldDidEndEditing(_ textField: UITextField) {
         saveConfig()
+        if textField == targetIntervalField {
+            TargetAppManager.saveIntervalMs(readTargetInterval())
+        }
         if textField == xField || textField == yField {
             if let (x, y) = readXY() {
                 points[0] = TapPoint(x: x, y: y)
