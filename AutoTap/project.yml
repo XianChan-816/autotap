@@ -45,7 +45,8 @@ targets:
     entitlements:
       path: Resources/AutoTap.entitlements
     dependencies:
-      - framework: MobileCoreServices.framework
+      # 系统 SDK 框架必须用 sdk 类型；framework 类型会被当作本地路径解析
+      - sdk: MobileCoreServices.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.autotap.app
