@@ -36,6 +36,7 @@ jobs:
             -scheme AutoTap \
             -configuration Debug \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \

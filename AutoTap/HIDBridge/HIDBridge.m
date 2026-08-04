@@ -30,31 +30,31 @@ static const AT_IOReturn AT_kIOReturnSuccess = 0;
 typedef void (*AT_IOHIDSystemCallback)(void *target, void *refcon, AT_IOHIDServiceRef service, AT_IOHIDEventRef event);
 typedef void (*AT_IOHIDServiceCallback)(void *target, void *refcon, AT_IOHIDEventRef event);
 
-/* 与 IOKit.framework 中公开头文件一致的事件类型 */
-typedef enum {
-    kIOHIDEventTypeNULL = 0,
-    kIOHIDEventTypeDigitizer = 11,
-} IOHIDEventType;
+/* 事件类型（本地前缀，避免与 SDK IOKit 头中的同名枚举冲突） */
+typedef CF_ENUM(uint32_t, AT_IOHIDEventType) {
+    AT_kIOHIDEventTypeNULL = 0,
+    AT_kIOHIDEventTypeDigitizer = 11,
+};
 
-/* 触控 digitizer 事件位掩码（参考 IOHIDEventTypes.h 私有头） */
-typedef NS_OPTIONS(uint32_t, IOHIDDigitizerEventMask) {
-    kIOHIDDigitizerEventRange       = 0x00000001,
-    kIOHIDDigitizerEventTouch       = 0x00000002,
-    kIOHIDDigitizerEventPosition    = 0x00000004,
-    kIOHIDDigitizerEventTip         = 0x00000008,
-    kIOHIDDigitizerEventIdentity    = 0x00000010,
-    kIOHIDDigitizerEventAttribute   = 0x00000020,
-    kIOHIDDigitizerEventCancel      = 0x00000040,
-    kIOHIDDigitizerEventResting     = 0x00000080,
-    kIOHIDDigitizerEventFromEdge    = 0x00000100,
-    kIOHIDDigitizerEventWillPause   = 0x00000200,
+/* 触控 digitizer 事件位掩码（本地前缀，值参考私有头 IOHIDEventTypes.h） */
+typedef NS_OPTIONS(uint32_t, AT_IOHIDDigitizerEventMask) {
+    AT_kIOHIDDigitizerEventRange       = 0x00000001,
+    AT_kIOHIDDigitizerEventTouch       = 0x00000002,
+    AT_kIOHIDDigitizerEventPosition    = 0x00000004,
+    AT_kIOHIDDigitizerEventTip         = 0x00000008,
+    AT_kIOHIDDigitizerEventIdentity    = 0x00000010,
+    AT_kIOHIDDigitizerEventAttribute   = 0x00000020,
+    AT_kIOHIDDigitizerEventCancel      = 0x00000040,
+    AT_kIOHIDDigitizerEventResting     = 0x00000080,
+    AT_kIOHIDDigitizerEventFromEdge    = 0x00000100,
+    AT_kIOHIDDigitizerEventWillPause   = 0x00000200,
 };
 
 // MARK: - 私有函数指针（运行时解析，避免直接链接私有符号）
 
 static AT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerEvent)(CFAllocatorRef,
                                                            uint64_t timeStamp,
-                                                           IOHIDEventType type,
+                                                           AT_IOHIDEventType type,
                                                            uint32_t options,
                                                            uint32_t index,
                                                            uint32_t identity,
@@ -199,10 +199,10 @@ static uint64_t SenderID(void) {
         now,
         0,            // index
         0x1,          // identity
-        down ? (kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch |
-                kIOHIDDigitizerEventPosition | kIOHIDDigitizerEventTip |
-                kIOHIDDigitizerEventIdentity)
-             : (kIOHIDDigitizerEventRange | kIOHIDDigitizerEventIdentity),
+        down ? (AT_kIOHIDDigitizerEventRange | AT_kIOHIDDigitizerEventTouch |
+                AT_kIOHIDDigitizerEventPosition | AT_kIOHIDDigitizerEventTip |
+                AT_kIOHIDDigitizerEventIdentity)
+             : (AT_kIOHIDDigitizerEventRange | AT_kIOHIDDigitizerEventIdentity),
         0,            // buttonMask
         x, y,         // 归一化坐标（0~1）
         0.0,          // z
@@ -218,11 +218,11 @@ static uint64_t SenderID(void) {
     AT_IOHIDEventRef parent = p_IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault,
         now,
-        kIOHIDEventTypeDigitizer,
+        AT_kIOHIDEventTypeDigitizer,
         0,
         0,            // index
         0x1,          // identity
-        kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventIdentity,
+        AT_kIOHIDDigitizerEventRange | AT_kIOHIDDigitizerEventTouch | AT_kIOHIDDigitizerEventIdentity,
         0,            // buttonMask
         0, 0, 0,      // 父事件不带坐标
         0, 0,
