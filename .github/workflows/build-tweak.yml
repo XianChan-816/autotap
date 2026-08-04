@@ -89,14 +89,33 @@ jobs:
         run: |
           export THEOS=$HOME/theos
           cd FloatingTap
+          set -o pipefail
           make clean package FINALPACKAGE=1 2>&1 | tee build.log
+          MAKE_RC=${PIPESTATUS[0]}
+          echo "=== build.log tail ==="
+          tail -n 40 build.log
+          echo "=== locate deb ==="
+          find . -name "*.deb" -print -exec ls -la {} \;
+          DEB=$(find . -name "*.deb" | head -1)
+          if [ -n "$DEB" ]; then
+            mkdir -p /tmp/debout
+            cp "$DEB" /tmp/debout/
+            echo "STAGED_DEB=$DEB"
+          else
+            echo "NO DEB PRODUCED — see build.log above"
+          fi
+          exit $MAKE_RC
 
       - name: Upload deb
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: FloatingTap.deb
-          path: FloatingTap/packages/*.deb
-          if-no-files-found: error
+          path: |
+            FloatingTap/packages/*.deb
+            FloatingTap/.theos/packages/*.deb
+            /tmp/debout/*.deb
+          if-no-files-found: warn
 
       - name: Upload build log (on failure or success)
         if: always()

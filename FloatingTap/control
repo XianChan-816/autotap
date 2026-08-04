@@ -6,4 +6,4 @@ Description: 全局悬浮球自动点击器（IOHIDEvent 注入），长按触�
 Maintainer: FloatingTap
 Author: FloatingTap
 Section: Tweaks
-Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0)
+Depends: ellekit, firmware (>= 14.0)
