@@ -53,21 +53,24 @@ jobs:
             echo "theos: fetched via tarball (no submodules)"
           }
 
-      - name: Download iOS SDK (git-lfs single file)
+      - name: Download iOS SDK (theos/sdks git-lfs dir)
         run: |
           sudo apt-get install -y git-lfs
           mkdir -p $HOME/theos/sdks
           export GIT_LFS_SKIP_SMUDGE=1
           git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks
           cd $HOME/sdks
-          ls -la
-          SDK_FILE=$(ls iPhoneOS*.sdk.zip 2>/dev/null | sort -V | tail -1)
-          echo "Selected SDK: ${SDK_FILE}"
-          [ -n "$SDK_FILE" ] || { echo "NO SDK ZIP FOUND"; exit 1; }
-          git lfs pull --include "$SDK_FILE"
-          file "$SDK_FILE"
-          unzip -q -o "$SDK_FILE" -d $HOME/theos/sdks
-          ls $HOME/theos/sdks
+          # theos/sdks 仓库里是解压好的 .sdk 目录（不是 zip）。
+          # 选 iOS 15.x 系列，最贴合用户 15.5 设备，向下兼容 deployment 15.0。
+          SDK_DIR=$(ls -d iPhoneOS15*.sdk 2>/dev/null | sort -V | tail -1)
+          echo "Selected SDK: ${SDK_DIR}"
+          [ -n "$SDK_DIR" ] || { echo "NO SDK DIR FOUND"; exit 1; }
+          git lfs pull --include "${SDK_DIR}/**"
+          SIZE=$(du -sm "$SDK_DIR" 2>/dev/null | cut -f1)
+          echo "SDK size after pull: ${SIZE} MB"
+          [ "${SIZE:-0}" -gt 5 ] || { echo "SDK pull failed (too small, LFS not fetched)"; exit 1; }
+          cp -R "$SDK_DIR" "$HOME/theos/sdks/"
+          ls "$HOME/theos/sdks"
 
       - name: Build .deb
         run: |
