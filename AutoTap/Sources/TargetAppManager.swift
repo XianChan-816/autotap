@@ -51,6 +51,22 @@ enum TargetAppManager {
         dict.write(toFile: configPath, atomically: true)
     }
 
+    /// 读取点击位置（归一化 0~1），供 tweak 悬浮球定位（球心=点击点）
+    static func loadClick() -> (Double, Double)? {
+        guard let dict = NSDictionary(contentsOfFile: configPath),
+              let x = dict["ClickX"] as? NSNumber,
+              let y = dict["ClickY"] as? NSNumber else { return nil }
+        return (x.doubleValue, y.doubleValue)
+    }
+
+    /// 保存点击位置（归一化 0~1），tweak 悬浮球读此定位（用户在 App 内调节，目标 App 内不可调）
+    static func saveClick(x: Double, y: Double) {
+        let dict = NSMutableDictionary(contentsOfFile: configPath) ?? NSMutableDictionary()
+        dict["ClickX"] = min(1, max(0, x))
+        dict["ClickY"] = min(1, max(0, y))
+        dict.write(toFile: configPath, atomically: true)
+    }
+
     // MARK: - 已安装 App 枚举
 
     struct AppInfo {

@@ -2,7 +2,7 @@
 //  FloatingBallView.m
 //  FloatingTap
 //
-//  实现：悬浮球 window、拖动/捏合/长按手势、点击注入引擎、配置持久化。
+//  实现：悬浮球 window、长按手势（立即触发连点）、点击注入引擎、位置由 AutoTap 配置下发。
 //
 //  穿透说明：悬浮球 window 全屏透明，用 FTPassthroughView 的 hitTest 实现
 //  「空白区域穿透」——只有球本体接收手势，其余触摸原样交给下层 App/游戏。
@@ -17,6 +17,8 @@
 NSString *const kFloatingTapConfigPath = @"/var/mobile/Library/Preferences/FloatingTap.plist";
 NSString *const kFTKeyTargets   = @"Targets";
 NSString *const kFTKeyIntervalMs= @"IntervalMs";
+NSString *const kFTKeyClickX     = @"ClickX";
+NSString *const kFTKeyClickY     = @"ClickY";
 
 // tweak（SpringBoard 特权进程）枚举出的已装 App 清单，供 AutoTap App 读取
 // 普通 App 受沙盒/文件权限限制无法枚举，故由 tweak 代劳并写入 mobile 可读路径
@@ -39,9 +41,6 @@ static UIColor *FTTapColor(BOOL clicking) {
 }
 @end
 
-static NSString *const kPrefsBallX      = @"FloatingTap.ballX";
-static NSString *const kPrefsBallY      = @"FloatingTap.ballY";
-static NSString *const kPrefsBallSize   = @"FloatingTap.ballSize";
 static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 
 @interface FloatingBallView ()
@@ -99,18 +98,20 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 
     self.ballWindow = window;
 
-    // 恢复上次位置/大小
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    double x = [def doubleForKey:kPrefsBallX];
-    double y = [def doubleForKey:kPrefsBallY];
-    double size = [def doubleForKey:kPrefsBallSize];
-    if (size >= 24 && size <= 160) self.diameter = size;
+    // 目标 App 内悬浮球不可拖动/缩放，大小固定（updateAppearance 已按默认直径绘制）
     [self updateAppearance];
 
+    // 位置由 AutoTap 配置下发（用户在 App 内调节点击位置，此处只读不调）
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:kFloatingTapConfigPath];
+    double cxN = 0.5, cyN = 0.5;
+    id vx = cfg[kFTKeyClickX], vy = cfg[kFTKeyClickY];
+    if ([vx respondsToSelector:@selector(doubleValue)]) cxN = [vx doubleValue];
+    if ([vy respondsToSelector:@selector(doubleValue)]) cyN = [vy doubleValue];
+    cxN = MIN(MAX(cxN, 0.0), 1.0);
+    cyN = MIN(MAX(cyN, 0.0), 1.0);
+
     CGSize ss = [UIScreen mainScreen].bounds.size;
-    CGFloat cx = (x > 0 && x < 1) ? x * ss.width : ss.width * 0.85;
-    CGFloat cy = (y > 0 && y < 1) ? y * ss.height : ss.height * 0.25;
-    self.center = CGPointMake(cx, cy);
+    self.center = CGPointMake(cxN * ss.width, cyN * ss.height);
 }
 
 - (void)dismiss {
@@ -137,21 +138,14 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 }
 
 - (void)setupGestures {
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-    [self addGestureRecognizer:pan];
-
+    // 长按：立即触发连点（目标 App 内悬浮球不可拖动/缩放，只按住触发）
     UILongPressGestureRecognizer *longPress =
         [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleLongPress:)];
-    // 立即触发：手指一碰圆圈就开始连点（minimumPressDuration=0）
-    // allowableMovement 放宽到 30pt，避免按住时手指自然抖动被误判为取消
-    longPress.minimumPressDuration = 0.0;
-    longPress.allowableMovement = 30;
+    longPress.minimumPressDuration = 0.0;   // 手指一碰圆圈即开始连点
+    longPress.allowableMovement = 30;       // 抖动不误判为取消
     [self addGestureRecognizer:longPress];
 
-    UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(handlePinch:)];
-    [self addGestureRecognizer:pinch];
-
-    // 双击：关闭悬浮球（不再显示；想恢复时 sbreload 重载即可）
+    // 双击：关闭悬浮球（想恢复时切走目标 App 再切回，或 sbreload）
     UITapGestureRecognizer *doubleTap =
         [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleDoubleTap:)];
     doubleTap.numberOfTapsRequired = 2;
@@ -201,30 +195,6 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 
 // MARK: - 手势
 
-- (void)handlePan:(UIPanGestureRecognizer *)g {
-    CGSize ss = [UIScreen mainScreen].bounds.size;
-    if (g.state == UIGestureRecognizerStateBegan) {
-        self.panAnchor = [g locationInView:self.superview];
-    } else if (g.state == UIGestureRecognizerStateChanged) {
-        CGPoint p = [g locationInView:self.superview];
-        CGPoint c = self.center;
-        c.x += p.x - self.panAnchor.x;
-        c.y += p.y - self.panAnchor.y;
-        self.panAnchor = p;
-        CGFloat r = self.diameter / 2;
-        c.x = MIN(MAX(c.x, r), MAX(r, ss.width - r));
-        c.y = MIN(MAX(c.y, r), MAX(r, ss.height - r));
-        self.center = c;
-        [self persistPosition];
-    } else if (g.state == UIGestureRecognizerStateEnded ||
-               g.state == UIGestureRecognizerStateCancelled ||
-               g.state == UIGestureRecognizerStateFailed) {
-        // 拖动结束时也强制停止连点：防止 UIPan 抢走触摸后
-        // UILongPress 的 Ended 不派发，导致 stopClicking 永不调用而一直触发
-        [self stopClicking];
-    }
-}
-
 - (void)handleLongPress:(UILongPressGestureRecognizer *)g {
     if (g.state == UIGestureRecognizerStateBegan) {
         [self startClicking];
@@ -232,16 +202,6 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
                g.state == UIGestureRecognizerStateCancelled ||
                g.state == UIGestureRecognizerStateFailed) {
         [self stopClicking];
-    }
-}
-
-- (void)handlePinch:(UIPinchGestureRecognizer *)g {
-    if (g.state == UIGestureRecognizerStateChanged) {
-        CGFloat newD = MIN(MAX(self.diameter * g.scale, 24), 160);
-        g.scale = 1;
-        self.diameter = newD;
-        [self updateAppearance];
-        [self persistSize];
     }
 }
 
@@ -384,24 +344,6 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 
     // 直接注入 HID 事件（穿透已由 FTPassthroughView 保证，无需开关 window）
     [[HIDInject shared] tapAt:tap];
-}
-
-// MARK: - 持久化
-
-- (void)persistPosition {
-    CGSize ss = [UIScreen mainScreen].bounds.size;
-    if (ss.width > 0 && ss.height > 0) {
-        NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-        [def setDouble:self.center.x / ss.width forKey:kPrefsBallX];
-        [def setDouble:self.center.y / ss.height forKey:kPrefsBallY];
-        [def synchronize];
-    }
-}
-
-- (void)persistSize {
-    NSUserDefaults *def = [NSUserDefaults standardUserDefaults];
-    [def setDouble:self.diameter forKey:kPrefsBallSize];
-    [def synchronize];
 }
 
 @end

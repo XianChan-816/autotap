@@ -420,6 +420,7 @@ final class ViewController: UIViewController {
         }
         updateCirclePosition()
         updatePointsLabel()
+        saveConfig()
     }
 
     @objc private func addPointTapped() {
@@ -437,6 +438,7 @@ final class ViewController: UIViewController {
         yField.text = "0.5"
         updatePointsLabel()
         updateCirclePosition()
+        saveConfig()
     }
 
     @objc private func orientationChanged() {
@@ -568,6 +570,10 @@ final class ViewController: UIViewController {
         UserDefaults.standard.set(currentOrientation.rawValue, forKey: "cfg.orientation")
         UserDefaults.standard.set(continuousMode, forKey: "cfg.continuous")
         UserDefaults.standard.set(Double(clickCircle.diameter), forKey: "cfg.circleSize")
+        // 同步点击位置到共享配置，供 FloatingTap tweak 悬浮球定位（球心=点击点）
+        if let (x, y) = readXY() {
+            TargetAppManager.saveClick(x: Double(x), y: Double(y))
+        }
     }
 
     private func loadSavedConfig() {
