@@ -23,7 +23,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// 是否已成功建立 HID 系统连接（代表权限生效）
 @property (nonatomic, readonly, getter=isConnected) BOOL connected;
 
-+ (instancetype)shared;
+/// 单例（声明为 class property，Swift 中按 HIDBridge.shared 属性使用；
+/// 若用类方法 +shared 导入 Swift 会变成 HIDBridge.shared() 方法，调用点全错）
+@property (class, nonatomic, readonly, strong) HIDBridge *shared;
 
 /// 初始化并连接 HID 系统服务。失败返回 NO（多为缺少 entitlement）
 - (BOOL)connect;
