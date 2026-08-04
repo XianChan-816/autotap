@@ -62,20 +62,42 @@ enum TargetAppManager {
     }
 
     /// 枚举所有已安装 App（含系统 App，可按需过滤），按显示名排序
+    /// 注意：普通 App（含 TrollStore）调用 LSApplicationWorkspace.allApplications()
+    /// 受沙盒限制返回空，因此改用**文件系统扫描**安装目录，不依赖私有 API 权限。
     static func installedApps(includeSystem: Bool = false) -> [AppInfo] {
         if let cached = cachedApps { return cached }
-        // defaultWorkspace() 在 Swift 3+ 被重命名为 default()，返回 Self!（隐式解包可选）
-        let apps = LSApplicationWorkspace.default()?.allApplications() ?? []
-        var result: [AppInfo] = []
 
-        for proxy in apps {
-            guard let bundleID = proxy.bundleIdentifier else { continue }
-            if !includeSystem && bundleID.hasPrefix("com.apple.") { continue }
-            let localized = proxy.localizedName ?? ""
-            let name = localized.count > 0 ? localized : bundleID
-            result.append(AppInfo(bundleID: bundleID, name: name))
+        // 候选根目录：覆盖 rootless（Dopamine /var/jb）与非 rootless 两种布局
+        let roots: [String] = [
+            "/var/containers/Bundle/Application",          // 非 rootless 用户 App
+            "/var/jb/var/containers/Bundle/Application",   // Dopamine rootless 用户 App
+            "/Applications",                               // 系统 App（非 rootless）
+            "/var/jb/Applications"                          // 系统 App（rootless）
+        ]
+
+        var found: [String: AppInfo] = [:]  // bundleID -> info（去重）
+        let fm = FileManager.default
+
+        for root in roots {
+            guard let dirs = try? fm.contentsOfDirectory(atPath: root) else { continue }
+            for dir in dirs {
+                let appDir = (root as NSString).appendingPathComponent(dir)
+                guard let apps = try? fm.contentsOfDirectory(atPath: appDir) else { continue }
+                for appName in apps where appName.hasSuffix(".app") {
+                    let infoPath = ((appDir as NSString).appendingPathComponent(appName)
+                                    as NSString).appendingPathComponent("Info.plist")
+                    guard let dict = NSDictionary(contentsOfFile: infoPath),
+                          let bid = dict["CFBundleIdentifier"] as? String, !bid.isEmpty else { continue }
+                    if !includeSystem && bid.hasPrefix("com.apple.") { continue }
+                    let display = (dict["CFBundleDisplayName"] as? String)
+                        ?? (dict["CFBundleName"] as? String)
+                        ?? bid
+                    found[bid] = AppInfo(bundleID: bid, name: display)
+                }
+            }
         }
 
+        var result = Array(found.values)
         result.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         cachedApps = result
         return result
