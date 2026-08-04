@@ -14,21 +14,19 @@
 #import <objc/runtime.h>
 
 // 共享配置（AutoTap App 与 tweak 共同读写；rootless 下系统偏好目录不变）
-NSString *const kFloatingTapConfigPath = @"/var/mobile/Library/Preferences/FloatingTap.plist";
+NSString *const kFloatingTapConfigPath = @"/var/mobile/Documents/FloatingTap/config.plist";
 NSString *const kFTKeyTargets   = @"Targets";
 NSString *const kFTKeyIntervalMs= @"IntervalMs";
 NSString *const kFTKeyClickX     = @"ClickX";
 NSString *const kFTKeyClickY     = @"ClickY";
 
 // tweak（SpringBoard 特权进程）枚举出的已装 App 清单，供 AutoTap App 读取
-// 普通 App 受沙盒/文件权限限制无法枚举，故由 tweak 代劳并写入 mobile 可读路径
-NSString *const kFloatingTapAppsDumpPath = @"/var/mobile/Library/Preferences/FloatingTap.apps.plist";
-
-// 枚举诊断状态（App 读此判断 tweak 是否加载、导出是否成功）：_count / _error / _time
-NSString *const kFloatingTapAppsStatusPath = @"/var/mobile/Library/Preferences/FloatingTap.apps.status.plist";
-
-// tweak 心跳（%ctor 立即写入，证明 tweak 已加载并运行；App 读此判断 tweak 是否在线）
-NSString *const kFloatingTapTweakStatusPath = @"/var/mobile/Library/Preferences/FloatingTap.tweak.plist";
+// 注意：必须放在 mobile 用户的 Documents 目录下（/var/mobile/Library/Preferences/ 受 iOS TCC 保护，
+// App 看不到 root 写在那里的文件，会被拒为"不可写"/"不存在"）
+NSString *const kFTDataDir = @"/var/mobile/Documents/FloatingTap/";
+NSString *const kFloatingTapAppsDumpPath   = @"/var/mobile/Documents/FloatingTap/apps.plist";
+NSString *const kFloatingTapAppsStatusPath = @"/var/mobile/Documents/FloatingTap/apps.status.plist";
+NSString *const kFloatingTapTweakStatusPath = @"/var/mobile/Documents/FloatingTap/tweak.plist";
 
 // 等价 systemRed / systemBlue 的显式 RGB（不依赖 SDK 缺失的 system 颜色属性）
 static UIColor *FTTapColor(BOOL clicking) {
@@ -359,6 +357,7 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 
     if (errorMsg) [status setObject:errorMsg forKey:@"_error"];
     [status setObject:@(dict.count) forKey:@"_count"];
+    FTEnsureDataDir();
     [dict writeToFile:kFloatingTapAppsDumpPath atomically:YES];
     [status writeToFile:kFloatingTapAppsStatusPath atomically:YES];
     FTEnsureReadable(kFloatingTapAppsDumpPath);
@@ -366,14 +365,31 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
     NSLog(@"[FloatingTap] 导出 %lu 个已装 App（%@）", (unsigned long)dict.count, errorMsg ?: @"成功");
 }
 
-/// 确保文件对 mobile 用户可读（root 进程写的文件默认可能 0600，App(mobile) 读不到会误判 tweak 未加载）
+/// 确保文件对 mobile 用户可读（root 进程写的文件默认 owner=root + mode=0600，App(mobile) 读不到会误判 tweak 未加载）。
+/// 同时 chown 给 mobile:mobile (uid/gid 501)，否则即便有 r 位 mobile 也未必能跨用户读 root 文件。
 static void FTEnsureReadable(NSString *path) {
     if (!path) return;
     @try {
-        NSDictionary *attrs = @{NSFilePosixPermissions: @(0644)};
+        NSDictionary *attrs = @{
+            NSFilePosixPermissions: @(0644),
+            NSFileOwnerAccountID: @(501),  // mobile uid on iOS
+            NSFileGroupOwnerAccountID: @(501),  // mobile gid on iOS
+        };
         [[NSFileManager defaultManager] setAttributes:attrs ofItemAtPath:path error:NULL];
     } @catch (NSException *ex) {
-        NSLog(@"[FloatingTap] chmod 失败 %@: %@", path, ex);
+        NSLog(@"[FloatingTap] chmod/chown 失败 %@: %@", path, ex);
+    }
+}
+
+/// 确保数据目录存在（mobile Documents/FloatingTap/ 不一定存在）
+static void FTEnsureDataDir(void) {
+    @try {
+        [[NSFileManager defaultManager] createDirectoryAtPath:kFTDataDir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:NULL];
+    } @catch (NSException *ex) {
+        NSLog(@"[FloatingTap] mkdir %@ 失败: %@", kFTDataDir, ex);
     }
 }
 
@@ -382,9 +398,10 @@ static void FTEnsureReadable(NSString *path) {
 /// 若在 %ctor 调 [FloatingBallView shared] 会触发 UIView 初始化，卡死 SB 启动（表现为死机）。
 + (void)writeHeartbeat {
     @try {
+        FTEnsureDataDir();
         NSMutableDictionary *hb = [NSMutableDictionary dictionary];
         [hb setObject:@(YES) forKey:@"_loaded"];
-        [hb setObject:@"1.0.2" forKey:@"_version"];
+        [hb setObject:@"1.0.3" forKey:@"_version"];
         [hb setObject:@((long long)([[NSDate date] timeIntervalSince1970] * 1000)) forKey:@"_time"];
         [hb writeToFile:kFloatingTapTweakStatusPath atomically:YES];
         FTEnsureReadable(kFloatingTapTweakStatusPath);

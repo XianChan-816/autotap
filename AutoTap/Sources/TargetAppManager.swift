@@ -4,7 +4,7 @@
 //
 //  目标 App 管理：与 FloatingTap tweak 通过共享 plist 通信。
 //  - 枚举已安装 App（LSApplicationWorkspace 私有 API）
-//  - 读写 /var/mobile/Library/Preferences/FloatingTap.plist（Targets / IntervalMs）
+//  - 读写 /var/mobile/Documents/FloatingTap/config.plist（Targets / IntervalMs / ClickX / ClickY）
 //  - 打开目标 App
 //
 //  App 需在 TrollStore/越狱环境运行（platform-application + no-sandbox entitlement），
@@ -15,17 +15,21 @@ import UIKit
 
 enum TargetAppManager {
 
-    static let configPath = "/var/mobile/Library/Preferences/FloatingTap.plist"
+    static let configPath = "/var/mobile/Documents/FloatingTap/config.plist"
 
     /// tweak（SpringBoard）导出的已装 App 清单（mobile 可读路径）
     /// 普通 App 受沙盒 + 文件权限限制无法枚举已装 App，故由 FloatingTap tweak 代劳写入
-    static let appsDumpPath = "/var/mobile/Library/Preferences/FloatingTap.apps.plist"
+    /// 路径必须在 /var/mobile/Documents/ 下，/var/mobile/Library/Preferences/ 受 iOS TCC 保护
+    static let appsDumpPath = "/var/mobile/Documents/FloatingTap/apps.plist"
 
     /// 枚举诊断状态文件（tweak 写）：_count / _error / _time
-    static let appsStatusPath = "/var/mobile/Library/Preferences/FloatingTap.apps.status.plist"
+    static let appsStatusPath = "/var/mobile/Documents/FloatingTap/apps.status.plist"
 
     /// tweak 心跳文件（%ctor 立即写）：_loaded / _version / _time
-    static let tweakStatusPath = "/var/mobile/Library/Preferences/FloatingTap.tweak.plist"
+    static let tweakStatusPath = "/var/mobile/Documents/FloatingTap/tweak.plist"
+
+    /// 共享数据目录（tweak 写、App 读，约定一致）
+    static let dataDir = "/var/mobile/Documents/FloatingTap/"
 
     // MARK: - 共享配置
 
@@ -40,7 +44,7 @@ enum TargetAppManager {
     static func saveTargets(_ ids: [String]) {
         let dict = NSMutableDictionary(contentsOfFile: configPath) ?? NSMutableDictionary()
         dict["Targets"] = ids
-        dict.write(toFile: configPath, atomically: true)
+        writeConfig(dict)
     }
 
     /// 读取连点间隔（毫秒），供 tweak 使用
@@ -54,7 +58,7 @@ enum TargetAppManager {
     static func saveIntervalMs(_ ms: Int) {
         let dict = NSMutableDictionary(contentsOfFile: configPath) ?? NSMutableDictionary()
         dict["IntervalMs"] = max(1, min(ms, 60_000))
-        dict.write(toFile: configPath, atomically: true)
+        writeConfig(dict)
     }
 
     /// 读取点击位置（归一化 0~1），供 tweak 悬浮球定位（球心=点击点）
@@ -70,6 +74,15 @@ enum TargetAppManager {
         let dict = NSMutableDictionary(contentsOfFile: configPath) ?? NSMutableDictionary()
         dict["ClickX"] = min(1, max(0, x))
         dict["ClickY"] = min(1, max(0, y))
+        writeConfig(dict)
+    }
+
+    /// 写配置：先确保目录存在（mobile Documents/FloatingTap/ 可能尚未创建）
+    private static func writeConfig(_ dict: NSDictionary) {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: dataDir) {
+            try? fm.createDirectory(atPath: dataDir, withIntermediateDirectories: true)
+        }
         dict.write(toFile: configPath, atomically: true)
     }
 

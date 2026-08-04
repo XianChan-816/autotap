@@ -6,7 +6,7 @@
 //  注入目标：com.apple.springboard（见 FloatingTap.plist）
 //
 //  行为：每 0.5s 检测一次前台 App，若其 bundleID 在共享配置
-//  （/var/mobile/Library/Preferences/FloatingTap.plist 的 Targets 列表）中，
+//  （/var/mobile/Documents/FloatingTap/config.plist 的 Targets 列表）中，
 //  则显示悬浮球；离开目标 App 立即隐藏。不再全局常驻。
 //
 
