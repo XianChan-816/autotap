@@ -153,6 +153,9 @@ enum TargetAppManager {
     struct TweakDiagnostic {
         let tweakLoaded: Bool
         let tweakTime: TimeInterval
+        let hbExists: Bool
+        let hbReadDetail: String?
+        let writeTest: String?
         let dumpExists: Bool
         let dumpCount: Int
         let dumpError: String?
@@ -160,7 +163,18 @@ enum TargetAppManager {
         /// 供 UI 展示的一行状态描述
         var message: String {
             if !tweakLoaded {
-                return "tweak 未加载：心跳文件缺失/过旧。请确认 FloatingTap.deb 已安装并 sbreload。"
+                var detail = "tweak 未加载："
+                if !hbExists {
+                    detail += "App 看不到心跳文件（\(tweakStatusPath) 不存在）"
+                } else if let rd = hbReadDetail {
+                    detail += "心跳文件在，但读取失败：\(rd)"
+                } else {
+                    detail += "心跳文件在且可读，但 _loaded/_time 判定为过期"
+                }
+                if let wt = writeTest, !wt.isEmpty {
+                    detail += "；写目录测试：\(wt)"
+                }
+                return detail + "。请确认 FloatingTap.deb 已安装并 sbreload。"
             }
             if let err = dumpError, !err.isEmpty {
                 return "tweak 已加载，但枚举失败：\(err)"
@@ -174,15 +188,32 @@ enum TargetAppManager {
 
     static func tweakDiagnostic() -> TweakDiagnostic {
         let now = Date().timeIntervalSince1970
-        // 心跳
+        // 心跳：文件存在性 + 读取详情（区分「App 看不到文件」和「文件在但解析失败」）
+        let hbExists = FileManager.default.fileExists(atPath: tweakStatusPath)
         var tweakLoaded = false
         var tweakTime: TimeInterval = 0
-        if let hb = NSDictionary(contentsOfFile: tweakStatusPath),
-           (hb["_loaded"] as? NSNumber)?.boolValue == true,
-           let t = (hb["_time"] as? NSNumber)?.doubleValue {
-            // 超过 120s 视为过期（tweak 可能在 Safe Mode 下未加载）
-            tweakLoaded = (now - t/1000) < 120
-            tweakTime = t
+        var hbReadDetail: String?
+        if hbExists {
+            if let hb = NSDictionary(contentsOfFile: tweakStatusPath) {
+                if (hb["_loaded"] as? NSNumber)?.boolValue == true,
+                   let t = (hb["_time"] as? NSNumber)?.doubleValue {
+                    // 超过 120s 视为过期（tweak 可能在 Safe Mode 下未加载）
+                    tweakLoaded = (now - t/1000) < 120
+                    tweakTime = t
+                }
+            } else {
+                hbReadDetail = "NSDictionary 解析返回 nil（权限或格式问题）"
+            }
+        }
+        // 写测试：App 能否写入同一目录（判断 App 对该路径的访问能力）
+        var writeTest: String?
+        let testPath = tweakStatusPath + ".apptest"
+        do {
+            try "ok".write(toFile: testPath, atomically: true, encoding: .utf8)
+            writeTest = "可写"
+            try? FileManager.default.removeItem(atPath: testPath)
+        } catch {
+            writeTest = "不可写（\(error.localizedDescription)）"
         }
         // 枚举状态
         let dumpExists = FileManager.default.fileExists(atPath: appsDumpPath)
@@ -195,6 +226,8 @@ enum TargetAppManager {
             dumpTime = (st["_time"] as? NSNumber)?.doubleValue ?? 0
         }
         return TweakDiagnostic(tweakLoaded: tweakLoaded, tweakTime: tweakTime,
+                               hbExists: hbExists, hbReadDetail: hbReadDetail,
+                               writeTest: writeTest,
                                dumpExists: dumpExists, dumpCount: dumpCount,
                                dumpError: dumpError, dumpTime: dumpTime)
     }

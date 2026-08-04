@@ -21,7 +21,7 @@
     // SpringBoard 完全启动后再启动监控（8 秒延迟，避免启动期 KVC 私有 API 导致 SB 崩溃）
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.5
+        NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:2.0
                                                           repeats:YES
                                                             block:^(NSTimer *t) {
             // 整个轮询用 @try/@catch 包裹，KVC 抛异常不会拖死 SpringBoard
@@ -44,8 +44,8 @@
         } @catch (NSException *ex) {
             NSLog(@"[FloatingTap] 导出 App 清单异常: %@", ex);
         }
-        // 每 60s 刷新一次，覆盖新安装的 App
-        NSTimer *dumpTimer = [NSTimer scheduledTimerWithTimeInterval:60
+        // 每 300s（5 分钟）刷新一次，覆盖新安装的 App（高频全量枚举耗 CPU 发热）
+        NSTimer *dumpTimer = [NSTimer scheduledTimerWithTimeInterval:300
                                                               repeats:YES
                                                                 block:^(NSTimer *t) {
             @try { [[FloatingBallView shared] dumpInstalledApps]; }
