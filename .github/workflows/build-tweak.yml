@@ -24,18 +24,34 @@ jobs:
           sudo apt-get install -y \
             clang dpkg-dev fakeroot libc6-dev libplist-dev make libssl-dev
 
-      # Ubuntu 官方源没有 ldid 包，从源码编译（Theos 签名工具）
-      - name: Install ldid from source
+      # Ubuntu 官方源没有 ldid 包：优先下载 Procursus 预编译 Linux 二进制，
+      # 失败则用 tarball 源码编译（均不经过 git，避免认证问题）
+      - name: Install ldid
         run: |
-          git clone --depth 1 https://github.com/theos/ldid.git /tmp/ldid-src
-          cd /tmp/ldid-src
-          make -j2
-          sudo cp ldid /usr/local/bin/ldid
+          set -e
+          if curl -fsSL -o /tmp/ldid \
+              "https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64" \
+              && [ -s /tmp/ldid ]; then
+            chmod +x /tmp/ldid
+            sudo mv /tmp/ldid /usr/local/bin/ldid
+            echo "ldid: prebuilt binary OK"
+          else
+            curl -fsSL https://github.com/ProcursusTeam/ldid/archive/refs/heads/main.tar.gz -o /tmp/ldid.tar.gz
+            tar xzf /tmp/ldid.tar.gz -C /tmp
+            cd /tmp/ldid-main && make -j2
+            sudo cp ldid /usr/local/bin/ldid
+            echo "ldid: built from source OK"
+          fi
           ldid 2>&1 | head -1 || true
 
       - name: Clone Theos
         run: |
-          git clone --recursive --depth 1 https://github.com/theos/theos.git $HOME/theos
+          git clone --recursive --depth 1 https://github.com/theos/theos.git $HOME/theos || {
+            curl -fsSL https://github.com/theos/theos/archive/refs/heads/master.tar.gz -o /tmp/theos.tar.gz
+            tar xzf /tmp/theos.tar.gz -C $HOME
+            mv $HOME/theos-master $HOME/theos
+            echo "theos: fetched via tarball (no submodules)"
+          }
 
       - name: Download iOS 16.4 SDK
         run: |
