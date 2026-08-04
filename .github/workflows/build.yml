@@ -27,11 +27,14 @@ jobs:
       # 最新版 xcodegen 默认生成 objectVersion 77（Xcode 16+ 格式），Xcode 15.4 无法打开。
       - name: Install xcodegen 2.40.0 (pinned)
         run: |
-          curl -sL -o /tmp/xcodegen.zip \
+          curl -fsSL -o /tmp/xcodegen.zip \
             https://github.com/yonaskolb/XcodeGen/releases/download/2.40.0/xcodegen.zip
+          ls -la /tmp/xcodegen.zip
           unzip -q -o /tmp/xcodegen.zip -d /tmp/xcodegen
-          sudo mv /tmp/xcodegen/xcodegen /usr/local/bin/xcodegen
-          chmod +x /usr/local/bin/xcodegen
+          find /tmp/xcodegen -type f -name xcodegen
+          XGBIN=$(find /tmp/xcodegen -type f -name xcodegen | head -1)
+          sudo cp "$XGBIN" /usr/local/bin/xcodegen
+          sudo chmod +x /usr/local/bin/xcodegen
           xcodegen version
 
       - name: Generate Xcode project
