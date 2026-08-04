@@ -33,6 +33,9 @@ extern NSString *const kFTKeyIntervalMs;// NSNumber：连点间隔（毫秒）
 /// 枚举系统内已装 App 并写入 kFloatingTapAppsDumpPath（仅 SpringBoard 特权进程调用）
 - (void)dumpInstalledApps;
 
+/// tweak 加载心跳：%ctor 立即写入，供 AutoTap App 判断 tweak 是否在线
+- (void)writeHeartbeat;
+
 @end
 
 NS_ASSUME_NONNULL_END

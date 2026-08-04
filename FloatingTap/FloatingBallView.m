@@ -24,6 +24,12 @@ NSString *const kFTKeyClickY     = @"ClickY";
 // 普通 App 受沙盒/文件权限限制无法枚举，故由 tweak 代劳并写入 mobile 可读路径
 NSString *const kFloatingTapAppsDumpPath = @"/var/mobile/Library/Preferences/FloatingTap.apps.plist";
 
+// 枚举诊断状态（App 读此判断 tweak 是否加载、导出是否成功）：_count / _error / _time
+NSString *const kFloatingTapAppsStatusPath = @"/var/mobile/Library/Preferences/FloatingTap.apps.status.plist";
+
+// tweak 心跳（%ctor 立即写入，证明 tweak 已加载并运行；App 读此判断 tweak 是否在线）
+NSString *const kFloatingTapTweakStatusPath = @"/var/mobile/Library/Preferences/FloatingTap.tweak.plist";
+
 // 等价 systemRed / systemBlue 的显式 RGB（不依赖 SDK 缺失的 system 颜色属性）
 static UIColor *FTTapColor(BOOL clicking) {
     return clicking
@@ -306,32 +312,73 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 /// SpringBoard 是特权进程，LSApplicationWorkspace 枚举无限制；写到的路径对 mobile 用户可读。
 /// 普通 App 受沙盒 + 文件权限（/var/containers 属 root 0700）双重限制无法枚举，故由 tweak 代劳。
 - (void)dumpInstalledApps {
+    NSMutableDictionary *status = [NSMutableDictionary dictionary];
+    [status setObject:@(YES) forKey:@"_dumped"];
+    [status setObject:@((long long)([[NSDate date] timeIntervalSince1970] * 1000)) forKey:@"_time"];
+
+    NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+    NSString *errorMsg = nil;
+
     @try {
         Class lsClass = NSClassFromString(@"LSApplicationWorkspace");
-        if (!lsClass) return;
-        SEL selDef = NSSelectorFromString(@"defaultWorkspace");
-        if (![lsClass respondsToSelector:selDef]) return;
+        if (!lsClass) { errorMsg = @"LSApplicationWorkspace 类不存在"; }
+        else {
+            SEL selDef = NSSelectorFromString(@"defaultWorkspace");
+            if (![lsClass respondsToSelector:selDef]) { errorMsg = @"无 defaultWorkspace 方法"; }
+            else {
+                id ws = nil;
+                NSArray *apps = nil;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        id ws = [lsClass performSelector:selDef];
-        if (!ws) return;
-        SEL selAll = NSSelectorFromString(@"allApplications");
-        if (![ws respondsToSelector:selAll]) return;
-        NSArray *apps = [ws performSelector:selAll];
-        NSMutableDictionary *dict = [NSMutableDictionary dictionary];
-        for (id proxy in apps) {
-            NSString *bid = [proxy performSelector:NSSelectorFromString(@"bundleIdentifier")];
-            if (![bid isKindOfClass:[NSString class]] || bid.length == 0) continue;
-            NSString *name = [proxy performSelector:NSSelectorFromString(@"localizedName")];
-            if (![name isKindOfClass:[NSString class]] || name.length == 0) name = bid;
-            dict[bid] = name;
-        }
+                ws = [lsClass performSelector:selDef];
+                if (!ws) { errorMsg = @"defaultWorkspace 返回 nil"; }
+                else {
+                    SEL selAll = NSSelectorFromString(@"allApplications");
+                    if (![ws respondsToSelector:selAll]) { errorMsg = @"无 allApplications 方法"; }
+                    else { apps = [ws performSelector:selAll]; }
+                }
 #pragma clang diagnostic pop
-        [dict writeToFile:kFloatingTapAppsDumpPath atomically:YES];
-        NSLog(@"[FloatingTap] 已导出 %lu 个已装 App 到 %@",
-              (unsigned long)dict.count, kFloatingTapAppsDumpPath);
+                if (!errorMsg) {
+                    if (![apps isKindOfClass:[NSArray class]]) { errorMsg = @"allApplications 返回非数组"; }
+                    else {
+                        for (id proxy in apps) {
+                            // KVC 取属性（比 performSelector: 稳，property/ivar 均有效）
+                            NSString *bid = nil;
+                            @try { bid = [proxy valueForKey:@"bundleIdentifier"]; } @catch (NSException *e) {}
+                            if (![bid isKindOfClass:[NSString class]] || bid.length == 0) {
+                                @try { bid = [proxy valueForKey:@"applicationIdentifier"]; } @catch (NSException *e) {}
+                            }
+                            if (![bid isKindOfClass:[NSString class]] || bid.length == 0) continue;
+                            NSString *name = nil;
+                            @try { name = [proxy valueForKey:@"localizedName"]; } @catch (NSException *e) {}
+                            if (![name isKindOfClass:[NSString class]] || name.length == 0) name = bid;
+                            dict[bid] = name;
+                        }
+                    }
+                }
+            }
+        }
     } @catch (NSException *ex) {
-        NSLog(@"[FloatingTap] dumpInstalledApps 异常: %@", ex);
+        errorMsg = [ex description];
+    }
+
+    if (errorMsg) [status setObject:errorMsg forKey:@"_error"];
+    [status setObject:@(dict.count) forKey:@"_count"];
+    [dict writeToFile:kFloatingTapAppsDumpPath atomically:YES];
+    [status writeToFile:kFloatingTapAppsStatusPath atomically:YES];
+    NSLog(@"[FloatingTap] 导出 %lu 个已装 App（%@）", (unsigned long)dict.count, errorMsg ?: @"成功");
+}
+
+/// tweak 加载心跳：%ctor 立即写入，供 AutoTap App 判断 tweak 是否在线。
+- (void)writeHeartbeat {
+    @try {
+        NSMutableDictionary *hb = [NSMutableDictionary dictionary];
+        [hb setObject:@(YES) forKey:@"_loaded"];
+        [hb setObject:@"1.0" forKey:@"_version"];
+        [hb setObject:@((long long)([[NSDate date] timeIntervalSince1970] * 1000)) forKey:@"_time"];
+        [hb writeToFile:kFloatingTapTweakStatusPath atomically:YES];
+    } @catch (NSException *ex) {
+        NSLog(@"[FloatingTap] writeHeartbeat 异常: %@", ex);
     }
 }
 

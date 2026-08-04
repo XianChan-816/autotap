@@ -12,6 +12,7 @@ import UIKit
 final class TargetPickerViewController: UIViewController {
 
     private let tableView = UITableView(frame: .zero, style: .grouped)
+    private let statusLabel = UILabel()
     private var allApps: [TargetAppManager.AppInfo] = []
     private var selectedIDs: Set<String> = []
     private let searchController = UISearchController(searchResultsController: nil)
@@ -48,8 +49,20 @@ final class TargetPickerViewController: UIViewController {
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
         view.addSubview(tableView)
 
+        // 顶部诊断状态条（排查 tweak 是否加载 / 枚举是否成功）
+        statusLabel.numberOfLines = 0
+        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabel
+        statusLabel.backgroundColor = UIColor(white: 0.95, alpha: 1)
+        statusLabel.text = "诊断中…"
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(statusLabel)
+
         NSLayoutConstraint.activate([
-            tableView.topAnchor.constraint(equalTo: view.topAnchor),
+            statusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 8),
+            statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
+            tableView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 4),
             tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
@@ -61,12 +74,14 @@ final class TargetPickerViewController: UIViewController {
     private func loadApps() {
         TargetAppManager.invalidateCache()  // 每次打开都重新读取（tweak 清单可能已更新）
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let diag = TargetAppManager.tweakDiagnostic()
             let apps = TargetAppManager.installedApps()
             DispatchQueue.main.async {
                 self?.allApps = apps
+                self?.statusLabel.text = diag.message
                 self?.tableView.reloadData()
                 if apps.isEmpty {
-                    self?.toast("列表为空：请确认 FloatingTap tweak 已安装并 sbreload（App 清单由 tweak 导出）")
+                    self?.toast(diag.message)
                 }
             }
         }

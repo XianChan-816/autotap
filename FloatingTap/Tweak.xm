@@ -13,6 +13,10 @@
 #import "FloatingBallView.h"
 
 %ctor {
+    // 立即写入心跳（证明 tweak 已加载），不等 8s 延迟
+    @try { [[FloatingBallView shared] writeHeartbeat]; }
+    @catch (NSException *ex) { NSLog(@"[FloatingTap] 心跳写入异常: %@", ex); }
+
     // SpringBoard 完全启动后再启动监控（8 秒延迟，避免启动期 KVC 私有 API 导致 SB 崩溃）
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -47,6 +51,15 @@
             @catch (NSException *ex) { NSLog(@"[FloatingTap] 刷新 App 清单异常: %@", ex); }
         }];
         [[NSRunLoop mainRunLoop] addTimer:dumpTimer forMode:NSRunLoopCommonModes];
+
+        // 每 30s 刷新心跳（让 App 端能判断 tweak 是否仍在运行）
+        NSTimer *hbTimer = [NSTimer scheduledTimerWithTimeInterval:30
+                                                           repeats:YES
+                                                             block:^(NSTimer *t) {
+            @try { [[FloatingBallView shared] writeHeartbeat]; }
+            @catch (NSException *ex) { NSLog(@"[FloatingTap] 心跳刷新异常: %@", ex); }
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:hbTimer forMode:NSRunLoopCommonModes];
 
         NSLog(@"[FloatingTap] 前台 App 监控已启动（0.5s 轮询）");
     });

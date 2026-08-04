@@ -21,6 +21,12 @@ enum TargetAppManager {
     /// 普通 App 受沙盒 + 文件权限限制无法枚举已装 App，故由 FloatingTap tweak 代劳写入
     static let appsDumpPath = "/var/mobile/Library/Preferences/FloatingTap.apps.plist"
 
+    /// 枚举诊断状态文件（tweak 写）：_count / _error / _time
+    static let appsStatusPath = "/var/mobile/Library/Preferences/FloatingTap.apps.status.plist"
+
+    /// tweak 心跳文件（%ctor 立即写）：_loaded / _version / _time
+    static let tweakStatusPath = "/var/mobile/Library/Preferences/FloatingTap.tweak.plist"
+
     // MARK: - 共享配置
 
     /// 读取当前目标 App bundleID 列表
@@ -135,6 +141,62 @@ enum TargetAppManager {
         result.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         cachedApps = result
         return result
+    }
+
+    // MARK: - tweak 诊断
+
+    /// 读取 tweak 状态，用于排查「选择应用列表为空」问题。
+    /// - tweakLoaded：心跳文件存在且近期写入（证明 tweak 已加载）
+    /// - dumpCount：tweak 导出的 App 数量
+    /// - dumpError：tweak 枚举报错信息（若有）
+    /// - dumpTime：tweak 最近一次枚举的时间戳
+    struct TweakDiagnostic {
+        let tweakLoaded: Bool
+        let tweakTime: TimeInterval
+        let dumpExists: Bool
+        let dumpCount: Int
+        let dumpError: String?
+        let dumpTime: TimeInterval
+        /// 供 UI 展示的一行状态描述
+        var message: String {
+            if !tweakLoaded {
+                return "tweak 未加载：心跳文件缺失/过旧。请确认 FloatingTap.deb 已安装并 sbreload。"
+            }
+            if let err = dumpError, !err.isEmpty {
+                return "tweak 已加载，但枚举失败：\(err)"
+            }
+            if dumpCount == 0 {
+                return "tweak 已加载，但导出 0 个 App（枚举返回空）。"
+            }
+            return "tweak 已加载，已导出 \(dumpCount) 个 App。"
+        }
+    }
+
+    static func tweakDiagnostic() -> TweakDiagnostic {
+        let now = Date().timeIntervalSince1970
+        // 心跳
+        var tweakLoaded = false
+        var tweakTime: TimeInterval = 0
+        if let hb = NSDictionary(contentsOfFile: tweakStatusPath),
+           (hb["_loaded"] as? NSNumber)?.boolValue == true,
+           let t = (hb["_time"] as? NSNumber)?.doubleValue {
+            // 超过 120s 视为过期（tweak 可能在 Safe Mode 下未加载）
+            tweakLoaded = (now - t/1000) < 120
+            tweakTime = t
+        }
+        // 枚举状态
+        let dumpExists = FileManager.default.fileExists(atPath: appsDumpPath)
+        var dumpCount = 0
+        var dumpError: String?
+        var dumpTime: TimeInterval = 0
+        if let st = NSDictionary(contentsOfFile: appsStatusPath) {
+            dumpCount = (st["_count"] as? NSNumber)?.intValue ?? 0
+            dumpError = st["_error"] as? String
+            dumpTime = (st["_time"] as? NSNumber)?.doubleValue ?? 0
+        }
+        return TweakDiagnostic(tweakLoaded: tweakLoaded, tweakTime: tweakTime,
+                               dumpExists: dumpExists, dumpCount: dumpCount,
+                               dumpError: dumpError, dumpTime: dumpTime)
     }
 
     // MARK: - 打开目标 App
