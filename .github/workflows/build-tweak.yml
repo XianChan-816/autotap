@@ -18,31 +18,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang dpkg-dev fakeroot libc6-dev libplist-dev make libssl-dev
-
-      # Ubuntu 官方源没有 ldid 包：优先下载 Procursus 预编译 Linux 二进制，
-      # 失败则用 tarball 源码编译（均不经过 git，避免认证问题）
-      - name: Install ldid
-        run: |
-          set -e
-          if curl -fsSL -o /tmp/ldid \
-              "https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64" \
-              && [ -s /tmp/ldid ]; then
-            chmod +x /tmp/ldid
-            sudo mv /tmp/ldid /usr/local/bin/ldid
-            echo "ldid: prebuilt binary OK"
-          else
-            curl -fsSL https://github.com/ProcursusTeam/ldid/archive/refs/heads/main.tar.gz -o /tmp/ldid.tar.gz
-            tar xzf /tmp/ldid.tar.gz -C /tmp
-            cd /tmp/ldid-main && make -j2
-            sudo cp ldid /usr/local/bin/ldid
-            echo "ldid: built from source OK"
-          fi
-          ldid 2>&1 | head -1 || true
+            clang dpkg-dev fakeroot libc6-dev libplist-dev make libssl-dev xz-utils git-lfs
 
       - name: Clone Theos
         run: |
@@ -52,6 +32,22 @@ jobs:
             mv $HOME/theos-master $HOME/theos
             echo "theos: fetched via tarball (no submodules)"
           }
+
+      # Linux 上 Theos 需要预编译的 iOS 交叉工具链（clang + ldid）。
+      # 来源是 L1ghtmann/llvm-project 的 GitHub Release 预编译包（官方安装脚本同款），
+      # 不是 theos/toolchain git 仓库。解压后路径为
+      #   $THEOS/toolchain/linux/iphone/bin/{clang,ldid,...}
+      # GitHub Actions ubuntu runner 是 x86_64，下载 x86_64 版。
+      - name: Install iOS toolchain (prebuilt clang+ldid)
+        run: |
+          set -e
+          TC_URL="https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz"
+          curl -fsSL "$TC_URL" -o /tmp/toolchain.tar.xz
+          mkdir -p "$HOME/theos/toolchain"
+          tar -xJf /tmp/toolchain.tar.xz -C "$HOME/theos/toolchain/"
+          ls -la "$HOME/theos/toolchain/linux/iphone/bin/clang"
+          "$HOME/theos/toolchain/linux/iphone/bin/clang" --version | head -1
+          echo "toolchain OK"
 
       # 新版 Ubuntu 自带 Perl(5.34+) 禁止 logos 旧代码里的 `shift $args` 写法，
       # 会让 logos.pl 在预处理阶段崩溃（表现为 Preprocessing Tweak.xm Error 2）。
