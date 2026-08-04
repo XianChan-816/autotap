@@ -23,11 +23,25 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_15.4.app
 
-      - name: Install xcodegen
-        run: brew install xcodegen
+      # 固定 xcodegen 2.40.0（Xcode 15 时代版本，生成 objectVersion 60 传统格式）。
+      # 最新版 xcodegen 默认生成 objectVersion 77（Xcode 16+ 格式），Xcode 15.4 无法打开。
+      - name: Install xcodegen 2.40.0 (pinned)
+        run: |
+          curl -sL -o /tmp/xcodegen.zip \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.40.0/xcodegen.zip
+          unzip -q -o /tmp/xcodegen.zip -d /tmp/xcodegen
+          sudo mv /tmp/xcodegen/xcodegen /usr/local/bin/xcodegen
+          chmod +x /usr/local/bin/xcodegen
+          xcodegen version
 
       - name: Generate Xcode project
         run: xcodegen generate --spec AutoTap/project.yml
+
+      - name: Inspect generated project format
+        run: |
+          ls -la AutoTap/AutoTap.xcodeproj/
+          grep -E "objectVersion|compatibilityVersion" \
+            AutoTap/AutoTap.xcodeproj/project.pbxproj | head -5
 
       - name: Build app (unsigned)
         run: |
