@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ["FloatingTap/**"]
+    paths: ["FloatingTap/**", ".github/workflows/build-tweak.yml"]
 
 jobs:
   build:
@@ -53,14 +53,20 @@ jobs:
             echo "theos: fetched via tarball (no submodules)"
           }
 
-      - name: Download iOS SDK (git-lfs)
+      - name: Download iOS SDK (git-lfs single file)
         run: |
           sudo apt-get install -y git-lfs
           mkdir -p $HOME/theos/sdks
+          export GIT_LFS_SKIP_SMUDGE=1
           git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks
           cd $HOME/sdks
-          git lfs pull --include "iPhoneOS16.4.sdk.zip"
-          unzip -q -o iPhoneOS16.4.sdk.zip -d $HOME/theos/sdks
+          ls -la
+          SDK_FILE=$(ls iPhoneOS*.sdk.zip 2>/dev/null | sort -V | tail -1)
+          echo "Selected SDK: ${SDK_FILE}"
+          [ -n "$SDK_FILE" ] || { echo "NO SDK ZIP FOUND"; exit 1; }
+          git lfs pull --include "$SDK_FILE"
+          file "$SDK_FILE"
+          unzip -q -o "$SDK_FILE" -d $HOME/theos/sdks
           ls $HOME/theos/sdks
 
       - name: Build .deb
