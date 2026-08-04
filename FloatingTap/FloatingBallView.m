@@ -311,6 +311,8 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
         if (!lsClass) return;
         SEL selDef = NSSelectorFromString(@"defaultWorkspace");
         if (![lsClass respondsToSelector:selDef]) return;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
         id ws = [lsClass performSelector:selDef];
         if (!ws) return;
         SEL selAll = NSSelectorFromString(@"allApplications");
@@ -324,6 +326,7 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
             if (![name isKindOfClass:[NSString class]] || name.length == 0) name = bid;
             dict[bid] = name;
         }
+#pragma clang diagnostic pop
         [dict writeToFile:kFloatingTapAppsDumpPath atomically:YES];
         NSLog(@"[FloatingTap] 已导出 %lu 个已装 App 到 %@",
               (unsigned long)dict.count, kFloatingTapAppsDumpPath);

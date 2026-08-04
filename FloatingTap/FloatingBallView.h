@@ -30,6 +30,9 @@ extern NSString *const kFTKeyIntervalMs;// NSNumber：连点间隔（毫秒）
 /// 依据前台 App 是否在目标列表，自动显示/隐藏悬浮球（由 Tweak.xm 定时调用）
 - (void)updateVisibilityForFrontmostApp;
 
+/// 枚举系统内已装 App 并写入 kFloatingTapAppsDumpPath（仅 SpringBoard 特权进程调用）
+- (void)dumpInstalledApps;
+
 @end
 
 NS_ASSUME_NONNULL_END
