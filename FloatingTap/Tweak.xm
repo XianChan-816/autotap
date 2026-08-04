@@ -14,7 +14,8 @@
 
 %ctor {
     // 立即写入心跳（证明 tweak 已加载），不等 8s 延迟
-    @try { [[FloatingBallView shared] writeHeartbeat]; }
+    // 用类方法，绝不在 %ctor 调 [FloatingBallView shared]（会触发 UIView 初始化卡死 SB）
+    @try { [FloatingBallView writeHeartbeat]; }
     @catch (NSException *ex) { NSLog(@"[FloatingTap] 心跳写入异常: %@", ex); }
 
     // SpringBoard 完全启动后再启动监控（8 秒延迟，避免启动期 KVC 私有 API 导致 SB 崩溃）
@@ -56,7 +57,7 @@
         NSTimer *hbTimer = [NSTimer scheduledTimerWithTimeInterval:30
                                                            repeats:YES
                                                              block:^(NSTimer *t) {
-            @try { [[FloatingBallView shared] writeHeartbeat]; }
+            @try { [FloatingBallView writeHeartbeat]; }
             @catch (NSException *ex) { NSLog(@"[FloatingTap] 心跳刷新异常: %@", ex); }
         }];
         [[NSRunLoop mainRunLoop] addTimer:hbTimer forMode:NSRunLoopCommonModes];

@@ -322,41 +322,36 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
     @try {
         Class lsClass = NSClassFromString(@"LSApplicationWorkspace");
         if (!lsClass) { errorMsg = @"LSApplicationWorkspace 类不存在"; }
+        else if (![lsClass respondsToSelector:NSSelectorFromString(@"defaultWorkspace")]) { errorMsg = @"无 defaultWorkspace 方法"; }
         else {
-            SEL selDef = NSSelectorFromString(@"defaultWorkspace");
-            if (![lsClass respondsToSelector:selDef]) { errorMsg = @"无 defaultWorkspace 方法"; }
-            else {
-                id ws = nil;
-                NSArray *apps = nil;
+            id ws = nil;
+            NSArray *apps = nil;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                ws = [lsClass performSelector:selDef];
-                if (!ws) { errorMsg = @"defaultWorkspace 返回 nil"; }
+            ws = [lsClass performSelector:NSSelectorFromString(@"defaultWorkspace")];
+            if (!ws) { errorMsg = @"defaultWorkspace 返回 nil"; }
+            else if (![ws respondsToSelector:NSSelectorFromString(@"allApplications")]) { errorMsg = @"无 allApplications 方法"; }
+            else { apps = [ws performSelector:NSSelectorFromString(@"allApplications")]; }
+            if (!errorMsg) {
+                if (![apps isKindOfClass:[NSArray class]]) { errorMsg = @"allApplications 返回非数组"; }
                 else {
-                    SEL selAll = NSSelectorFromString(@"allApplications");
-                    if (![ws respondsToSelector:selAll]) { errorMsg = @"无 allApplications 方法"; }
-                    else { apps = [ws performSelector:selAll]; }
-                }
-#pragma clang diagnostic pop
-                if (!errorMsg) {
-                    if (![apps isKindOfClass:[NSArray class]]) { errorMsg = @"allApplications 返回非数组"; }
-                    else {
-                        for (id proxy in apps) {
-                            // KVC 取属性（比 performSelector: 稳，property/ivar 均有效）
-                            NSString *bid = nil;
-                            @try { bid = [proxy valueForKey:@"bundleIdentifier"]; } @catch (NSException *e) {}
-                            if (![bid isKindOfClass:[NSString class]] || bid.length == 0) {
-                                @try { bid = [proxy valueForKey:@"applicationIdentifier"]; } @catch (NSException *e) {}
-                            }
-                            if (![bid isKindOfClass:[NSString class]] || bid.length == 0) continue;
-                            NSString *name = nil;
-                            @try { name = [proxy valueForKey:@"localizedName"]; } @catch (NSException *e) {}
-                            if (![name isKindOfClass:[NSString class]] || name.length == 0) name = bid;
-                            dict[bid] = name;
+                    for (id proxy in apps) {
+                        // 每个代理先确认响应 selector，避免 unrecognized selector 崩溃
+                        SEL selBid = NSSelectorFromString(@"bundleIdentifier");
+                        if (![proxy respondsToSelector:selBid]) continue;
+                        NSString *bid = [proxy performSelector:selBid];
+                        if (![bid isKindOfClass:[NSString class]] || bid.length == 0) continue;
+                        NSString *name = bid;
+                        SEL selName = NSSelectorFromString(@"localizedName");
+                        if ([proxy respondsToSelector:selName]) {
+                            NSString *n = (NSString *)[proxy performSelector:selName];
+                            if ([n isKindOfClass:[NSString class]] && n.length > 0) name = n;
                         }
+                        dict[bid] = name;
                     }
                 }
             }
+#pragma clang diagnostic pop
         }
     } @catch (NSException *ex) {
         errorMsg = [ex description];
@@ -370,7 +365,9 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
 }
 
 /// tweak 加载心跳：%ctor 立即写入，供 AutoTap App 判断 tweak 是否在线。
-- (void)writeHeartbeat {
+/// 注意：必须是类方法，绝不碰 shared/UIKit —— %ctor 阶段 SpringBoard 界面未就绪，
+/// 若在 %ctor 调 [FloatingBallView shared] 会触发 UIView 初始化，卡死 SB 启动（表现为死机）。
++ (void)writeHeartbeat {
     @try {
         NSMutableDictionary *hb = [NSMutableDictionary dictionary];
         [hb setObject:@(YES) forKey:@"_loaded"];
