@@ -64,7 +64,7 @@ enum TargetAppManager {
     /// 枚举所有已安装 App（含系统 App，可按需过滤），按显示名排序
     static func installedApps(includeSystem: Bool = false) -> [AppInfo] {
         if let cached = cachedApps { return cached }
-        guard let workspace = LSApplicationWorkspace.defaultWorkspace() else { return [] }
+        let workspace = LSApplicationWorkspace.defaultWorkspace()
         let apps = workspace.allApplications() ?? []
         var result: [AppInfo] = []
 
@@ -86,7 +86,7 @@ enum TargetAppManager {
     /// 通过 LSApplicationWorkspace 打开目标 App
     @discardableResult
     static func openApp(bundleID: String) -> Bool {
-        guard let workspace = LSApplicationWorkspace.defaultWorkspace() else { return false }
+        let workspace = LSApplicationWorkspace.defaultWorkspace()
         return workspace.openApplication(withBundleID: bundleID)
     }
 }
