@@ -17,6 +17,15 @@
 
 import UIKit
 
+// MARK: - tweak handler 包装（NSObject 子类，避开 closure→@convention(c) 转换问题）
+
+/// Box 类：把 Swift 闭包包装成 NSObject，让 Darwin notification 的 C callback 能安全持有
+final class TweakUpdateBox: NSObject {
+    let handler: () -> Void
+    init(_ h: @escaping () -> Void) { self.handler = h }
+    @objc func invoke() { handler() }
+}
+
 enum TargetAppManager {
 
     // MARK: - 路径（全部在 App 沙盒 Caches 内，App 100% 可写可读）
@@ -56,13 +65,6 @@ enum TargetAppManager {
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         let name = CFNotificationName(rawValue: notifyAppStarted)
         CFNotificationCenterPostNotification(center, name, nil, nil, true)
-    }
-
-    /// Box 类：把 Swift 闭包包装成 NSObject，让 Darwin notification 的 C callback 能安全持有
-    private final class TweakUpdateBox: NSObject {
-        let handler: () -> Void
-        init(_ h: @escaping () -> Void) { self.handler = h }
-        @objc func invoke() { handler() }
     }
 
     /// App 监听 tweak 数据更新（心跳、App 列表）。收到后回调 handler，由 UI reload。
