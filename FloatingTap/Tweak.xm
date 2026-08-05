@@ -15,6 +15,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>   // 仅类型声明（UIWindow/UIEvent），不产生运行时元数据；%hook 需要
 #import <stdio.h>
 #import <syslog.h>
 #import <time.h>
