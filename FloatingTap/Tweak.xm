@@ -147,18 +147,20 @@ static BOOL FTUIReady(void) {
 
 static unsigned long gClickCount = 0; // 本次连点周期内的点击次数（诊断）
 
-// 读取连点间隔（毫秒）：/var/mobile/Library/Preferences/com.floatingtap.cfg 第一行数字，默认 200
+// 读取连点间隔（毫秒）：/var/mobile/Library/Preferences/com.floatingtap.cfg 第一行数字。
+// ⚠️ v1.0.46：默认 400ms——iOS 双击识别窗口约 350ms，间隔小于它会触发 tapCount 累积
+// （v1.0.45 实测 tap=4），图标被当成多击不启动。400ms 以上每次点击独立 tapCount=1。
 static double FTIntervalMs(void) {
     FILE *f = fopen("/var/mobile/Library/Preferences/com.floatingtap.cfg", "r");
     if (f) {
-        double v = 200.0;
+        double v = 400.0;
         if (fscanf(f, "%lf", &v) == 1 && v >= 1.0 && v <= 60000.0) {
             fclose(f);
             return v;
         }
         fclose(f);
     }
-    return 200.0;
+    return 400.0;
 }
 
 // 恢复球窗口交互（注入后 60ms 回调）
@@ -564,10 +566,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.45 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.46 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.45 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.46 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
