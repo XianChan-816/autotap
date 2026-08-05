@@ -79,6 +79,8 @@ final class TargetPickerViewController: UIViewController {
             object: nil
         )
     }
+
+    private func loadApps() {
         TargetAppManager.invalidateCache()  // 每次打开都重新读取（tweak 清单可能已更新）
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let diag = TargetAppManager.tweakDiagnostic()

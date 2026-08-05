@@ -49,20 +49,20 @@ enum TargetAppManager {
     // MARK: - Darwin notification 名（跨进程 ABI，tweak 端必须一字不差）
 
     /// App 启动后发送，tweak 收到后用 proc 找到 App 反查沙盒路径
-    static let notifyAppStarted = "com.floatingtap.autotap.appStarted" as CFString
+    static let notifyAppStartedName = "com.floatingtap.autotap.appStarted" as CFString
 
     /// App 写完 config 后发送，tweak 收到后重新读取目标 App / 间隔 / 点击位置
-    static let notifyConfigUpdated = "com.floatingtap.autotap.configUpdated" as CFString
+    static let notifyConfigUpdatedName = "com.floatingtap.autotap.configUpdated" as CFString
 
     /// tweak 写完心跳/枚举后发送，App 收到后重新读取 tweak status / apps
-    static let notifyTweakDataUpdated = "com.floatingtap.autotap.tweakDataUpdated" as CFString
+    static let notifyTweakDataUpdatedName = "com.floatingtap.autotap.tweakDataUpdated" as CFString
 
     // MARK: - 启动与监听
 
     /// App 启动时调用：通知 tweak 通过 proc_listpids 找 App PID 后开始写数据
     static func notifyAppStarted() {
         let center = CFNotificationCenterGetDarwinNotifyCenter()
-        let name = CFNotificationName(rawValue: notifyAppStarted)
+        let name = CFNotificationName(rawValue: notifyAppStartedName)
         CFNotificationCenterPostNotification(center, name, nil, nil, true)
     }
 
@@ -139,7 +139,7 @@ enum TargetAppManager {
     private static func writeConfig(_ dict: NSDictionary) {
         dict.write(toFile: configPath, atomically: true)
         let center = CFNotificationCenterGetDarwinNotifyCenter()
-        let name = CFNotificationName(rawValue: notifyConfigUpdated)
+        let name = CFNotificationName(rawValue: notifyConfigUpdatedName)
         CFNotificationCenterPostNotification(center, name, nil, nil, true)
     }
 
