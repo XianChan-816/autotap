@@ -16,6 +16,7 @@
 //
 
 import UIKit
+import Darwin  // notify_post / notify_register_dispatch（Darwin notification）
 
 // MARK: - tweak handler 包装（保留以备后用，当前用 polling 替代）
 
