@@ -220,7 +220,7 @@ static void FTSetupBall(void) {
 }
 
 %ctor {
-    NSLog(@"[FloatingTap] v1.0.14 已加载（零 %hook 零 @implementation 版）");
+    NSLog(@"[FloatingTap] v1.0.14 已加载 (zero-hook, zero-implementation)");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         FTSetupBall();
