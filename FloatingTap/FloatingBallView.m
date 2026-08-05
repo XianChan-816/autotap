@@ -34,7 +34,8 @@ static NSString *gAppCachesDir = nil;  // 例如 /var/mobile/Containers/Data/App
 static NSString *FTAppsPath(void)        { return gAppCachesDir ? [gAppCachesDir stringByAppendingPathComponent:@"FloatingTap.apps.plist"] : nil; }
 static NSString *FTAppsStatusPath(void)  { return gAppCachesDir ? [gAppCachesDir stringByAppendingPathComponent:@"FloatingTap.apps.status.plist"] : nil; }
 static NSString *FTTweakStatusPath(void) { return gAppCachesDir ? [gAppCachesDir stringByAppendingPathComponent:@"FloatingTap.tweak.plist"] : nil; }
-static NSString *FTConfigPath(void)      { return gAppCachesDir ? [gAppCachesDir stringByAppendingPathComponent:@"AutoTapConfig.plist"] : nil; }
+// 注意：config 路径由全局变量 kFloatingTapConfigPath 承载（FTSetAppCachesDir 赋值），
+// 不再需要独立的 FTConfigPath()，避免 -Wunused-function 报错。
 
 // 拿到 App 沙盒 Caches 路径后由 Tweak.xm 调用（注册 Darwin notification 钩子）
 // C 函数不能用 @synchronized；调用只在主线程 Darwin 回调里发生，天然串行
