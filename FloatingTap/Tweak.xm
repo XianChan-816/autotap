@@ -1,12 +1,11 @@
 //
-//  Tweak.xm — FloatingTap v1.0.24
+//  Tweak.xm — FloatingTap v1.0.25
 //
-//  v1.0.23 实测：日志显示长按 0.4~0.9s 正常触发（clicking started/stopped 带时间戳），
-//  HID connect 成功、无 DispatchEvent failed——但屏幕无点击效果 → **HID 事件构造无效**。
-//  根因（HIDInject.c）：IOHIDEventCreateDigitizerEvent 的 type 参数误传事件类型 11，
-//  应为转换器类型 Hand(3)；坐标放在 finger 子事件而 parent 坐标=0；时间戳做了
-//  timebase 纳秒换算。v1.0.24 改为经典单事件写法（坐标直传 + Hand type +
-//  mach_absolute_time 原始值），并删掉 finger/append 子事件组合。
+//  v1.0.24 实测：点击计数与按住时长完美对应（7.3s→37 次），连点引擎正常，
+//  但屏幕无反应 → HID 事件被系统静默丢弃。根因：合成触摸事件缺少
+//  kIOHIDEventFieldDigitizerIsDisplayIntegrated(0x0B0014)=1 标记，
+//  系统不把它当屏幕触摸。v1.0.25 补：IOHIDEventSetIntegerValue(event,0x0B0014,1)
+//  + client SetDispatchQueue（zxtouch/autotouch iOS 15 兼容写法）。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
@@ -413,10 +412,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.24 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.25 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.24 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.25 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),

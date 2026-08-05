@@ -1,14 +1,15 @@
 //
 //  HIDInject.c — FloatingTap HID 注入引擎（纯 C 版）
 //
-//  v1.0.20：由 ObjC 类 HIDInject/HIDTap 重写为纯 C。
-//  构造 kIOHIDEventTypeDigitizer 事件（父事件 + 手指子事件），
-//  通过 IOHIDEventSystemClientDispatchEvent 派发到系统 HID 服务，实现全局触摸注入。
+//  v1.0.24/25：经典单事件写法（zxtouch/autotouch 验证 iOS 13-16 有效）——
+//  构造 kIOHIDEventTypeDigitizer 触摸事件（type=Hand 转换器，坐标直传，归一化 0~1），
+//  标记 kIOHIDEventFieldDigitizerIsDisplayIntegrated=1（关键，否则系统丢弃），
+//  IOHIDEventSystemClientDispatchEvent 派发到系统 HID 服务，实现全局触摸注入。
 //  SpringBoard 进程自身具备 HID entitlement，越狱环境可直接调用。
 //
 //  ⚠️ 纯 C 约束（arm64e PAC 环境铁律）：
 //     - 无 @implementation / @"..." / block / @selector
-//     - 不 import Foundation.h（ObjC 头），只用 CoreFoundation（纯 C）
+//     - 不 import Foundation.h（ObjC 头），只用 CoreFoundation/GCD（纯 C）
 //     - dispatch_once 用 C 静态 flag 代替
 //
 
@@ -21,6 +22,7 @@
 #include <syslog.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <dispatch/dispatch.h>
 
 // MARK: - 私有类型与常量（本地前缀，避免与 SDK IOKit 头冲突）
 
@@ -63,7 +65,9 @@ static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerEvent)(CFAllocatorRef,
 static FT_IOHIDEventSystemClientRef (*p_IOHIDEventSystemClientCreate)(CFAllocatorRef);
 static FT_IOReturn (*p_IOHIDEventSystemClientDispatchEvent)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef);
 static void (*p_IOHIDEventSystemClientScheduleWithRunLoop)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef);
+static void (*p_IOHIDEventSystemClientSetDispatchQueue)(FT_IOHIDEventSystemClientRef, dispatch_queue_t);
 static void (*p_IOHIDEventSetSenderID)(FT_IOHIDEventRef, uint64_t);
+static void (*p_IOHIDEventSetIntegerValue)(FT_IOHIDEventRef, uint32_t, int64_t);
 
 // MARK: - 状态
 
@@ -93,8 +97,12 @@ static bool FT_HIDLoadSymbols(void) {
         (FT_IOReturn (*)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef))dlsym(handle, "IOHIDEventSystemClientDispatchEvent");
     p_IOHIDEventSystemClientScheduleWithRunLoop =
         (void (*)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef))dlsym(handle, "IOHIDEventSystemClientScheduleWithRunLoop");
+    p_IOHIDEventSystemClientSetDispatchQueue =
+        (void (*)(FT_IOHIDEventSystemClientRef, dispatch_queue_t))dlsym(handle, "IOHIDEventSystemClientSetDispatchQueue");
     p_IOHIDEventSetSenderID =
         (void (*)(FT_IOHIDEventRef, uint64_t))dlsym(handle, "IOHIDEventSetSenderID");
+    p_IOHIDEventSetIntegerValue =
+        (void (*)(FT_IOHIDEventRef, uint32_t, int64_t))dlsym(handle, "IOHIDEventSetIntegerValue");
 
     g_hidLoaded = (p_IOHIDEventCreateDigitizerEvent &&
                    p_IOHIDEventSystemClientCreate &&
@@ -116,9 +124,12 @@ bool FT_HIDConnect(void) {
         syslog(LOG_ERR, "FloatingTap HID client create failed");
         return false;
     }
-    // 部分 iOS 版本需要把 client 挂到 runloop 才会真正派发事件（符号存在则挂，失败无害）
+    // 部分 iOS 版本需要 client 挂 runloop/dispatch queue 才会真正派发事件（符号存在则挂，失败无害）
     if (p_IOHIDEventSystemClientScheduleWithRunLoop) {
         p_IOHIDEventSystemClientScheduleWithRunLoop(g_hidClient, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+    }
+    if (p_IOHIDEventSystemClientSetDispatchQueue) {
+        p_IOHIDEventSystemClientSetDispatchQueue(g_hidClient, dispatch_get_main_queue());
     }
     syslog(LOG_ERR, "FloatingTap HID connected");
     return true;
@@ -134,9 +145,12 @@ static uint64_t FT_SenderID(void) {
     return 0x8000000817371935ULL;
 }
 
-// 经典单事件写法（社区验证 iOS 13-16 有效）：
-// type 参数必须是转换器类型 kIOHIDDigitizerTransducerTypeHand(3)，不是事件类型(11)；
-// 坐标直接放事件本体；时间戳用 mach_absolute_time() 原始值（不做 timebase 换算）。
+// 经典单事件写法（zxtouch/autotouch 在 iOS 13-16 验证有效）：
+// - type 参数必须是转换器类型 kIOHIDDigitizerTransducerTypeHand(3)，不是事件类型(11)；
+// - 坐标直接放事件本体（归一化 0~1）；
+// - 时间戳用 mach_absolute_time() 原始值；
+// - 关键：必须 IOHIDEventSetIntegerValue(event, 0x0B0014, 1)
+//   （kIOHIDEventFieldDigitizerIsDisplayIntegrated），否则系统不把事件当屏幕触摸，直接丢弃。
 static FT_IOHIDEventRef FT_DigitizerEvent(bool down, double x, double y) {
     uint32_t mask = down
         ? (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventTouch |
@@ -144,7 +158,7 @@ static FT_IOHIDEventRef FT_DigitizerEvent(bool down, double x, double y) {
            FT_kIOHIDDigitizerEventIdentity)
         : (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventIdentity);
 
-    return p_IOHIDEventCreateDigitizerEvent(
+    FT_IOHIDEventRef event = p_IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault,
         mach_absolute_time(),          // 原始 tick，不做纳秒换算
         3,                             // kIOHIDDigitizerTransducerTypeHand
@@ -159,6 +173,12 @@ static FT_IOHIDEventRef FT_DigitizerEvent(bool down, double x, double y) {
         true,                          // range
         down,                          // touch
         0);                            // optionsBits
+
+    if (event && p_IOHIDEventSetIntegerValue) {
+        // kIOHIDEventFieldDigitizerIsDisplayIntegrated —— 标记为屏幕集成触摸，否则被系统丢弃
+        p_IOHIDEventSetIntegerValue(event, 0x0B0014, 1);
+    }
+    return event;
 }
 
 static void FT_DispatchEvent(FT_IOHIDEventRef event) {
