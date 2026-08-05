@@ -1,10 +1,11 @@
 //
-//  Tweak.xm — FloatingTap v1.0.37
+//  Tweak.xm — FloatingTap v1.0.38
 //
-//  参考 zxtouch 源码（DeepWiki）发现根因：IOHIDEventCreateDigitizerEvent 是 15 参数，
-//  v1.0.24~36 误用 16 参数（多一个 options）→ index 起全部参数错位 → 事件畸形被 iOS 忽略。
-//  v1.0.37：修正 15 参数签名（HIDInject.c）。保持 _hidEvent+_gsEvent 双通道注入。
-//  若仍无效：下一步从真实触摸提取设备 senderID（zxtouch 机制，硬编码 0x8000000817371935 可能被拒）。
+//  v1.0.37 实测：15 参修正 + senderID 捕获后注入仍无效果（senderID 日志走 syslog
+//  文件看不到，状态不明）。v1.0.38 干净验证：注入只走 _gsEvent 单通道（排除
+//  _hidEvent 干扰），senderID 捕获状态改 FTHIDLog 写文件（capture started /
+//  captured senderID / no register callback symbol 均可见），GSEvent 构造状态
+//  也写日志（gs event create unavailable/failed）。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
@@ -181,52 +182,47 @@ static void FTLoadGSEvent(void) {
     g_gsLoaded = true;
 }
 
-// 构造 UIEvent 携带 hid+gs 事件并 sendEvent。
-// v1.0.35 实测：只塞 _hidEvent 时 UIKit 提取触摸失败（无效果）。
-// v1.0.36：同时塞 _gsEvent（GSEventCreateTouchEvent，老路径）+ 补 _timestamp（double ivar）。
+// 构造 UIEvent 携带 GSEvent 并 sendEvent（v1.0.38：只走 _gsEvent 单通道验证，
+// 排除 _hidEvent 干扰；GSEventCreateTouchEvent 是 iOS 15 GraphicsServices 老触摸路径）
 static void FTSendHIDEvent(id app, bool down, double nx, double ny) {
     Class ClsEvent = objc_getClass("UIEvent");
     if (!ClsEvent || !app) return;
     FTLoadGSEvent();
-
-    FT_IOHIDEventRef hid = FT_HIDCreateDigitizerEvent(down, nx, ny);
-    if (!hid) {
-        FTLog("hid event create failed");
+    if (!p_GSEventCreateTouchEvent) {
+        FTLog("gs event create unavailable");
         return;
     }
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 
+    FT_GSEventRef gs = p_GSEventCreateTouchEvent(CGPointMake(nx * gScreenW, ny * gScreenH),
+                                                 CGPointZero, now, 0);
+    if (!gs) {
+        FTLog("gs event create failed");
+        return;
+    }
     id event = FTAlloc(ClsEvent);
-    if (!event) { CFRelease(hid); return; }
+    if (!event) { CFRelease(gs); return; }
     event = ((Msg_Init)objc_msgSend)(event, sel_registerName("init"));
     char *base = (char *)(__bridge void *)event;
 
-    // _hidEvent（IOHIDEventRef 指针 ivar）
-    Ivar ivarHid = class_getInstanceVariable(ClsEvent, "_hidEvent");
-    if (ivarHid) {
-        *(void **)(base + ivar_getOffset(ivarHid)) = hid;
-    } else {
-        FTLog("UIEvent no _hidEvent ivar");
-        CFRelease(hid);
+    Ivar ivarGs = class_getInstanceVariable(ClsEvent, "_gsEvent");
+    if (!ivarGs) {
+        FTLog("UIEvent no _gsEvent ivar");
+        CFRelease(gs);
         return;
     }
+    *(void **)(base + ivar_getOffset(ivarGs)) = gs;
 
-    // _gsEvent（GSEventRef 指针 ivar）
-    if (p_GSEventCreateTouchEvent) {
-        FT_GSEventRef gs = p_GSEventCreateTouchEvent(CGPointMake(nx * gScreenW, ny * gScreenH),
-                                                     CGPointZero, now, 0);
-        if (gs) {
-            Ivar ivarGs = class_getInstanceVariable(ClsEvent, "_gsEvent");
-            if (ivarGs) {
-                *(void **)(base + ivar_getOffset(ivarGs)) = gs;
-            } else {
-                FTLog("UIEvent no _gsEvent ivar");
-            }
-        }
+    Ivar ivarTs = class_getInstanceVariable(ClsEvent, "_timestamp");
+    if (ivarTs) {
+        *(double *)(base + ivar_getOffset(ivarTs)) = now;
     }
 
+    ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
+    CFRelease(gs);
+}
     // _timestamp（NSTimeInterval double ivar）
     Ivar ivarTs = class_getInstanceVariable(ClsEvent, "_timestamp");
     if (ivarTs) {
@@ -234,14 +230,7 @@ static void FTSendHIDEvent(id app, bool down, double nx, double ny) {
     }
 
     ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
-
-    // 释放我们持有的引用（event 不 retain 这些 CF 指针）
-    Ivar ivarGs2 = class_getInstanceVariable(ClsEvent, "_gsEvent");
-    if (ivarGs2) {
-        void *gs2 = *(void **)(base + ivar_getOffset(ivarGs2));
-        if (gs2) CFRelease(gs2);
-    }
-    CFRelease(hid);
+    CFRelease(gs);
 }
 
 // 诊断：dump UIEvent 的 ivar 名（已确认有 _hidEvent/_gsEvent）
@@ -584,10 +573,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.37 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.38 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.37 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.38 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),

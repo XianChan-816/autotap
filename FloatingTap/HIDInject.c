@@ -145,6 +145,16 @@ bool FT_HIDIsConnected(void) {
     return g_hidClient != NULL;
 }
 
+// MARK: - 诊断日志（写文件，Filza 可见；与 Tweak.xm 的 FTLog 共用文件）
+
+static void FTHIDLog(const char *msg) {
+    FILE *f = fopen("/tmp/floatingtap_ctor.log", "a");
+    if (f) {
+        fprintf(f, "%s\n", msg);
+        fclose(f);
+    }
+}
+
 // MARK: - senderID 捕获（zxtouch 机制：从真实触摸提取设备专属 senderID）
 
 static uint64_t g_deviceSenderID = 0;
@@ -157,7 +167,9 @@ static void FT_SIDCallback(void *target, void *refcon, FT_IOHIDServiceRef servic
         uint64_t sid = p_IOHIDEventGetSenderID(event);
         if (sid) {
             g_deviceSenderID = sid;
-            syslog(LOG_ERR, "FloatingTap captured senderID: 0x%llx", (unsigned long long)sid);
+            char buf[96];
+            snprintf(buf, sizeof(buf), "captured senderID: 0x%llx", (unsigned long long)sid);
+            FTHIDLog(buf);
             // 提取到后注销捕获 client
             if (g_sidClient) {
                 if (p_IOHIDEventSystemClientUnscheduleWithRunLoop) {
@@ -174,16 +186,19 @@ void FT_HIDStartSenderIDCapture(void) {
     if (g_sidClient || g_deviceSenderID) return;
     if (!FT_HIDLoadSymbols()) return;
     if (!p_IOHIDEventSystemClientRegisterEventCallback) {
-        syslog(LOG_ERR, "FloatingTap no register callback symbol");
+        FTHIDLog("senderID: no register callback symbol");
         return;
     }
     g_sidClient = p_IOHIDEventSystemClientCreate(kCFAllocatorDefault);
-    if (!g_sidClient) return;
+    if (!g_sidClient) {
+        FTHIDLog("senderID: client create failed");
+        return;
+    }
     p_IOHIDEventSystemClientRegisterEventCallback(g_sidClient, FT_SIDCallback, NULL, NULL);
     if (p_IOHIDEventSystemClientScheduleWithRunLoop) {
         p_IOHIDEventSystemClientScheduleWithRunLoop(g_sidClient, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
     }
-    syslog(LOG_ERR, "FloatingTap senderID capture started");
+    FTHIDLog("senderID capture started");
 }
 
 uint64_t FT_HIDSenderID(void) {
