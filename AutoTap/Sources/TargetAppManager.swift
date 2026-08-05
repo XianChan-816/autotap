@@ -17,9 +17,8 @@
 
 import UIKit
 
-// MARK: - tweak handler 包装（NSObject 子类，避开 closure→@convention(c) 转换问题）
+// MARK: - tweak handler 包装（保留以备后用，当前用 polling 替代）
 
-/// Box 类：把 Swift 闭包包装成 NSObject，让 Darwin notification 的 C callback 能安全持有
 final class TweakUpdateBox: NSObject {
     let handler: () -> Void
     init(_ h: @escaping () -> Void) { self.handler = h }
@@ -60,30 +59,34 @@ enum TargetAppManager {
 
     // MARK: - 启动与监听
 
-    /// App 启动时调用：通知 tweak 反查沙盒路径开始写数据
+    /// App 启动时调用：通知 tweak 通过 proc_listpids 找 App PID 后开始写数据
     static func notifyAppStarted() {
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         let name = CFNotificationName(rawValue: notifyAppStarted)
         CFNotificationCenterPostNotification(center, name, nil, nil, true)
     }
 
-    /// App 监听 tweak 数据更新（心跳、App 列表）。收到后回调 handler，由 UI reload。
+    /// App 端轮询心跳文件变化（替代 CFNotification AddObserver，避开 Swift closure→@convention(c) 转换问题）
+    /// 每 2s 检查 tweak.plist 的 _time 字段，变化就回调 handler（由 UI reload）
+    private static var lastSeenTweakTime: TimeInterval = 0
+    private static var pollingTimer: Timer?
+
     static func startListeningForTweakUpdates(handler: @escaping () -> Void) {
-        let box = TweakUpdateBox(handler)
-        let observer = Unmanaged.passUnretained(box).toOpaque()
-        let cb: CFNotificationCallback = { (_, obs, _, _, _) in
-            guard let obs = obs else { return }
-            let b = Unmanaged<TweakUpdateBox>.fromOpaque(obs).takeUnretainedValue()
-            DispatchQueue.main.async { b.invoke() }
+        // 立即读取一次基线
+        if let hb = NSDictionary(contentsOfFile: tweakStatusPath),
+           let t = (hb["_time"] as? NSNumber)?.doubleValue {
+            lastSeenTweakTime = t
         }
-        CFNotificationCenterAddObserver(
-            CFNotificationCenterGetDarwinNotifyCenter(),
-            observer,
-            cb,
-            CFNotificationName(rawValue: notifyTweakDataUpdated),
-            nil,
-            .deliverImmediately
-        )
+        // 已在轮询则不重复
+        if pollingTimer != nil { return }
+        pollingTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+            guard let hb = NSDictionary(contentsOfFile: tweakStatusPath),
+                  let t = (hb["_time"] as? NSNumber)?.doubleValue else { return }
+            if t > lastSeenTweakTime {
+                lastSeenTweakTime = t
+                DispatchQueue.main.async { handler() }
+            }
+        }
     }
 
     // MARK: - 共享配置
