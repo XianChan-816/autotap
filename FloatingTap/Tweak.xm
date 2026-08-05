@@ -1,30 +1,17 @@
 //
-//  Tweak.xm — FloatingTap v1.0.19
+//  Tweak.xm — FloatingTap v1.0.20
 //
-//  v1.0.18 实测结论（决定性）：/tmp/floatingtap_ctor.log 不存在 = 纯 arm64 dylib
-//  根本没被注入 SpringBoard（SB 是 arm64e 进程，只接受 arm64e slice）。
-//  结合历史二分：
-//    - v1.0.9（双架构 arm64+arm64e + 空 %ctor）→ 不卡
-//    - v1.0.11/1.0.12（双架构 + 含任何 ObjC 类，哪怕空类）→ 卡屏
-//    - v1.0.13/1.0.14（双架构 + 零自定义类，但 %ctor 里 NSLog(@"...")）→ PAC 崩 → SafeMode
-//    - v1.0.16~18（纯 arm64）→ 静默不注入（无标记文件、无球、无崩溃）
-//  铁证结论：
-//    1) M1 的 SpringBoard 是 arm64e 进程，纯 arm64 dylib 无法注入；
-//    2) arm64e 注入路径（ellekit/Dopamine）下，dylib 内任何 ObjC 元数据
-//       （自定义类、@"..." 常量字符串 isa）都会触发指针认证(PAC)失败 → SB 崩；
-//    3) 纯 C（零 ObjC 元数据）安全。
+//  v1.0.19 实测：不弹 Safe Mode + /tmp/floatingtap_ctor.log 存在 + 蓝白球出现
+//  → 「纯 C 驱动的 ObjC 动态调用」路线完全走通（arm64e 注入 + 零 ObjC 元数据安全）。
 //
-//  v1.0.19 策略：「纯 C 驱动的 ObjC 动态调用」
-//    - ARCHS 恢复 arm64 arm64e
-//    - 零 @implementation / %hook / @"..." / block 字面量 / @selector / NSLog
-//    - 类获取用 objc_getClass("...")（纯 C），SEL 用 sel_registerName("...")
-//      （运行时查找，不产生 __objc_selrefs/__cfstring 元数据）
-//    - 日志用 syslog（纯 C），GCD 用 dispatch_after_f / dispatch_source_set_event_handler_f
-//      （C 函数回调，不用 block）
-//    - 双击计时用 clock_gettime（纯 C）
-//    - ctor 保持纯 C：只写标记文件 + 调度 30s 后建球
+//  v1.0.20 恢复核心功能（仍保持零 @implementation / %hook / @"..." / block / @selector / NSLog）：
+//    1. 长按（minimumPressDuration=0，手指一碰即开始）→ 每 interval 在球心发 HID 点击
+//    2. 拖动球 → 调整点击位置（球心 = 点击点）
+//    3. 双击 → 停止连点并隐藏球
+//    4. 间隔从 /var/mobile/Library/Preferences/com.floatingtap.cfg 纯文本读取（默认 200ms）
+//    HID 注入走 HIDInject.c（纯 C：dlopen IOHIDEvent + IOHIDEventSystemClientDispatchEvent）
 //
-//  目标：验证「运行期 objc_msgSend 动态调用系统类」在 arm64e 注入环境下安全。
+//  铁律回顾：dylib 内任何 ObjC 元数据（类、@"..."、block）在 arm64e 注入下 PAC 崩。
 //
 
 #import <objc/runtime.h>
@@ -36,6 +23,8 @@
 #import <stdint.h>
 #import <dispatch/dispatch.h>
 #import <CoreGraphics/CoreGraphics.h>
+
+#include "HIDInject.h"
 
 // MARK: - objc_msgSend 类型化函数指针（ARM64 下结构体参数需与目标方法签名一致）
 
@@ -75,11 +64,18 @@ static id gBallWindow = nil;
 static id gBallView   = nil;
 static id gPanGR      = nil;
 static id gTapGR      = nil;
+static id gLongGR     = nil;
 
 static CGPoint gPanStartLoc;   // 触摸起始点（窗口坐标）
 static CGPoint gPanOrigin0;    // 触摸起始时窗口 frame.origin
 static BOOL    gPanActive = NO;
 static double  gLastTapAt = 0; // mach monotonic 秒
+
+static double  gScreenW = 0;   // 主屏尺寸（FTSetupBall 时保存）
+static double  gScreenH = 0;
+
+static BOOL    gIsClicking = NO;      // 连点进行中
+static dispatch_source_t gClickTimer = NULL; // 连点定时器（ARC 管理）
 
 // MARK: - 工具
 
@@ -136,6 +132,9 @@ static void FTTickCallback(void *ctx);
 static void FTEnsureBallCallback(void *ctx);
 static void FTTweakInitCallback(void *ctx);
 static void FTEnsureBall(int attempt);
+static void FTStartClicking(void);
+static void FTStopClicking(void);
+static void FTClickCallback(void *ctx);
 
 // MARK: - 触摸轮询（GR target=nil，只读 state）
 
@@ -170,11 +169,88 @@ static void FTOnTapTick(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
     if (now - gLastTapAt < 0.4) {
-        syslog(LOG_ERR, "FloatingTap DOUBLE TAP detected");
+        syslog(LOG_ERR, "FloatingTap DOUBLE TAP detected, hiding ball");
+        FTStopClicking();
+        if (gBallWindow) {
+            ((Msg_SetHidden)objc_msgSend)(gBallWindow, sel_registerName("setHidden:"), YES);
+        }
         gLastTapAt = 0;
     } else {
         gLastTapAt = now;
     }
+}
+
+// 长按轮询：Began → 开始连点；Ended/Cancelled/Failed → 停止连点
+static void FTOnLongPressTick(void) {
+    if (!gLongGR) return;
+    NSUInteger st = ((Msg_State)objc_msgSend)(gLongGR, sel_registerName("state"));
+    if (st == 1) { // Began
+        FTStartClicking();
+    } else if (st == 3 || st == 4 || st == 5) { // Ended / Cancelled / Failed
+        FTStopClicking();
+    }
+}
+
+// MARK: - 连点引擎
+
+// 读取连点间隔（毫秒）：/var/mobile/Library/Preferences/com.floatingtap.cfg 第一行数字，默认 200
+static double FTIntervalMs(void) {
+    FILE *f = fopen("/var/mobile/Library/Preferences/com.floatingtap.cfg", "r");
+    if (f) {
+        double v = 200.0;
+        if (fscanf(f, "%lf", &v) == 1 && v >= 1.0 && v <= 60000.0) {
+            fclose(f);
+            return v;
+        }
+        fclose(f);
+    }
+    return 200.0;
+}
+
+// 连点回调：在球心发一次 HID 点击
+static void FTClickCallback(void *ctx) {
+    (void)ctx;
+    if (!gBallWindow || !gIsClicking) return;
+    if (!FT_HIDIsConnected()) return;
+
+    CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
+    double cx = f.origin.x + f.size.width * 0.5;
+    double cy = f.origin.y + f.size.height * 0.5;
+    double nx = (gScreenW > 0) ? cx / gScreenW : 0.5;
+    double ny = (gScreenH > 0) ? cy / gScreenH : 0.5;
+    if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
+    if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
+
+    FT_HIDTapAt(nx, ny);
+}
+
+static void FTStartClicking(void) {
+    if (gIsClicking) return;
+    if (!FT_HIDConnect()) {
+        syslog(LOG_ERR, "FloatingTap HID connect failed, cannot start clicking");
+        return;
+    }
+    gIsClicking = YES;
+    double ms = FTIntervalMs();
+    gClickTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (gClickTimer) {
+        dispatch_source_set_timer(gClickTimer,
+                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms * NSEC_PER_MSEC)),
+                                  (uint64_t)(ms * NSEC_PER_MSEC), 0);
+        dispatch_source_set_event_handler_f(gClickTimer, FTClickCallback);
+        dispatch_resume(gClickTimer);
+    }
+    syslog(LOG_ERR, "FloatingTap clicking started, interval=%.0fms", ms);
+}
+
+static void FTStopClicking(void) {
+    if (!gIsClicking) return;
+    gIsClicking = NO;
+    if (gClickTimer) {
+        dispatch_source_cancel(gClickTimer);
+        gClickTimer = NULL;
+    }
+    syslog(LOG_ERR, "FloatingTap clicking stopped");
 }
 
 // MARK: - 创建小球
@@ -188,13 +264,16 @@ static void FTSetupBall(void) {
     Class ClsColor  = objc_getClass("UIColor");
     Class ClsPanGR  = objc_getClass("UIPanGestureRecognizer");
     Class ClsTapGR  = objc_getClass("UITapGestureRecognizer");
-    if (!ClsWindow || !ClsView || !ClsScreen || !ClsColor || !ClsPanGR || !ClsTapGR) {
+    Class ClsLongGR = objc_getClass("UILongPressGestureRecognizer");
+    if (!ClsWindow || !ClsView || !ClsScreen || !ClsColor || !ClsPanGR || !ClsTapGR || !ClsLongGR) {
         syslog(LOG_ERR, "FloatingTap system classes missing, skip");
         return;
     }
 
     id mainScreen = ((Msg_Send)objc_msgSend)((id)ClsScreen, sel_registerName("mainScreen"));
     CGRect sb = ((Msg_Bounds)objc_msgSend)(mainScreen, sel_registerName("bounds"));
+    gScreenW = sb.size.width;
+    gScreenH = sb.size.height;
     CGFloat d = 56.0;
     CGRect ballFrame = CGRectMake(sb.size.width / 2 - d / 2, sb.size.height / 2 - d / 2, d, d);
 
@@ -228,13 +307,19 @@ static void FTSetupBall(void) {
     ((Msg_Init)objc_msgSend)(gPanGR, sel_registerName("init"));
     gTapGR = FTAlloc(ClsTapGR);
     ((Msg_Init)objc_msgSend)(gTapGR, sel_registerName("init"));
+    gLongGR = FTAlloc(ClsLongGR);
+    ((Msg_Init)objc_msgSend)(gLongGR, sel_registerName("init"));
     ((Msg_SetNumberOfTapsRequired)objc_msgSend)(gTapGR, sel_registerName("setNumberOfTapsRequired:"), (NSUInteger)2);
     ((Msg_SetDelaysTouchesBegan)objc_msgSend)(gPanGR, sel_registerName("setDelaysTouchesBegan:"), NO);
     ((Msg_SetDelaysTouchesEnded)objc_msgSend)(gPanGR, sel_registerName("setDelaysTouchesEnded:"), NO);
     ((Msg_SetCancelsTouchesInView)objc_msgSend)(gPanGR, sel_registerName("setCancelsTouchesInView:"), NO);
+    // 长按：minimumPressDuration=0 → 手指一碰立即 Began（开始连点），allowableMovement=30 防抖动误取消
+    ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setMinimumPressDuration:"), 0.0);
+    ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setAllowableMovement:"), 30.0);
 
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gPanGR);
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gTapGR);
+    ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gLongGR);
 
     // 直接把 ball 加到 window（不走 VC），更可靠
     ((Msg_AddSubview)objc_msgSend)(win, sel_registerName("addSubview:"), ball);
@@ -260,6 +345,7 @@ static void FTSetupBall(void) {
 
 static void FTTickCallback(void *ctx) {
     (void)ctx;
+    FTOnLongPressTick();
     FTOnPanTick();
     FTOnTapTick();
 }
@@ -295,10 +381,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.19 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.20 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.19 loaded (pure C ctor, zero ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.20 loaded (pure C ctor, zero ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),

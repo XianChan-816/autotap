@@ -1,40 +1,32 @@
 //
-//  HIDInject.h
-//  FloatingTap
+//  HIDInject.h — FloatingTap HID 注入引擎（纯 C 版）
 //
-//  IOHIDEvent 私有接口注入层（移植自 AutoTap App 版 HIDBridge）。
-//  运行在 SpringBoard 进程（越狱环境），权限天然满足。
+//  v1.0.20：由 ObjC 类 HIDInject/HIDTap 重写为纯 C 函数。
+//  原因：arm64e 注入环境下 dylib 内任何 ObjC 元数据都会触发 PAC 失败崩 SB，
+//  必须零 @implementation / @"..." / block。
+//  对外只暴露三个函数；内部 dlopen IOHIDEvent 符号动态解析。
 //
 
-#import <Foundation/Foundation.h>
-#import <CoreGraphics/CoreGraphics.h>
+#ifndef HIDInject_h
+#define HIDInject_h
 
-NS_ASSUME_NONNULL_BEGIN
+#include <stdbool.h>
 
-/// 一次完整的"按下-抬起"点击
-@interface HIDTap : NSObject
-/// 归一化坐标 (0~1)，以竖屏 home 在下为基准
-@property (nonatomic, assign) CGFloat normalizedX;
-@property (nonatomic, assign) CGFloat normalizedY;
-@end
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-@interface HIDInject : NSObject
+// 连接 HID 系统（幂等；失败返回 false 并打 syslog）
+bool FT_HIDConnect(void);
 
-@property (nonatomic, readonly, getter=isConnected) BOOL connected;
+// 是否已连接
+bool FT_HIDIsConnected(void);
 
-+ (instancetype)shared;
+// 在归一化坐标 (0~1, 0~1) 处发一次完整点击（down + up）
+void FT_HIDTapAt(double normalizedX, double normalizedY);
 
-- (BOOL)connect;
+#ifdef __cplusplus
+}
+#endif
 
-/// 在指定归一化坐标上执行一次点击（按下 + 抬起）
-- (void)tapAt:(HIDTap *)tap;
-
-/// 按下（长按场景）
-- (void)tapDown:(HIDTap *)tap;
-
-/// 抬起
-- (void)tapUp:(HIDTap *)tap;
-
-@end
-
-NS_ASSUME_NONNULL_END
+#endif /* HIDInject_h */
