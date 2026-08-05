@@ -179,6 +179,7 @@ static void FTSyntheticTap(double px, double py) {
         (void)ex;
         FTLog("inject exception");
     }
+}
 
 // 诊断：dump UIEvent 的 ivar 名（已确认有 _hidEvent/_gsEvent）
 static void FTDumpEventIvars(void) {
