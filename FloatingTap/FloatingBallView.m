@@ -16,9 +16,6 @@
 #import "FloatingBallView.h"
 #import "HIDInject.h"
 #import <objc/runtime.h>
-#import <notify.h>
-#import <libproc.h>
-#import <sandbox.h>
 
 // 共享配置（AutoTap App 与 tweak 共同读写；写到 App 沙盒 Caches）
 // kFloatingTapConfigPath 是可变全局变量，Tweak.xm 在拿到 App 沙盒路径后赋值
@@ -40,12 +37,11 @@ static NSString *FTTweakStatusPath(void) { return gAppCachesDir ? [gAppCachesDir
 static NSString *FTConfigPath(void)      { return gAppCachesDir ? [gAppCachesDir stringByAppendingPathComponent:@"AutoTapConfig.plist"] : nil; }
 
 // 拿到 App 沙盒 Caches 路径后由 Tweak.xm 调用（注册 Darwin notification 钩子）
+// C 函数不能用 @synchronized；调用只在主线程 Darwin 回调里发生，天然串行
 void FTSetAppCachesDir(NSString *dir) {
-    @synchronized ([FloatingBallView class]) {
-        gAppCachesDir = [dir copy];
-        kFloatingTapConfigPath = [[dir stringByAppendingPathComponent:@"AutoTapConfig.plist"] copy];
-        NSLog(@"[FloatingTap] App Caches 路径已设置: %@", dir);
-    }
+    gAppCachesDir = [dir copy];
+    kFloatingTapConfigPath = [[dir stringByAppendingPathComponent:@"AutoTapConfig.plist"] copy];
+    NSLog(@"[FloatingTap] App Caches 路径已设置: %@", dir);
 }
 NSString *FTGetAppCachesDir(void) { return gAppCachesDir; }
 

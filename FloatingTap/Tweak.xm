@@ -84,29 +84,29 @@ static NSString *FTResolveAppCaches(pid_t pid) {
 }
 
 // 收到 App 启动通知后：找 App PID → 拿沙盒路径 → 立即写心跳 + 导出
+// 注意：C 函数里不能使用 @synchronized（ObjC 语法仅限方法），Darwin notification
+// 回调运行在主 run loop，天然串行，无需加锁。
 static void FTOnAppStarted(void) {
-    @synchronized ([FloatingBallView class]) {
-        if (gAppPID <= 0) {
-            gAppPID = FTFindAppPID();
-        }
-        if (gAppPID <= 0) {
-            NSLog(@"[FloatingTap] 找不到 AutoTap 进程");
-            return;
-        }
-        NSString *caches = FTResolveAppCaches(gAppPID);
-        if (!caches) {
-            NSLog(@"[FloatingTap] 拿不到 App 沙盒 Caches 路径");
-            return;
-        }
-        FTSetAppCachesDir(caches);
-        // 立即写心跳 + 导出 App 列表（此时 App 还没装载 UI，时间充裕）
-        @try { [FloatingBallView writeHeartbeat]; }
-        @catch (NSException *ex) { NSLog(@"[FloatingTap] 启动心跳异常: %@", ex); }
-        @try { [[FloatingBallView shared] dumpInstalledApps]; }
-        @catch (NSException *ex) { NSLog(@"[FloatingTap] 启动枚举异常: %@", ex); }
-        // 通知 App 数据已就绪
-        notify_post([kFTNotifyTweakDataUpdated UTF8String]);
+    if (gAppPID <= 0) {
+        gAppPID = FTFindAppPID();
     }
+    if (gAppPID <= 0) {
+        NSLog(@"[FloatingTap] 找不到 AutoTap 进程");
+        return;
+    }
+    NSString *caches = FTResolveAppCaches(gAppPID);
+    if (!caches) {
+        NSLog(@"[FloatingTap] 拿不到 App 沙盒 Caches 路径");
+        return;
+    }
+    FTSetAppCachesDir(caches);
+    // 立即写心跳 + 导出 App 列表（此时 App 还没装载 UI，时间充裕）
+    @try { [FloatingBallView writeHeartbeat]; }
+    @catch (NSException *ex) { NSLog(@"[FloatingTap] 启动心跳异常: %@", ex); }
+    @try { [[FloatingBallView shared] dumpInstalledApps]; }
+    @catch (NSException *ex) { NSLog(@"[FloatingTap] 启动枚举异常: %@", ex); }
+    // 通知 App 数据已就绪
+    notify_post([kFTNotifyTweakDataUpdated UTF8String]);
 }
 
 // 收到 App configUpdated 通知后：重新读 config（目标 App / 间隔 / 位置）
