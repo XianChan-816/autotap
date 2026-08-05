@@ -191,8 +191,15 @@ static void FTSendHIDEvent(id app, bool down, double nx, double ny) {
     id event = FTAlloc(ClsEvent);
     if (!event) { CFRelease(hid); return; }
     event = ((Msg_Init)objc_msgSend)(event, sel_registerName("init"));
-    // _hidEvent 是 void* 指针 ivar：object_setInstanceVariable 直写（无 retain/release）
-    object_setInstanceVariable(event, "_hidEvent", hid);
+    // _hidEvent 是 void* 指针 ivar：用 ivar offset 直接内存写（ARC 下 object_setInstanceVariable 不可用）
+    Ivar ivarHid = class_getInstanceVariable(ClsEvent, "_hidEvent");
+    if (!ivarHid) {
+        FTLog("UIEvent no _hidEvent ivar");
+        CFRelease(hid);
+        return;
+    }
+    void **slot = (void **)((char *)(__bridge void *)event + ivar_getOffset(ivarHid));
+    *slot = hid;
     ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
     CFRelease(hid);
 }
