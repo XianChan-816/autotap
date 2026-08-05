@@ -161,16 +161,35 @@ static double FTIntervalMs(void) {
 // 恢复球窗口交互（注入后 60ms 回调）
 static void FTRestoreBallInteractionCallback(void *ctx);
 
-// MARK: - 连点注入（v1.0.39：IOHIDEventSystemClientDispatchEvent 直接派发 = zxtouch 全套）
-// v1.0.38 实测：senderID 捕获成功（0x1000006dc，证实硬编码 0x8000000817371935 是错的）；
-// GSEventCreateTouchEvent 符号在 iOS 15.5 不存在（gs event create unavailable）。
-// v1.0.37 已修 15 参数 → 重新走 DispatchEvent 直接派发（zxtouch 原版路径：
-// 15参构造 + 真实 senderID + IOHIDEventSystemClientDispatchEvent）。
-// 注入前关球窗口交互（穿透），60ms 后恢复（FTClickCallback 处理）。
+// MARK: - 连点注入
+// v1.0.41：走 [UIApplication _handleHIDEvent:]（UIKit 原生 HID 入口）——注入已确认
+// 到达 UIKit（UIApp handleHIDEvent called 对齐 + SEND ball=0 到下层窗口）。
+// v1.0.43：down 立即发，up 延迟 50ms 发（社区标准做法）——让 UIKit 把 down/up
+// 关联为同一触摸（v1.0.42 实测 down+up 零间隔可能被当作两个独立触摸，tap 手势不触发）。
 
-// 在屏幕像素点 (px,py) 发一次合成点击。
-// v1.0.41：注入走 [UIApplication _handleHIDEvent:]（UIKit 原生 HID 入口，绕开被
-// 丢弃的 IOKit 分发层）——构造好的父+子 IOHIDEvent 直接喂给 UIKit。
+static double gPendingUpX = 0;
+static double gPendingUpY = 0;
+static void FTSendHIDUpCallback(void *ctx);
+
+// 发送一次 up（延迟回调）
+static void FTSendHIDUpCallback(void *ctx) {
+    (void)ctx;
+    @try {
+        Class ClsApp = objc_getClass("UIApplication");
+        if (!ClsApp) return;
+        id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
+        if (!app) return;
+        FT_IOHIDEventRef up = FT_HIDCreateDigitizerEvent(false, gPendingUpX, gPendingUpY);
+        if (up) {
+            ((Msg_SendID)objc_msgSend)(app, sel_registerName("_handleHIDEvent:"), up);
+            CFRelease(up);
+        }
+    } @catch (NSException *ex) {
+        (void)ex;
+    }
+}
+
+// 在屏幕像素点 (px,py) 发一次合成点击（down 立即 + up 延迟 50ms）
 static void FTSyntheticTap(double px, double py) {
     @try {
         double nx = (gScreenW > 0) ? px / gScreenW : 0.5;
@@ -183,16 +202,17 @@ static void FTSyntheticTap(double px, double py) {
         id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
         if (!app) return;
 
+        // down 立即
         FT_IOHIDEventRef down = FT_HIDCreateDigitizerEvent(true, nx, ny);
         if (down) {
             ((Msg_SendID)objc_msgSend)(app, sel_registerName("_handleHIDEvent:"), down);
             CFRelease(down);
         }
-        FT_IOHIDEventRef up = FT_HIDCreateDigitizerEvent(false, nx, ny);
-        if (up) {
-            ((Msg_SendID)objc_msgSend)(app, sel_registerName("_handleHIDEvent:"), up);
-            CFRelease(up);
-        }
+        // up 延迟 50ms（关联同一触摸）
+        gPendingUpX = nx;
+        gPendingUpY = ny;
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                         dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
     } @catch (NSException *ex) {
         (void)ex;
         FTLog("inject exception");
@@ -527,10 +547,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.42 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.43 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.42 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.43 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
