@@ -170,6 +170,9 @@ typedef id   (*Msg_SetWithObject)(id, SEL, id);
 typedef id   (*Msg_HitTest)(id, SEL, CGPoint, id);
 typedef void (*Msg_SendEvent)(id, SEL, id);
 typedef id   (*Msg_StringWithUTF8String)(id, SEL, const char *);
+typedef id   (*Msg_NumberWithDouble)(id, SEL, double);
+typedef id   (*Msg_NumberWithInt)(id, SEL, int);
+typedef id   (*Msg_NumberWithUnsignedInt)(id, SEL, unsigned int);
 
 // 运行时创建 NSString（禁止 @"" 字面量：arm64e PAC 元数据雷区）
 static id FTString(const char *s) {
@@ -219,11 +222,11 @@ static void FTSyntheticTap(double px, double py) {
     double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"), targetWin, FTString("_window"));
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_Send)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithDouble:"), now), FTString("_timestamp"));
+        ((Msg_NumberWithDouble)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithDouble:"), now), FTString("_timestamp"));
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_Send)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 0), FTString("_phase")); // Began
+        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 0), FTString("_phase")); // Began
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_Send)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithUnsignedInt:"), 1), FTString("_tapCount"));
+        ((Msg_NumberWithUnsignedInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithUnsignedInt:"), 1), FTString("_tapCount"));
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
         ((Msg_ValueWithCGPoint)objc_msgSend)((id)ClsValue, sel_registerName("valueWithCGPoint:"), pt), FTString("_locationInWindow"));
 
@@ -238,7 +241,7 @@ static void FTSyntheticTap(double px, double py) {
     // 4. down（Began）→ up（Ended）
     ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_Send)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 3), FTString("_phase")); // Ended
+        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 3), FTString("_phase")); // Ended
     ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
 }
 
