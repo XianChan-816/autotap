@@ -1,9 +1,10 @@
 //
-//  Tweak.xm — FloatingTap v1.0.26
+//  Tweak.xm — FloatingTap v1.0.27
 //
-//  v1.0.24/25 实测：点击计数正常但屏幕无反应 → v1.0.26 按 zxtouch（iOS 15 验证可用的
-//  触摸注入器）完整对齐事件参数：index=1、down mask 简化为 Range|Touch|Position、
-//  up mask 为 Range、显式 SetIntegerValue(Index=1, Identity=1, IsDisplayIntegrated=1)。
+//  v1.0.26 用户问「25 版本能拖动？」：日志从 v1.0.21 起从未出现 pan began——
+//  Pan 手势被 Long（minimumPressDuration=0 抢先 Began）压制，拖动从未生效。
+//  v1.0.27：删除 Pan GR，拖动并入 Long GR 的 Changed 状态（按住=连点，
+//  按住移动=拖动球，松手=停），彻底消除手势冲突。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
@@ -38,9 +39,6 @@ typedef void       (*Msg_AddGestureRecognizer)(id, SEL, id);
 typedef void       (*Msg_AddSubview)(id, SEL, id);
 typedef void       (*Msg_MakeKeyAndVisible)(id, SEL);
 typedef void       (*Msg_SetNumberOfTapsRequired)(id, SEL, NSUInteger);
-typedef void       (*Msg_SetDelaysTouchesBegan)(id, SEL, BOOL);
-typedef void       (*Msg_SetDelaysTouchesEnded)(id, SEL, BOOL);
-typedef void       (*Msg_SetCancelsTouchesInView)(id, SEL, BOOL);
 typedef void       (*Msg_SetWindowScene)(id, SEL, id);
 typedef id         (*Msg_Layer)(id, SEL);
 typedef id         (*Msg_ColorWithRGBA)(id, SEL, CGFloat, CGFloat, CGFloat, CGFloat);
@@ -58,7 +56,6 @@ typedef NSInteger  (*Msg_Int)(id, SEL);
 
 static id gBallWindow = nil;
 static id gBallView   = nil;
-static id gPanGR      = nil;
 static id gTapGR      = nil;
 static id gLongGR     = nil;
 
@@ -213,37 +210,25 @@ static void FTStopClicking(void) {
 static Class gGRTargetClass = nil;
 static id    gGRTarget      = nil;
 
-// Pan 回调：拖动球
-static void FTGRPanHandler(id self, SEL _cmd, id gr) {
+// Long 回调：一碰即连点 + 拖动（Changed 状态拖动球，删除 Pan GR 避免手势冲突）
+static void FTGRLongHandler(id self, SEL _cmd, id gr) {
     (void)self; (void)_cmd;
-    if (!gBallWindow || !gr) return;
+    if (!gr || !gBallWindow) return;
     NSUInteger st = ((Msg_State)objc_msgSend)(gr, sel_registerName("state"));
     if (st == 1) { // Began
         gPanStartLoc = ((Msg_LocationInView)objc_msgSend)(gr, sel_registerName("locationInView:"), gBallWindow);
         gPanOrigin0  = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame")).origin;
         gPanActive   = YES;
-        FTLog("pan began");
-    } else if (st == 2 && gPanActive) { // Changed
+        FTStartClicking();
+    } else if (st == 2 && gPanActive) { // Changed → 拖动球
         CGPoint cur = ((Msg_LocationInView)objc_msgSend)(gr, sel_registerName("locationInView:"), gBallWindow);
         CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
         ((Msg_SetFrame)objc_msgSend)(gBallWindow, sel_registerName("setFrame:"),
             CGRectMake(gPanOrigin0.x + (cur.x - gPanStartLoc.x),
                        gPanOrigin0.y + (cur.y - gPanStartLoc.y),
                        f.size.width, f.size.height));
-    } else if ((st == 3 || st == 4) && gPanActive) { // Ended / Cancelled
-        gPanActive = NO;
-        FTLog("pan ended");
-    }
-}
-
-// Long 回调：一碰即连点，松手/移动超限停止
-static void FTGRLongHandler(id self, SEL _cmd, id gr) {
-    (void)self; (void)_cmd;
-    if (!gr) return;
-    NSUInteger st = ((Msg_State)objc_msgSend)(gr, sel_registerName("state"));
-    if (st == 1) { // Began
-        FTStartClicking();
     } else if (st == 3 || st == 4 || st == 5) { // Ended / Cancelled / Failed
+        gPanActive = NO;
         FTStopClicking();
     }
 }
@@ -269,7 +254,6 @@ static BOOL FTMakeGRTarget(void) {
     if (!superCls) return NO;
     gGRTargetClass = objc_allocateClassPair(superCls, "FTGRTarget", 0);
     if (!gGRTargetClass) return NO;
-    class_addMethod(gGRTargetClass, sel_registerName("handlePan:"),  (IMP)FTGRPanHandler,  "v@:@");
     class_addMethod(gGRTargetClass, sel_registerName("handleLong:"), (IMP)FTGRLongHandler, "v@:@");
     class_addMethod(gGRTargetClass, sel_registerName("handleTap:"),  (IMP)FTGRTapHandler,  "v@:@");
     objc_registerClassPair(gGRTargetClass);
@@ -297,10 +281,9 @@ static void FTSetupBall(void) {
     Class ClsView   = objc_getClass("UIView");
     Class ClsScreen = objc_getClass("UIScreen");
     Class ClsColor  = objc_getClass("UIColor");
-    Class ClsPanGR  = objc_getClass("UIPanGestureRecognizer");
     Class ClsTapGR  = objc_getClass("UITapGestureRecognizer");
     Class ClsLongGR = objc_getClass("UILongPressGestureRecognizer");
-    if (!ClsWindow || !ClsView || !ClsScreen || !ClsColor || !ClsPanGR || !ClsTapGR || !ClsLongGR) {
+    if (!ClsWindow || !ClsView || !ClsScreen || !ClsColor || !ClsTapGR || !ClsLongGR) {
         FTLog("setup failed: system class missing");
         return;
     }
@@ -342,22 +325,18 @@ static void FTSetupBall(void) {
                                        ((Msg_CGColor)objc_msgSend)(white, sel_registerName("CGColor")));
 
     // GR：运行时创建的 target 实例 + initWithTarget:action:
-    gPanGR = FTMakeGR(ClsPanGR, "handlePan:");
-    gTapGR = FTMakeGR(ClsTapGR, "handleTap:");
+    gTapGR  = FTMakeGR(ClsTapGR, "handleTap:");
     gLongGR = FTMakeGR(ClsLongGR, "handleLong:");
-    if (!gPanGR || !gTapGR || !gLongGR) {
+    if (!gTapGR || !gLongGR) {
         FTLog("setup failed: make GR");
     }
     ((Msg_SetNumberOfTapsRequired)objc_msgSend)(gTapGR, sel_registerName("setNumberOfTapsRequired:"), (NSUInteger)2);
-    ((Msg_SetDelaysTouchesBegan)objc_msgSend)(gPanGR, sel_registerName("setDelaysTouchesBegan:"), NO);
-    ((Msg_SetDelaysTouchesEnded)objc_msgSend)(gPanGR, sel_registerName("setDelaysTouchesEnded:"), NO);
-    ((Msg_SetCancelsTouchesInView)objc_msgSend)(gPanGR, sel_registerName("setCancelsTouchesInView:"), NO);
-    // 长按：minimumPressDuration=0 → 手指一碰立即 Began（开始连点）
+    // 长按：minimumPressDuration=0 → 手指一碰立即 Began（开始连点），
+    // Changed 状态拖动球（删除 Pan GR 避免手势冲突）。
     // allowableMovement=200：宽松容差，iPad 上手指自然抖动/微小移动不会误判失败
     ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setMinimumPressDuration:"), 0.0);
     ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setAllowableMovement:"), 200.0);
 
-    ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gPanGR);
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gTapGR);
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gLongGR);
 
@@ -410,7 +389,7 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.26 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.27 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
     syslog(LOG_ERR, "FloatingTap v1.0.25 loaded (pure C ctor, zero static ObjC metadata)");
