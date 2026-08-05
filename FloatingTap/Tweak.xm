@@ -1,11 +1,12 @@
 //
-//  Tweak.xm — FloatingTap v1.0.28
+//  Tweak.xm — FloatingTap v1.0.29（诊断版）
 //
-//  v1.0.27 实测：拖动 ✅（Long GR Changed 状态修复成功）；连点 ❌ 屏幕无反应。
-//  重大推断：注入坐标=球心，球窗口(windowLevel 1001)恰好挡在球心，注入的 HID 触摸
-//  先命中自家球窗口被拦截 → 下层图标/按钮永远收不到 → "日志一切正常但屏幕没反应"。
-//  v1.0.28：注入瞬间 setUserInteractionEnabled:NO（窗口不参与 hitTest → 注入触摸
-//  穿透到下层），60ms 后恢复。
+//  v1.0.28 实测：球窗口穿透后图标仍不点开 → 「球窗口拦截」理论排除。
+//  v1.0.29 决定性诊断：%hook UIWindow sendEvent: 节流打印触摸数+命中 view 类，
+//  观察注入的 HID 触摸到底有没有到达 UIKit 层。同时 FTClickCallback 打印
+//  inject tap 坐标，与 SEND 日志对照：
+//    - SEND 频繁出现 = 注入到达 UIKit，问题在上层（坐标/路由）
+//    - SEND 只反映真实手指 = 注入在 IOKit/BackBoard 层被丢弃 → 换注入路径
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
@@ -49,6 +50,7 @@ typedef CGRect     (*Msg_Frame)(id, SEL);
 typedef CGPoint    (*Msg_LocationInView)(id, SEL, id);
 typedef NSUInteger (*Msg_State)(id, SEL);
 typedef NSUInteger (*Msg_Count)(id, SEL);
+typedef id         (*Msg_AnyObject)(id, SEL);
 typedef id         (*Msg_ObjectAtIndex)(id, SEL, NSUInteger);
 typedef BOOL       (*Msg_IsKindOf)(id, SEL, Class);
 typedef NSInteger  (*Msg_Int)(id, SEL);
@@ -178,6 +180,10 @@ static void FTClickCallback(void *ctx) {
 
     FT_HIDTapAt(nx, ny);
     gClickCount++;
+
+    char diag[96];
+    snprintf(diag, sizeof(diag), "inject tap nx=%.2f ny=%.2f", nx, ny);
+    FTLog(diag);
 
     // 60ms 后恢复交互（连点 200ms 间隔，恢复后用户可松手停止）
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)),
@@ -403,6 +409,36 @@ static void FTTweakInitCallback(void *ctx) {
     FTEnsureBall(0);
 }
 
+// MARK: - 诊断 hook（v1.0.29 临时）：观察注入触摸是否到达 UIKit 层
+// 只读：%orig 先调，再节流打印 event 的触摸数与命中的 view 类。
+// 判断：注入若到达，日志会高频出现 SEND touches=1 view=<下层view类>；
+//       若完全没有注入相关记录 → HID 事件在 IOKit/BackBoard 层被丢弃。
+
+%hook UIWindow
+- (void)sendEvent:(UIEvent *)event {
+    %orig;
+    static double sLastDiag = 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    if (now - sLastDiag < 0.5) return; // 节流 500ms
+    sLastDiag = now;
+    if (!event) return;
+    id touches = ((Msg_Send)objc_msgSend)(event, sel_registerName("allTouches"));
+    NSUInteger n = touches ? ((Msg_Count)objc_msgSend)(touches, sel_registerName("count")) : 0;
+    if (n == 0) return;
+    const char *cls = "?";
+    id t = ((Msg_AnyObject)objc_msgSend)(touches, sel_registerName("anyObject"));
+    if (t) {
+        id v = ((Msg_Send)objc_msgSend)(t, sel_registerName("view"));
+        if (v) cls = object_getClassName(v);
+    }
+    char buf[128];
+    snprintf(buf, sizeof(buf), "SEND touches=%lu view=%s", (unsigned long)n, cls);
+    FTLog(buf);
+}
+%end
+
 // MARK: - 入口（纯 C constructor，等效 %ctor 但无 Logos 依赖、零 ObjC）
 
 __attribute__((constructor))
@@ -410,10 +446,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.28 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.29 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.28 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.29 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
