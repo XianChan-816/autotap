@@ -229,7 +229,7 @@ static void FTSetupBall(void) {
     dispatch_resume(timer);
 
     NSLog(@"[FloatingTap] v1.0.18 ball created, scene=%@ win=%p",
-          (scene ? @"yes" : @"no"), (void*)win);
+          (scene ? @"yes" : @"no"), (__bridge void*)win);
 }
 
 // 确保 SB UI 就绪后再创建（每 2s 重试，最多 10 次）
