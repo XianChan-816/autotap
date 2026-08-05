@@ -6,6 +6,4 @@ Description: 全局悬浮球自动点击器（IOHIDEvent 注入），长按触�
 Maintainer: FloatingTap
 Author: FloatingTap
 Section: Tweaks
-# Depends 不写 rocketbootstrap：tweak 用 dlopen 动态加载 librocketbootstrap.dylib，
-# 缺失时降级运行（仅 IPC 跨进程不通，不崩）；用户可自行 Sileo 装 com.rpetrich.rocketbootstrap
 Depends: ellekit, firmware (>= 14.0)
