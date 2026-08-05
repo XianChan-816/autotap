@@ -158,16 +158,19 @@ static void FTRegisterNotifications(void) {
 }
 
 %ctor {
-    // 1. 立即注册 Darwin notification 监听（安全，不碰 UIKit、不查进程）
-    //    注意：绝不在 %ctor 里做进程枚举 / sandbox API / 任何 UIKit ——
-    //    SpringBoard 启动早期环境未就绪，私有 API 崩溃是 EXC_BAD_ACCESS，
-    //    @try/@catch 捕不住，直接白苹果（b1794ad 已验证过此坑）。
-    @try { FTRegisterNotifications(); }
-    @catch (NSException *ex) { NSLog(@"[FloatingTap] 注册通知异常: %@", ex); }
+    // 1. 注意：%ctor 里什么都不做！
+    //    CFNotificationCenterGetDarwinNotifyCenter() 在 SB 启动早期会去连 notifyd，
+    //    可能阻塞主线程 → 背光黑屏卡死（1.0.5 实测）。
+    //    Notification 注册移到 8s 延迟块里（UI 就绪后）。
+    NSLog(@"[FloatingTap] tweak 已加载（延迟初始化，v1.0.6）");
 
     // 2. SpringBoard 完全启动后再启动监控（8 秒延迟，避免启动期 KVC 私有 API 导致 SB 崩溃）
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        // UI 就绪后注册 Darwin notification 监听（此时连 notifyd 不会阻塞）
+        @try { FTRegisterNotifications(); }
+        @catch (NSException *ex) { NSLog(@"[FloatingTap] 注册通知异常: %@", ex); }
+
         NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:2.0
                                                           repeats:YES
                                                             block:^(NSTimer *t) {

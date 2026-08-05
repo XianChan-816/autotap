@@ -20,9 +20,15 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         self.window = window
 
         // 通知 FloatingTap tweak：App 已启动（Darwin notification）
-        // tweak 收到后用 proc_listpids + sandbox_get_container_for_pid 找到 App 沙盒 Caches 路径，
-        // 之后心跳/枚举状态都直接写到 App 沙盒，App 100% 可读
+        // tweak 在 SB 启动 8s 后才注册监听，故重复广播 30 次（每 1s），
+        // 确保 tweak 无论何时注册都能收到 appStarted
+        var broadcastCount = 0
         TargetAppManager.notifyAppStarted()
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
+            broadcastCount += 1
+            TargetAppManager.notifyAppStarted()
+            if broadcastCount >= 30 { timer.invalidate() }
+        }
 
         // 监听 tweak 写完数据后的通知（Darwin notification）
         TargetAppManager.startListeningForTweakUpdates {
@@ -42,7 +48,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func applicationWillEnterForeground(_ application: UIApplication) {
         KeepAlive.shared.stopSilentLoop()
-        // 重新通知 tweak，前台时 App 沙盒路径重新被发现（如果 tweak 之前没找到）
+        // 重新广播 appStarted，确保 tweak 拿到 App 沙盒路径
         TargetAppManager.notifyAppStarted()
     }
 }
