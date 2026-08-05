@@ -1,11 +1,13 @@
 //
-//  Tweak.xm — FloatingTap v1.0.30
+//  Tweak.xm — FloatingTap v1.0.31
 //
-//  v1.0.29 诊断（决定性）：长按 6.3s 注入 30 次，UIWindow sendEvent 的 SEND 记录
-//  只有零星几条（=用户手指），注入触摸从未到达 UIKit → IOHIDEventSystemClient
-//  在 Dopamine+iOS15.5+M1 环境事件被 IOKit/BackBoard 层丢弃（DispatchEvent 返回成功但无效）。
-//  v1.0.30 换注入路径：SB 进程内 KVC 合成 UITouch/UIEvent，调 [UIApplication sendEvent:]，
-//  等价程序化手指，不经过 HID 系统。hitTest 找触摸点命中窗口（跳过球窗口）。
+//  v1.0.30 实测：拖动触发连点 → 合成触摸 sendEvent → SB 崩溃（自动注销/SafeMode）。
+//  原因：KVC 构造的 UITouch/UIEvent 字段不完整（缺 _coalescedTouches/_type 等，
+//  UIKit 内部访问崩）；位置用 KVC _locationInWindow 解包风险大。
+//  v1.0.31：完整字段集（社区 TouchSimulator iOS15）：位置改私有方法
+//  _setLocation:resetPrevious:，touch 补 _isTap/_index/_digitizer/_edge，
+//  event 补 _coalescedTouches/_predictedTouches/_timestamp/_type/_subtype，
+//  down/up 用独立对象，整个 FTSyntheticTap 包 @try/@catch 兜底防崩。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  （KVC key 用 FTString 运行时创建 NSString）
@@ -173,6 +175,7 @@ typedef id   (*Msg_StringWithUTF8String)(id, SEL, const char *);
 typedef id   (*Msg_NumberWithDouble)(id, SEL, double);
 typedef id   (*Msg_NumberWithInt)(id, SEL, int);
 typedef id   (*Msg_NumberWithUnsignedInt)(id, SEL, unsigned int);
+typedef void (*Msg_SetLocationReset)(id, SEL, CGPoint, BOOL);
 
 // 运行时创建 NSString（禁止 @"" 字面量：arm64e PAC 元数据雷区）
 static id FTString(const char *s) {
@@ -181,68 +184,94 @@ static id FTString(const char *s) {
     return ((Msg_StringWithUTF8String)objc_msgSend)((id)ClsStr, sel_registerName("stringWithUTF8String:"), s);
 }
 
-// 在屏幕像素点 (px,py) 发一次合成点击（down + up，同一 touch 对象）
-static void FTSyntheticTap(double px, double py) {
-    Class ClsTouch = objc_getClass("UITouch");
-    Class ClsEvent = objc_getClass("UIEvent");
-    Class ClsApp   = objc_getClass("UIApplication");
-    Class ClsSet   = objc_getClass("NSSet");
-    Class ClsValue = objc_getClass("NSValue");
-    Class ClsNumber= objc_getClass("NSNumber");
-    if (!ClsTouch || !ClsEvent || !ClsApp || !ClsSet || !ClsValue || !ClsNumber) {
-        FTLog("synthetic tap failed: class missing");
-        return;
-    }
-    id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
-    if (!app) return;
-    id wins = ((Msg_Send)objc_msgSend)(app, sel_registerName("windows"));
-    if (!wins) return;
-    NSUInteger n = ((Msg_Count)objc_msgSend)(wins, sel_registerName("count"));
-
-    // 1. 找触摸点命中的窗口（跳过球窗口，球窗口交互已由调用方关闭）
-    CGPoint pt = CGPointMake(px, py);
-    id targetWin = nil;
-    for (NSUInteger i = 0; i < n; i++) {
-        id w = ((Msg_ObjectAtIndex)objc_msgSend)(wins, sel_registerName("objectAtIndex:"), i);
-        if (!w || w == gBallWindow) continue;
-        id hit = ((Msg_HitTest)objc_msgSend)(w, sel_registerName("hitTest:withEvent:"), pt, nil);
-        if (hit) { targetWin = w; break; }
-    }
-    if (!targetWin) {
-        FTLog("synthetic tap: no target window at point");
-        return;
-    }
-
-    // 2. 合成 UITouch（KVC 设置私有属性）
+// 构造完整 UITouch（社区 TouchSimulator iOS15 字段集；位置用私有方法 _setLocation:resetPrevious:）
+static id FTMakeTouch(int phase, CGPoint pt, id win, double ts) {
+    Class ClsTouch  = objc_getClass("UITouch");
+    Class ClsNumber = objc_getClass("NSNumber");
+    if (!ClsTouch || !ClsNumber) return nil;
     id touch = FTAlloc(ClsTouch);
-    if (!touch) return;
+    if (!touch) return nil;
     touch = ((Msg_Init)objc_msgSend)(touch, sel_registerName("init"));
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"), targetWin, FTString("_window"));
+    ((Msg_SetLocationReset)objc_msgSend)(touch, sel_registerName("_setLocation:resetPrevious:"), pt, YES);
+    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"), win, FTString("_window"));
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_NumberWithDouble)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithDouble:"), now), FTString("_timestamp"));
+        ((Msg_NumberWithDouble)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithDouble:"), ts), FTString("_timestamp"));
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 0), FTString("_phase")); // Began
+        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), phase), FTString("_phase"));
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
         ((Msg_NumberWithUnsignedInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithUnsignedInt:"), 1), FTString("_tapCount"));
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_ValueWithCGPoint)objc_msgSend)((id)ClsValue, sel_registerName("valueWithCGPoint:"), pt), FTString("_locationInWindow"));
+        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 1), FTString("_isTap"));
+    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
+        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 0), FTString("_index"));
+    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
+        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 0), FTString("_digitizer"));
+    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
+        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 0), FTString("_edge"));
+    return touch;
+}
 
-    // 3. 合成 UIEvent（_touches = NSSet{touch}）
+// 构造完整 UIEvent 并 sendEvent（_touches/_coalescedTouches/_predictedTouches/_type/_subtype）
+static void FTSendEvent(id app, id touch, double ts) {
+    Class ClsEvent  = objc_getClass("UIEvent");
+    Class ClsSet    = objc_getClass("NSSet");
+    Class ClsNumber = objc_getClass("NSNumber");
+    if (!ClsEvent || !ClsSet || !ClsNumber || !app || !touch) return;
     id set = ((Msg_SetWithObject)objc_msgSend)((id)ClsSet, sel_registerName("setWithObject:"), touch);
     if (!set) return;
     id event = FTAlloc(ClsEvent);
     if (!event) return;
     event = ((Msg_Init)objc_msgSend)(event, sel_registerName("init"));
     ((Msg_SetValueForKey)objc_msgSend)(event, sel_registerName("setValue:forKey:"), set, FTString("_touches"));
+    ((Msg_SetValueForKey)objc_msgSend)(event, sel_registerName("setValue:forKey:"), set, FTString("_coalescedTouches"));
+    ((Msg_SetValueForKey)objc_msgSend)(event, sel_registerName("setValue:forKey:"), set, FTString("_predictedTouches"));
+    ((Msg_SetValueForKey)objc_msgSend)(event, sel_registerName("setValue:forKey:"),
+        ((Msg_NumberWithDouble)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithDouble:"), ts), FTString("_timestamp"));
+    ((Msg_SetValueForKey)objc_msgSend)(event, sel_registerName("setValue:forKey:"),
+        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 0), FTString("_type"));    // UIEventTypeTouches
+    ((Msg_SetValueForKey)objc_msgSend)(event, sel_registerName("setValue:forKey:"),
+        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 0), FTString("_subtype")); // UIEventSubtypeNone
+    ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
+}
 
-    // 4. down（Began）→ up（Ended）
-    ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
-    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 3), FTString("_phase")); // Ended
-    ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
+// 在屏幕像素点 (px,py) 发一次合成点击（down + up 独立对象；@try 兜底防 SB 崩溃）
+static void FTSyntheticTap(double px, double py) {
+    @try {
+        Class ClsApp = objc_getClass("UIApplication");
+        if (!ClsApp) return;
+        id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
+        if (!app) return;
+        id wins = ((Msg_Send)objc_msgSend)(app, sel_registerName("windows"));
+        if (!wins) return;
+        NSUInteger n = ((Msg_Count)objc_msgSend)(wins, sel_registerName("count"));
+
+        // 1. 找触摸点命中的窗口（跳过球窗口，球窗口交互已由调用方关闭）
+        CGPoint pt = CGPointMake(px, py);
+        id targetWin = nil;
+        for (NSUInteger i = 0; i < n; i++) {
+            id w = ((Msg_ObjectAtIndex)objc_msgSend)(wins, sel_registerName("objectAtIndex:"), i);
+            if (!w || w == gBallWindow) continue;
+            id hit = ((Msg_HitTest)objc_msgSend)(w, sel_registerName("hitTest:withEvent:"), pt, nil);
+            if (hit) { targetWin = w; break; }
+        }
+        if (!targetWin) {
+            FTLog("synthetic tap: no target window at point");
+            return;
+        }
+
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+
+        // 2. down（独立对象，phase=Began）→ up（独立对象，phase=Ended）
+        id touchDown = FTMakeTouch(0, pt, targetWin, now);
+        if (touchDown) FTSendEvent(app, touchDown, now);
+        id touchUp = FTMakeTouch(3, pt, targetWin, now);
+        if (touchUp) FTSendEvent(app, touchUp, now);
+    } @catch (NSException *ex) {
+        (void)ex;
+        FTLog("synthetic tap exception");
+    }
 }
 
 // 连点回调：在球心发一次合成点击。
@@ -528,10 +557,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.30 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.31 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.30 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.31 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
