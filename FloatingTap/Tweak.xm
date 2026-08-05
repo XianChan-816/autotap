@@ -91,6 +91,7 @@ static NSString *FTResolveAppCaches(pid_t pid) {
 // 收到 App 启动通知后：找 App PID → 拿沙盒路径 → 立即写心跳 + 导出
 // 注意：C 函数里不能使用 @synchronized（ObjC 语法仅限方法），Darwin notification
 // 回调运行在主 run loop，天然串行，无需加锁。
+// 此回调在 App 启动后触发（SB 已启动完毕），进程枚举 / sandbox API 都安全。
 static void FTOnAppStarted(void) {
     if (gAppPID <= 0) {
         gAppPID = FTFindAppPID();
@@ -105,11 +106,15 @@ static void FTOnAppStarted(void) {
         return;
     }
     FTSetAppCachesDir(caches);
-    // 立即写心跳 + 导出 App 列表（此时 App 还没装载 UI，时间充裕）
+    // 写心跳（类方法，不建 UI，安全）
     @try { [FloatingBallView writeHeartbeat]; }
     @catch (NSException *ex) { NSLog(@"[FloatingTap] 启动心跳异常: %@", ex); }
-    @try { [[FloatingBallView shared] dumpInstalledApps]; }
-    @catch (NSException *ex) { NSLog(@"[FloatingTap] 启动枚举异常: %@", ex); }
+    // 枚举延迟 2s：确保 SpringBoard UI 完全就绪后再建 shared 视图（防御极端时序）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @try { [[FloatingBallView shared] dumpInstalledApps]; }
+        @catch (NSException *ex) { NSLog(@"[FloatingTap] 启动枚举异常: %@", ex); }
+    });
     // 通知 App 数据已就绪
     notify_post([kFTNotifyTweakDataUpdated UTF8String]);
 }
@@ -153,27 +158,14 @@ static void FTRegisterNotifications(void) {
 }
 
 %ctor {
-    // 1. 立即注册 Darwin notification 监听（安全，不碰 UIKit）
+    // 1. 立即注册 Darwin notification 监听（安全，不碰 UIKit、不查进程）
+    //    注意：绝不在 %ctor 里做进程枚举 / sandbox API / 任何 UIKit ——
+    //    SpringBoard 启动早期环境未就绪，私有 API 崩溃是 EXC_BAD_ACCESS，
+    //    @try/@catch 捕不住，直接白苹果（b1794ad 已验证过此坑）。
     @try { FTRegisterNotifications(); }
     @catch (NSException *ex) { NSLog(@"[FloatingTap] 注册通知异常: %@", ex); }
 
-    // 2. 尝试主动找 App 沙盒（如果 App 已经在运行，比如 SB 重启）
-    @try {
-        pid_t pid = FTFindAppPID();
-        if (pid > 0) {
-            gAppPID = pid;
-            NSString *caches = FTResolveAppCaches(pid);
-            if (caches) {
-                FTSetAppCachesDir(caches);
-                @try { [FloatingBallView writeHeartbeat]; }
-                @catch (NSException *ex) { NSLog(@"[FloatingTap] 启动心跳异常: %@", ex); }
-            }
-        }
-    } @catch (NSException *ex) {
-        NSLog(@"[FloatingTap] 主动解析 App 沙盒异常: %@", ex);
-    }
-
-    // 3. SpringBoard 完全启动后再启动监控（8 秒延迟，避免启动期 KVC 私有 API 导致 SB 崩溃）
+    // 2. SpringBoard 完全启动后再启动监控（8 秒延迟，避免启动期 KVC 私有 API 导致 SB 崩溃）
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:2.0
@@ -193,7 +185,7 @@ static void FTRegisterNotifications(void) {
             NSLog(@"[FloatingTap] 启动首检异常: %@", ex);
         }
 
-        // 首次枚举（如果主动解析 App 沙盒失败，等待 App 启动通知）
+        // 首次枚举（如果 App 沙盒路径还没设置，等 App 启动通知来了再补）
         if (FTGetAppCachesDir()) {
             @try {
                 [[FloatingBallView shared] dumpInstalledApps];
