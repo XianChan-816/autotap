@@ -154,6 +154,9 @@ static uint64_t FT_SenderID(void) {
 //   否则系统可能丢弃合成触摸。
 // 导出供 Tweak.xm 塞入 UIEvent._hidEvent（绕开 IOKit 分发层）。
 FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y) {
+    // v1.0.35: 必须先确保 dlsym 符号已加载（v1.0.30 起 FT_HIDConnect 不再被调用，
+    // 符号加载被跳过导致函数指针全 NULL → 事件构造失败）
+    if (!FT_HIDLoadSymbols()) return NULL;
     if (!p_IOHIDEventCreateDigitizerEvent) return NULL;
     uint32_t mask = down
         ? (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventTouch |
