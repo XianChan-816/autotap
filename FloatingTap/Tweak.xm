@@ -1,14 +1,14 @@
 //
-//  Tweak.xm — FloatingTap v1.0.29（诊断版）
+//  Tweak.xm — FloatingTap v1.0.30
 //
-//  v1.0.28 实测：球窗口穿透后图标仍不点开 → 「球窗口拦截」理论排除。
-//  v1.0.29 决定性诊断：%hook UIWindow sendEvent: 节流打印触摸数+命中 view 类，
-//  观察注入的 HID 触摸到底有没有到达 UIKit 层。同时 FTClickCallback 打印
-//  inject tap 坐标，与 SEND 日志对照：
-//    - SEND 频繁出现 = 注入到达 UIKit，问题在上层（坐标/路由）
-//    - SEND 只反映真实手指 = 注入在 IOKit/BackBoard 层被丢弃 → 换注入路径
+//  v1.0.29 诊断（决定性）：长按 6.3s 注入 30 次，UIWindow sendEvent 的 SEND 记录
+//  只有零星几条（=用户手指），注入触摸从未到达 UIKit → IOHIDEventSystemClient
+//  在 Dopamine+iOS15.5+M1 环境事件被 IOKit/BackBoard 层丢弃（DispatchEvent 返回成功但无效）。
+//  v1.0.30 换注入路径：SB 进程内 KVC 合成 UITouch/UIEvent，调 [UIApplication sendEvent:]，
+//  等价程序化手指，不经过 HID 系统。hitTest 找触摸点命中窗口（跳过球窗口）。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
+//  （KVC key 用 FTString 运行时创建 NSString）
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
 //
 
@@ -159,14 +159,96 @@ static double FTIntervalMs(void) {
 // 恢复球窗口交互（注入后 60ms 回调）
 static void FTRestoreBallInteractionCallback(void *ctx);
 
-// 连点回调：在球心发一次 HID 点击。
-// ⚠️ 关键：注入坐标=球心，球窗口(windowLevel 1001)正好在球心，注入触摸会先命中
-// 球窗口被吃掉 → 下层永远收不到 → "屏幕没反应"。因此注入瞬间关掉球窗口交互
+// MARK: - 合成触摸（KVC 方案，v1.0.30 起替代 HID 注入）
+// v1.0.29 诊断证实：IOHIDEventSystemClientDispatchEvent 在 Dopamine+iOS15.5+M1 环境
+// 事件被 IOKit/BackBoard 层丢弃（从未到达 UIWindow sendEvent）。改在 SB 进程内
+// 用 KVC 直接合成 UITouch/UIEvent，调 [UIApplication sendEvent:] —— 等价程序化手指。
+
+typedef void (*Msg_SetValueForKey)(id, SEL, id, id);
+typedef id   (*Msg_ValueWithCGPoint)(id, SEL, CGPoint);
+typedef id   (*Msg_SetWithObject)(id, SEL, id);
+typedef id   (*Msg_HitTest)(id, SEL, CGPoint, id);
+typedef void (*Msg_SendEvent)(id, SEL, id);
+typedef id   (*Msg_StringWithUTF8String)(id, SEL, const char *);
+
+// 运行时创建 NSString（禁止 @"" 字面量：arm64e PAC 元数据雷区）
+static id FTString(const char *s) {
+    Class ClsStr = objc_getClass("NSString");
+    if (!ClsStr) return nil;
+    return ((Msg_StringWithUTF8String)objc_msgSend)((id)ClsStr, sel_registerName("stringWithUTF8String:"), s);
+}
+
+// 在屏幕像素点 (px,py) 发一次合成点击（down + up，同一 touch 对象）
+static void FTSyntheticTap(double px, double py) {
+    Class ClsTouch = objc_getClass("UITouch");
+    Class ClsEvent = objc_getClass("UIEvent");
+    Class ClsApp   = objc_getClass("UIApplication");
+    Class ClsSet   = objc_getClass("NSSet");
+    Class ClsValue = objc_getClass("NSValue");
+    Class ClsNumber= objc_getClass("NSNumber");
+    if (!ClsTouch || !ClsEvent || !ClsApp || !ClsSet || !ClsValue || !ClsNumber) {
+        FTLog("synthetic tap failed: class missing");
+        return;
+    }
+    id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
+    if (!app) return;
+    id wins = ((Msg_Send)objc_msgSend)(app, sel_registerName("windows"));
+    if (!wins) return;
+    NSUInteger n = ((Msg_Count)objc_msgSend)(wins, sel_registerName("count"));
+
+    // 1. 找触摸点命中的窗口（跳过球窗口，球窗口交互已由调用方关闭）
+    CGPoint pt = CGPointMake(px, py);
+    id targetWin = nil;
+    for (NSUInteger i = 0; i < n; i++) {
+        id w = ((Msg_ObjectAtIndex)objc_msgSend)(wins, sel_registerName("objectAtIndex:"), i);
+        if (!w || w == gBallWindow) continue;
+        id hit = ((Msg_HitTest)objc_msgSend)(w, sel_registerName("hitTest:withEvent:"), pt, nil);
+        if (hit) { targetWin = w; break; }
+    }
+    if (!targetWin) {
+        FTLog("synthetic tap: no target window at point");
+        return;
+    }
+
+    // 2. 合成 UITouch（KVC 设置私有属性）
+    id touch = FTAlloc(ClsTouch);
+    if (!touch) return;
+    touch = ((Msg_Init)objc_msgSend)(touch, sel_registerName("init"));
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"), targetWin, FTString("_window"));
+    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
+        ((Msg_Send)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithDouble:"), now), FTString("_timestamp"));
+    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
+        ((Msg_Send)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 0), FTString("_phase")); // Began
+    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
+        ((Msg_Send)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithUnsignedInt:"), 1), FTString("_tapCount"));
+    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
+        ((Msg_ValueWithCGPoint)objc_msgSend)((id)ClsValue, sel_registerName("valueWithCGPoint:"), pt), FTString("_locationInWindow"));
+
+    // 3. 合成 UIEvent（_touches = NSSet{touch}）
+    id set = ((Msg_SetWithObject)objc_msgSend)((id)ClsSet, sel_registerName("setWithObject:"), touch);
+    if (!set) return;
+    id event = FTAlloc(ClsEvent);
+    if (!event) return;
+    event = ((Msg_Init)objc_msgSend)(event, sel_registerName("init"));
+    ((Msg_SetValueForKey)objc_msgSend)(event, sel_registerName("setValue:forKey:"), set, FTString("_touches"));
+
+    // 4. down（Began）→ up（Ended）
+    ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
+    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
+        ((Msg_Send)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 3), FTString("_phase")); // Ended
+    ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
+}
+
+// 连点回调：在球心发一次合成点击。
+// ⚠️ 注入坐标=球心，球窗口(windowLevel 1001)正好在球心，注入触摸会先命中
+// 球窗口被吃掉 → 下层永远收不到。因此注入瞬间关掉球窗口交互
 // （userInteractionEnabled=NO，窗口不参与 hitTest，注入触摸穿透），60ms 后恢复。
 static void FTClickCallback(void *ctx) {
     (void)ctx;
     if (!gBallWindow || !gIsClicking) return;
-    if (!FT_HIDIsConnected()) return;
 
     CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
     double cx = f.origin.x + f.size.width * 0.5;
@@ -179,7 +261,7 @@ static void FTClickCallback(void *ctx) {
     // 注入前：球窗口不参与 hitTest → 注入触摸穿透到下层
     ((Msg_SetUserInteractionEnabled)objc_msgSend)(gBallWindow, sel_registerName("setUserInteractionEnabled:"), NO);
 
-    FT_HIDTapAt(nx, ny);
+    FTSyntheticTap(nx * gScreenW, ny * gScreenH);
     gClickCount++;
 
     char diag[96];
@@ -200,10 +282,6 @@ static void FTRestoreBallInteractionCallback(void *ctx) {
 
 static void FTStartClicking(void) {
     if (gIsClicking) return;
-    if (!FT_HIDConnect()) {
-        FTLog("clicking failed: HID connect failed");
-        return;
-    }
     gIsClicking = YES;
     gClickCount = 0;
     double ms = FTIntervalMs();
@@ -447,10 +525,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.29 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.30 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.29 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.30 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
