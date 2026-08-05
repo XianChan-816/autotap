@@ -5,7 +5,11 @@
 
 export THEOS_PACKAGE_SCHEME = rootless
 export TARGET := iphone:clang:latest:15.0
-export ARCHS = arm64 arm64e
+# v1.0.16: 去掉 arm64e，只编 arm64。
+# 根因：崩溃日志显示 FloatingTap.dylib 以 arm64e 注入 M1 时，%ctor 内 NSLog 的
+# objc_msgSend 触发 ARM64E PAC（指针认证）失败 → SB 崩 → Safe Mode。
+# 只编 arm64（无 PAC）在 M1 上可正常运行，ElleKit 注入不走指针认证，绕开此坑。
+export ARCHS = arm64
 
 include $(THEOS)/makefiles/common.mk
 
