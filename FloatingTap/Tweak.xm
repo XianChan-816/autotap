@@ -1,12 +1,13 @@
 //
-//  Tweak.xm — FloatingTap v1.0.49
+//  Tweak.xm — FloatingTap v1.0.50
 //
-//  v1.0.48 实测：注入触摸到达 UIWindow sendEvent，但 view=?（touch.view=nil）
-//  = UIKit hitTest 没命中任何 view → 图标手势收不到 → 不开。
-//  对照：真实触摸 view=NCNotificationListView（有值）。
-//  v1.0.49 决定性诊断：SEND 日志加 locationInWindow 像素坐标（loc=）+
-//  窗口类（win=）——若 loc=0.33,0.42（还是归一化值）→ UIKit 期望像素，
-//  坐标单位错误实锤 → 修事件构造；若 loc=788,700（正确像素）→ hitTest 链路问题。
+//  架构（用户原设计）：AutoTap App = 启动器（选目标 App / 拖动十字线定位置 / 间隔），
+//  FloatingTap tweak = 执行器。App 端协议（TargetAppManager.swift）早已定义，
+//  tweak 端此前从未对接——v1.0.50 补齐通信：
+//    - 监听 Darwin 通知（CFNotificationCenter，纯 C）：appStarted / configUpdated
+//    - sysctl KERN_PROC_ALL 找 AutoTap PID + sandbox_container_path_for_pid 反查沙盒
+//    - 写心跳 FloatingTap.tweak.plist（App 显示"已加载"）
+//    - 读 AutoTapConfig.plist（ClickX/ClickY/IntervalMs）→ 球按配置定位 + 连点用配置坐标
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
@@ -19,9 +20,14 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <dlfcn.h>
 #import <stdio.h>
+#import <stdlib.h>
+#import <string.h>
 #import <syslog.h>
 #import <time.h>
 #import <stdint.h>
+#import <stdbool.h>
+#import <unistd.h>
+#import <sys/sysctl.h>
 #import <dispatch/dispatch.h>
 #import <CoreGraphics/CoreGraphics.h>
 
@@ -162,10 +168,11 @@ static BOOL FTUIReady(void) {
 
 static unsigned long gClickCount = 0; // 本次连点周期内的点击次数（诊断）
 
-// 读取连点间隔（毫秒）：/var/mobile/Library/Preferences/com.floatingtap.cfg 第一行数字。
+// 读取连点间隔（毫秒）：优先 App 配置（v1.0.50），兜底 cfg 文件，默认 400ms。
 // ⚠️ v1.0.46：默认 400ms——iOS 双击识别窗口约 350ms，间隔小于它会触发 tapCount 累积
 // （v1.0.45 实测 tap=4），图标被当成多击不启动。400ms 以上每次点击独立 tapCount=1。
 static double FTIntervalMs(void) {
+    if (gCfgLoaded && gCfgMs >= 1.0) return gCfgMs;
     FILE *f = fopen("/var/mobile/Library/Preferences/com.floatingtap.cfg", "r");
     if (f) {
         double v = 400.0;
@@ -176,6 +183,174 @@ static double FTIntervalMs(void) {
         fclose(f);
     }
     return 400.0;
+}
+
+// MARK: - App 通信（v1.0.50 对接 AutoTap App）
+// 协议（见 AutoTap/Sources/TargetAppManager.swift，App 端早已定义，tweak 端此前从未对接）：
+//  - 配置：<AutoTap沙盒>/Library/Caches/AutoTapConfig.plist
+//    keys：Targets([String]) / IntervalMs / ClickX / ClickY（归一化 0~1）
+//  - tweak 写心跳：<AutoTap沙盒>/Library/Caches/FloatingTap.tweak.plist（_loaded / _time 毫秒）
+//  - tweak 写枚举：FloatingTap.apps.plist + FloatingTap.apps.status.plist（下一步）
+//  - Darwin 通知：com.floatingtap.autotap.appStarted / configUpdated / tweakDataUpdated
+// 实现：CFNotificationCenter（纯 C API）+ sysctl 找 PID + sandbox_container_path_for_pid 反查沙盒。
+
+typedef id         (*Msg_StringWithUTF8String)(id, SEL, const char *);
+typedef id         (*Msg_DictWithFile)(id, SEL, id);
+typedef id         (*Msg_ObjectForKey)(id, SEL, id);
+typedef double     (*Msg_DoubleValue)(id, SEL);
+
+static char gAutoTapSandbox[1024] = "";  // AutoTap App 沙盒路径（缓存）
+static int  gAutoTapSandboxReady = 0;
+static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 400.0;  // App 配置（位置/间隔）
+static int  gCfgLoaded = 0;
+
+// 运行时创建 NSString（禁止 @"..."：arm64e PAC 元数据雷区）
+static id FTStr(const char *s) {
+    Class ClsStr = objc_getClass("NSString");
+    if (!ClsStr) return nil;
+    return ((Msg_StringWithUTF8String)objc_msgSend)((id)ClsStr, sel_registerName("stringWithUTF8String:"), s);
+}
+
+// 通过进程名找 PID（sysctl KERN_PROC_ALL，纯 C）
+static pid_t FTFindPIDByName(const char *name) {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0) return -1;
+    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(len);
+    if (!procs) return -1;
+    if (sysctl(mib, 4, procs, &len, NULL, 0) != 0) { free(procs); return -1; }
+    int n = (int)(len / sizeof(struct kinfo_proc));
+    pid_t found = -1;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(procs[i].kp_proc.p_comm, name) == 0) { found = procs[i].kp_proc.p_pid; break; }
+    }
+    free(procs);
+    return found;
+}
+
+// 反查 AutoTap 沙盒路径（sandbox_container_path_for_pid，dlsym 动态解析）
+static void FTResolveAutoTapSandbox(void) {
+    if (gAutoTapSandboxReady) return;
+    gAutoTapSandboxReady = 1; // 只尝试一次（App 不在运行则等下次 appStarted 通知重试）
+    pid_t pid = FTFindPIDByName("AutoTap");
+    if (pid <= 0) { FTLog("autotap: process not running"); return; }
+    static const char *(*p_sandbox_container_path_for_pid)(pid_t) = NULL;
+    if (!p_sandbox_container_path_for_pid) {
+        p_sandbox_container_path_for_pid =
+            (const char *(*)(pid_t))dlsym(RTLD_DEFAULT, "sandbox_container_path_for_pid");
+    }
+    if (!p_sandbox_container_path_for_pid) { FTLog("autotap: no sandbox symbol"); return; }
+    const char *sp = p_sandbox_container_path_for_pid(pid);
+    if (!sp || !*sp) { FTLog("autotap: sandbox path empty"); return; }
+    snprintf(gAutoTapSandbox, sizeof(gAutoTapSandbox), "%s", sp);
+    gAutoTapSandboxReady = 2; // 成功
+    char diag[300];
+    snprintf(diag, sizeof(diag), "autotap sandbox: %s", gAutoTapSandbox);
+    FTLog(diag);
+}
+
+// 写心跳（FloatingTap.tweak.plist，手动生成 XML plist，零 ObjC 元数据）
+static void FTWriteHeartbeat(void) {
+    FTResolveAutoTapSandbox();
+    if (gAutoTapSandboxReady != 2) return;
+    char path[1150];
+    snprintf(path, sizeof(path), "%s/Library/Caches/FloatingTap.tweak.plist", gAutoTapSandbox);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    double now = (double)time(NULL) * 1000.0; // App 端 _time 为毫秒
+    fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+               "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+               "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+               "<plist version=\"1.0\">\n<dict>\n"
+               "\t<key>_loaded</key>\n\t<true/>\n"
+               "\t<key>_time</key>\n\t<real>%.0f</real>\n"
+               "</dict>\n</plist>\n", now);
+    fclose(f);
+    FTLog("heartbeat written");
+}
+
+// 读配置（dictionaryWithContentsOfFile: 动态调用）
+static id FTReadConfigDict(void) {
+    FTResolveAutoTapSandbox();
+    if (gAutoTapSandboxReady != 2) return nil;
+    char path[1150];
+    snprintf(path, sizeof(path), "%s/Library/Caches/AutoTapConfig.plist", gAutoTapSandbox);
+    id fstr = FTStr(path);
+    if (!fstr) return nil;
+    Class ClsDict = objc_getClass("NSDictionary");
+    if (!ClsDict) return nil;
+    return ((Msg_DictWithFile)objc_msgSend)((id)ClsDict, sel_registerName("dictionaryWithContentsOfFile:"), fstr);
+}
+
+static double FTConfigDouble(id dict, const char *key, double def) {
+    if (!dict) return def;
+    id k = FTStr(key);
+    if (!k) return def;
+    id v = ((Msg_ObjectForKey)objc_msgSend)(dict, sel_registerName("objectForKey:"), k);
+    if (!v) return def;
+    return ((Msg_DoubleValue)objc_msgSend)(v, sel_registerName("doubleValue"));
+}
+
+// 移动球到配置位置（球心 = 配置点击点）；同步锁定坐标
+static void FTMoveBallToConfig(void);
+
+// 应用配置：更新间隔 + 移动球
+static void FTApplyConfig(void) {
+    id dict = FTReadConfigDict();
+    if (!dict) { FTLog("config: no dict"); return; }
+    double nx = FTConfigDouble(dict, "ClickX", 0.5);
+    double ny = FTConfigDouble(dict, "ClickY", 0.5);
+    double ms = FTConfigDouble(dict, "IntervalMs", 400.0);
+    if (ms < 1.0) ms = 400.0;
+    if (nx < 0.0) nx = 0.0; if (nx > 1.0) nx = 1.0;
+    if (ny < 0.0) ny = 0.0; if (ny > 1.0) ny = 1.0;
+    gCfgX = nx; gCfgY = ny; gCfgMs = ms;
+    gCfgLoaded = 1;
+    FTMoveBallToConfig();
+    char diag[128];
+    snprintf(diag, sizeof(diag), "config loaded x=%.2f y=%.2f ms=%.0f", nx, ny, ms);
+    FTLog(diag);
+}
+
+// Darwin 通知回调（纯 C；observer=静态占位，靠 name 区分）
+static int sNotifyObserver = 0;
+static void FTNotificationCallback(CFNotificationCenterRef center, void *observer,
+                                   CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    (void)center; (void)observer; (void)object; (void)userInfo;
+    char buf[256];
+    if (!name || !CFStringGetCString(name, buf, sizeof(buf), kCFStringEncodingUTF8)) return;
+    if (strcmp(buf, "com.floatingtap.autotap.appStarted") == 0) {
+        FTLog("got appStarted");
+        // App（重新）启动：强制重试反查沙盒（之前可能因 App 未运行失败）
+        gAutoTapSandboxReady = 0;
+        FTResolveAutoTapSandbox();
+        FTWriteHeartbeat();
+    } else if (strcmp(buf, "com.floatingtap.autotap.configUpdated") == 0) {
+        FTLog("got configUpdated");
+        FTApplyConfig();
+    }
+}
+
+// 注册 Darwin 通知监听（name 需长期有效 → 存 static）
+static void FTRegisterNotifications(void) {
+    CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
+    if (!center) return;
+    static CFStringRef sNameAppStarted = NULL, sNameConfig = NULL;
+    if (!sNameAppStarted) {
+        sNameAppStarted = CFStringCreateWithCString(NULL, "com.floatingtap.autotap.appStarted", kCFStringEncodingUTF8);
+        sNameConfig = CFStringCreateWithCString(NULL, "com.floatingtap.autotap.configUpdated", kCFStringEncodingUTF8);
+    }
+    if (sNameAppStarted)
+        CFNotificationCenterAddObserver(center, &sNotifyObserver, FTNotificationCallback,
+                                        sNameAppStarted, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    if (sNameConfig)
+        CFNotificationCenterAddObserver(center, &sNotifyObserver, FTNotificationCallback,
+                                        sNameConfig, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    FTLog("notifications registered");
+    // 启动即尝试：App 可能已运行（心跳证明 tweak 活着）
+    FTResolveAutoTapSandbox();
+    FTWriteHeartbeat();
+    FTApplyConfig();
 }
 
 // 恢复球窗口交互（注入后 60ms 回调）
@@ -302,7 +477,8 @@ static void FTDumpEventIvars(void) {
     FTLog(buf);
 }
 
-// v1.0.48：SB 端恢复直接注入（不再写任务文件）。坐标锁定 = 长按开始时球心。
+// v1.0.48：SB 端恢复直接注入（不再写任务文件）。坐标锁定 = App 配置点（v1.0.50）
+// 或长按开始时球心（无配置时）。
 static void FTStartClicking(void) {
     if (gIsClicking) return;
     if (!FT_HIDConnect()) {
@@ -312,8 +488,12 @@ static void FTStartClicking(void) {
     gIsClicking = YES;
     gClickCount = 0;
     gTapIndex = 0;
-    // 锁定点击坐标 = 当前球心（v1.0.45：拖动球不改变注入点，避免 tap 因移动失败）
-    if (gBallWindow) {
+    if (gCfgLoaded) {
+        // v1.0.50：App 配置优先——点击点 = 配置坐标（球已移动到该位置）
+        gClickLockX = gCfgX;
+        gClickLockY = gCfgY;
+    } else if (gBallWindow) {
+        // 无配置：锁定当前球心（v1.0.45：拖动球不改变注入点，避免 tap 因移动失败）
         CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
         double cx = f.origin.x + f.size.width * 0.5;
         double cy = f.origin.y + f.size.height * 0.5;
@@ -494,6 +674,27 @@ static void FTSetupBall(void) {
     gBallView   = ball;
 
     FTLog("ball created, gesture handlers wired");
+
+    // v1.0.50：球创建后立即按 App 配置定位（若已加载配置）
+    FTMoveBallToConfig();
+}
+
+// v1.0.50：移动球到 App 配置位置（球心 = 配置点击点；未加载配置则居中不动）
+static void FTMoveBallToConfig(void) {
+    if (!gBallWindow || !gCfgLoaded) return;
+    if (gScreenW <= 0 || gScreenH <= 0) return;
+    double px = gCfgX * gScreenW;
+    double py = gCfgY * gScreenH;
+    CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
+    ((Msg_SetFrame)objc_msgSend)(gBallWindow, sel_registerName("setFrame:"),
+        CGRectMake(px - f.size.width * 0.5, py - f.size.height * 0.5,
+                   f.size.width, f.size.height));
+    // 同步锁定坐标（连点打在配置点）
+    gClickLockX = gCfgX;
+    gClickLockY = gCfgY;
+    char diag[96];
+    snprintf(diag, sizeof(diag), "ball moved to config %.2f,%.2f", gCfgX, gCfgY);
+    FTLog(diag);
 }
 
 // MARK: - GCD C 函数回调（代替 block）——前向声明
@@ -591,27 +792,23 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.49 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.50 loaded (pure C ctor, zero static ObjC metadata)");
 
-    // v1.0.48：先修好 SB 端基本连点（直接注入），抖音双进程方案暂停。
+    // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
-        // 【诊断标记】SB 进程覆盖写；抖音进程追加写（避免互相覆盖）
+        // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.49 ctor run (arm64e, pure C)\n");
+            fprintf(mk, "FloatingTap v1.0.50 ctor run (arm64e, pure C)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
+
+        // v1.0.50：注册 Darwin 通知监听（appStarted/configUpdated）+ 立即尝试反查沙盒/心跳/读配置
+        FTRegisterNotifications();
+
         // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
         dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
                          dispatch_get_main_queue(), NULL, FTTweakInitCallback);
-    } else if (FTIsBundle("com.ss.iphone.ugc.Aweme")) {
-        // v1.0.48 暂停抖音方案：不再启动任务文件轮询（SB 端也不写任务文件了）
-        FILE *mk = fopen("/tmp/floatingtap_ctor.log", "a");
-        if (mk) {
-            fprintf(mk, "FloatingTap v1.0.48 Douyin ctor (inactive, SB-first mode)\n");
-            fclose(mk);
-        }
-        syslog(LOG_ERR, "FloatingTap role: Douyin (inactive)");
     }
 }
