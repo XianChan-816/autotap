@@ -1,13 +1,15 @@
 //
-//  Tweak.xm — FloatingTap v1.0.50-fix3
+//  Tweak.xm — FloatingTap v1.0.52
 //
 //  架构（用户原设计）：AutoTap App = 启动器（选目标 App / 拖动十字线定位置 / 间隔），
-//  FloatingTap tweak = 执行器。App 端协议（TargetAppManager.swift）早已定义，
-//  tweak 端此前从未对接——v1.0.50 补齐通信：
-//    - 监听 Darwin 通知（CFNotificationCenter，纯 C）：appStarted / configUpdated
-//    - sysctl KERN_PROC_ALL 找 AutoTap PID + sandbox_container_path_for_pid 反查沙盒
-//    - 写心跳 FloatingTap.tweak.plist（App 显示"已加载"）
-//    - 读 AutoTapConfig.plist（ClickX/ClickY/IntervalMs）→ 球按配置定位 + 连点用配置坐标
+//  FloatingTap tweak = 执行器。
+//  v1.0.52：通信彻底改为 CFMessagePort（CoreFoundation C API）+ RocketBootstrap 打通
+//  iOS 沙盒 bootstrap namespace 隔离（文件系统跨进程在 iOS15 rootless 下实测不通）。
+//    - App→tweak：msgid 0 = config plist（Targets/IntervalMs/ClickX/ClickY）；msgid 2 = 请求 App 列表
+//    - tweak→App：msgid 1 = 心跳（_loaded/_time）；msgid 3 = 已装 App 列表（SB 进程枚举）
+//    - Darwin 通知（appStarted/configUpdated）仅作唤醒信号，不承载数据
+//    - RocketBootstrap 动态 dlopen（librocketbootstrap.dylib），server 用
+//      rocketbootstrap_cfmessageportexposelocal 暴露到全局 bootstrap → App 才能查到
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
@@ -189,163 +191,223 @@ static double FTIntervalMs(void) {
     return 400.0;
 }
 
-// MARK: - App 通信（v1.0.50 对接 AutoTap App / v1.0.50-fix 改固定全局路径）
-// 协议（见 AutoTap/Sources/TargetAppManager.swift，App 端早已定义，tweak 端此前从未对接）：
-//  - 配置：/var/mobile/Library/Preferences/com.floatingtap.config.plist（App no-sandbox 可写，tweak 可读）
-//    keys：Targets([String]) / IntervalMs / ClickX / ClickY（归一化 0~1）
-//  - tweak 写心跳：/var/mobile/Library/Preferences/com.floatingtap.tweak.plist（_loaded / _time 毫秒）
-//  - Darwin 通知：com.floatingtap.autotap.appStarted / configUpdated / tweakDataUpdated
-// ⚠️ v1.0.50-fix：原方案用 sandbox_container_path_for_pid 反查 App 沙盒，dlsym 私有函数
-// 在 arm64e 下调用崩溃（Safe Mode，日志停在 notifications registered 后）。App 有
-// no-sandbox entitlement，理论上可直接读写系统全局路径 → 删掉反查，用固定路径。
-// ⚠️ v1.0.50-fix3 实测：fix2 写 /var/mobile/Library/Preferences/ 心跳成功（tweak log
-// 「heartbeat written」30+ 次），但 App 的 FileManager.fileExists 返回 false → App 看到的
-// 不是真实 /var/mobile/ 而是 sandbox 容器根。改多路径探针：4 个候选按顺序试，写第一个能写的。
+// MARK: - App 通信（v1.0.52：CFMessagePort IPC，经 RocketBootstrap 打通沙盒隔离）
+// 文件系统跨进程在 iOS 15.5 + Dopamine rootless 沙盒下彻底不通（App 被 sandbox 重定向，
+// 4 候选路径实测 App 全部 ✗stat）。改用 CFMessagePort（CoreFoundation C API）+ RocketBootstrap
+// 打通 bootstrap namespace 隔离——越狱社区标准跨沙盒 IPC。
+//
+// 消息协议（msgid）：
+//   0 = App→tweak  config plist（Targets/IntervalMs/ClickX/ClickY）
+//   1 = tweak→App  heartbeat plist（_loaded/_time）
+//   2 = App→tweak  request apps list
+//   3 = tweak→App  apps list plist（dict: bundleID -> displayName）
+// Darwin notification（com.floatingtap.autotap.appStarted）作唤醒：App 启动发，tweak 收
+// 到立即推心跳 + apps，避免「tweak 没跑时 App 连不上」。
 
-typedef id         (*Msg_StringWithUTF8String)(id, SEL, const char *);
-typedef id         (*Msg_DictWithFile)(id, SEL, id);
-typedef id         (*Msg_ObjectForKey)(id, SEL, id);
-typedef double     (*Msg_DoubleValue)(id, SEL);
+typedef id         (*Msg_AllApps)(id, SEL);
+typedef id         (*Msg_AppBid)(id, SEL);
+typedef id         (*Msg_AppName)(id, SEL);
 
-// 候选路径（按「tweak + App 两边都能读写」概率从高到低；Logs/CrashReporter 全部进程
-// 都有写权限是公认的稳定共享点，/var/mobile/ 直挂跳过 /Library/ 保护）
-#define FT_HB_CAND_0 "/var/mobile/Library/Logs/CrashReporter/com.floatingtap.tweak.plist"
-#define FT_HB_CAND_1 "/var/mobile/com.floatingtap.tweak.plist"
-#define FT_HB_CAND_2 "/var/mobile/Library/Preferences/com.floatingtap.tweak.plist"
-#define FT_HB_CAND_3 "/tmp/com.floatingtap.tweak.plist"
-static const char *FT_HB_PATHS[] = { FT_HB_CAND_0, FT_HB_CAND_1, FT_HB_CAND_2, FT_HB_CAND_3 };
-static int FT_HB_COUNT = sizeof(FT_HB_PATHS) / sizeof(FT_HB_PATHS[0]);
-static int FT_HB_USED = -1; // 上次写成功的路径索引，-1=全部失败
-
-// 暂保持宏兼容（FTApplyConfig / FTReadConfigDict 内部用），但 FTReadConfigDict 改多路径
-#define FT_CFG_PATH "/var/mobile/Library/Preferences/com.floatingtap.config.plist"
-#define FT_HB_PATH  FT_HB_CAND_2  // 默认指向 Preferences，探针会重定向到第一个能写的
-
-// 运行时创建 NSString（禁止 @"..."：arm64e PAC 元数据雷区）
-static id FTStr(const char *s) {
-    Class ClsStr = objc_getClass("NSString");
-    if (!ClsStr) return nil;
-    return ((Msg_StringWithUTF8String)objc_msgSend)((id)ClsStr, sel_registerName("stringWithUTF8String:"), s);
-}
-
-// 写心跳（v1.0.50-fix3：多路径探针，写第一个能写的 → 记录成功路径 → 下次直接写该路径；
-// 全部失败则记录，留 /tmp/floatingtap_ctor.log 让人查）
-static void FTWriteHeartbeat(void) {
-    double now = (double)time(NULL) * 1000.0;
-    int useIdx = FT_HB_USED;
-    int tried = 0;
-
-    // 优先上次成功路径（已确认能写）
-    if (useIdx >= 0 && useIdx < FT_HB_COUNT) {
-        FILE *f = fopen(FT_HB_PATHS[useIdx], "w");
-        if (f) {
-            fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                       "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
-                       "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-                       "<plist version=\"1.0\">\n<dict>\n"
-                       "\t<key>_loaded</key>\n\t<true/>\n"
-                       "\t<key>_time</key>\n\t<real>%.0f</real>\n"
-                       "\t<key>_path</key>\n\t<string>%s</string>\n"
-                       "</dict>\n</plist>\n", now, FT_HB_PATHS[useIdx]);
-            fflush(f); fclose(f);
-            FTLog("heartbeat written");
-            return;
-        }
-        // 上次成功路径这次反而写不进去（罕见，可能被 App 改了权限）→ 全路径重探
-        FT_HB_USED = -1;
-    }
-
-    // 全路径探针
-    for (int i = 0; i < FT_HB_COUNT; i++) {
-        FILE *f = fopen(FT_HB_PATHS[i], "w");
-        char diag[256];
-        if (!f) {
-            snprintf(diag, sizeof(diag), "hb probe[%d] %s FAIL errno=%d", i, FT_HB_PATHS[i], errno);
-            FTLog(diag);
-            tried++;
-            continue;
-        }
-        fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                   "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
-                   "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-                   "<plist version=\"1.0\">\n<dict>\n"
-                   "\t<key>_loaded</key>\n\t<true/>\n"
-                   "\t<key>_time</key>\n\t<real>%.0f</real>\n"
-                   "\t<key>_path</key>\n\t<string>%s</string>\n"
-                   "</dict>\n</plist>\n", now, FT_HB_PATHS[i]);
-        fflush(f); fclose(f);
-        FT_HB_USED = i;
-        snprintf(diag, sizeof(diag), "hb probe[%d] %s OK", i, FT_HB_PATHS[i]);
-        FTLog(diag);
-        return;
-    }
-    if (tried == FT_HB_COUNT) {
-        FTLog("heartbeat: ALL candidates failed");
-    }
-}
-
-// 读配置（dictionaryWithContentsOfFile: 动态调用，多路径探针——同心跳）
-static id FTReadConfigDict(void) {
-    static const char *CFG_PATHS[] = {
-        "/var/mobile/Library/Preferences/com.floatingtap.config.plist",
-        "/var/mobile/Library/Logs/CrashReporter/com.floatingtap.config.plist",
-        "/var/mobile/com.floatingtap.config.plist",
-        "/tmp/com.floatingtap.config.plist",
+// RocketBootstrap：动态加载（解决沙盒 bootstrap 隔离，CFMessagePort 跨进程必需）
+// 纯 C dlopen + dlsym，不引入任何静态 ObjC 元数据。
+typedef void (*RBExposeFunc)(CFMessagePortRef);
+static void *gRBLib = NULL;
+static RBExposeFunc gRBExpose = NULL;
+static void FTRocketBootstrapInit(void) {
+    if (gRBLib) return;
+    const char *paths[] = {
+        "/usr/lib/librocketbootstrap.dylib",
+        "/var/jb/usr/lib/librocketbootstrap.dylib",
+        "/Library/MobileSubstrate/DynamicLibraries/librocketbootstrap.dylib",
+        NULL
     };
-    static int CFG_COUNT = sizeof(CFG_PATHS) / sizeof(CFG_PATHS[0]);
-    Class ClsDict = objc_getClass("NSDictionary");
-    if (!ClsDict) return nil;
-    Class ClsStr = objc_getClass("NSString");
-    if (!ClsStr) return nil;
-    for (int i = 0; i < CFG_COUNT; i++) {
-        id fstr = ((Msg_StringWithUTF8String)objc_msgSend)((id)ClsStr,
-                                                          sel_registerName("stringWithUTF8String:"),
-                                                          CFG_PATHS[i]);
-        if (!fstr) continue;
-        id d = ((Msg_DictWithFile)objc_msgSend)((id)ClsDict,
-                                                sel_registerName("dictionaryWithContentsOfFile:"),
-                                                fstr);
-        if (d) {
-            char diag[256];
-            snprintf(diag, sizeof(diag), "config read ok from %s", CFG_PATHS[i]);
-            FTLog(diag);
-            return d;
-        }
+    for (int i = 0; paths[i]; i++) {
+        gRBLib = dlopen(paths[i], RTLD_LAZY);
+        if (gRBLib) break;
     }
-    return nil;
+    if (gRBLib) {
+        gRBExpose = (RBExposeFunc)dlsym(gRBLib, "rocketbootstrap_cfmessageportexposelocal");
+        FTLog(gRBExpose ? "rocketbootstrap loaded (expose ok)" : "rocketbootstrap loaded (no expose)");
+    } else {
+        FTLog("rocketbootstrap NOT found - IPC may fail cross-process");
+    }
+}
+static void FTExposePort(CFMessagePortRef port) {
+    if (port && gRBExpose) gRBExpose(port);
 }
 
-static double FTConfigDouble(id dict, const char *key, double def) {
-    if (!dict) return def;
-    id k = FTStr(key);
-    if (!k) return def;
-    id v = ((Msg_ObjectForKey)objc_msgSend)(dict, sel_registerName("objectForKey:"), k);
-    if (!v) return def;
-    return ((Msg_DoubleValue)objc_msgSend)(v, sel_registerName("doubleValue"));
+// 动态 CFString（避免字面量字符串元数据；CFStringCreateWithCString 在 SB 启动后安全）
+static CFStringRef FTCreateCFStr(const char *s) {
+    return CFStringCreateWithCString(NULL, s, kCFStringEncodingUTF8);
 }
 
-// 移动球到配置位置（球心 = 配置点击点）；同步锁定坐标
+// 全局 IPC 状态
+static CFMessagePortRef gServerPort = NULL;   // tweak 端 server: com.floatingtap.tweak
+static int              gIPCAvailable = 0;    // RocketBootstrap 加载且 server 创建成功
+
+// 前向声明（定义在文件后段）
 static void FTMoveBallToConfig(void);
+static void FTMessagePortCallback(CFMessagePortRef local, SInt32 msgid, CFDataRef data, void *info);
 
-// 应用配置：更新间隔 + 移动球
-static void FTApplyConfig(void) {
-    id dict = FTReadConfigDict();
-    if (!dict) { FTLog("config: no dict"); return; }
-    double nx = FTConfigDouble(dict, "ClickX", 0.5);
-    double ny = FTConfigDouble(dict, "ClickY", 0.5);
-    double ms = FTConfigDouble(dict, "IntervalMs", 400.0);
-    if (ms < 1.0) ms = 400.0;
-    if (nx < 0.0) nx = 0.0; if (nx > 1.0) nx = 1.0;
-    if (ny < 0.0) ny = 0.0; if (ny > 1.0) ny = 1.0;
+// 应用 App 推来的 config（CoreFoundation CFDictionary，纯 C，无 ObjC）
+static void FTApplyConfigFromIPC(CFDictionaryRef dict) {
+    if (!dict || CFGetTypeID(dict) != CFDictionaryGetTypeID()) return;
+    double nx = 0.5, ny = 0.5, ms = 400.0;
+    CFStringRef kX = FTCreateCFStr("ClickX");
+    CFStringRef kY = FTCreateCFStr("ClickY");
+    CFStringRef kMs = FTCreateCFStr("IntervalMs");
+    CFNumberRef v;
+    if (kX && (v = CFDictionaryGetValue(dict, kX)) && CFGetTypeID(v) == CFNumberGetTypeID())
+        CFNumberGetValue(v, kCFNumberDoubleType, &nx);
+    if (kY && (v = CFDictionaryGetValue(dict, kY)) && CFGetTypeID(v) == CFNumberGetTypeID())
+        CFNumberGetValue(v, kCFNumberDoubleType, &ny);
+    if (kMs && (v = CFDictionaryGetValue(dict, kMs)) && CFGetTypeID(v) == CFNumberGetTypeID())
+        CFNumberGetValue(v, kCFNumberDoubleType, &ms);
+    if (kX) CFRelease(kX); if (kY) CFRelease(kY); if (kMs) CFRelease(kMs);
+    if (nx < 0) nx = 0; if (nx > 1) nx = 1;
+    if (ny < 0) ny = 0; if (ny > 1) ny = 1;
+    if (ms < 1) ms = 400;
     gCfgX = nx; gCfgY = ny; gCfgMs = ms;
     gCfgLoaded = 1;
     FTMoveBallToConfig();
     char diag[128];
-    snprintf(diag, sizeof(diag), "config loaded x=%.2f y=%.2f ms=%.0f", nx, ny, ms);
+    snprintf(diag, sizeof(diag), "IPC config x=%.2f y=%.2f ms=%.0f", nx, ny, ms);
     FTLog(diag);
 }
 
-// Darwin 通知回调（纯 C；observer=静态占位，靠 name 区分）
+// 文件心跳（fallback：已知 App 沙盒读不到，仅留痕不依赖）
+static void FTWriteHeartbeatFile(void) {
+    double now = (double)time(NULL) * 1000.0;
+    FILE *f = fopen("/var/mobile/Library/Preferences/com.floatingtap.tweak.plist", "w");
+    if (f) {
+        fprintf(f, "<?xml version=\"1.0\"?>\n<plist version=\"1.0\"><dict>"
+                   "<key>_loaded</key><true/><key>_time</key><real>%.0f</real>"
+                   "</dict></plist>\n", now);
+        fclose(f);
+    }
+}
+
+// tweak→App 发心跳（CFMessagePortSendRequest，msgID=1）
+static void FTSendHeartbeatIPC(void) {
+    CFStringRef name = FTCreateCFStr("com.floatingtap.autotap");
+    if (!name) { FTWriteHeartbeatFile(); return; }
+    CFMessagePortRef appPort = CFMessagePortCreateRemote(NULL, name);
+    CFRelease(name);
+    if (!appPort) {
+        FTLog("IPC heartbeat: app port unreachable");
+        FTWriteHeartbeatFile();
+        return;
+    }
+    double nowms = (double)time(NULL) * 1000.0;
+    CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFStringRef kL = FTCreateCFStr("_loaded");
+    CFStringRef kT = FTCreateCFStr("_time");
+    CFNumberRef t = CFNumberCreate(NULL, kCFNumberDoubleType, &nowms);
+    if (kL) { CFDictionarySetValue(d, kL, kCFBooleanTrue); CFRelease(kL); }
+    if (kT && t) { CFDictionarySetValue(d, kT, t); CFRelease(kT); }
+    CFErrorRef err = NULL;
+    CFDataRef data = CFPropertyListCreateData(NULL, d, kCFPropertyListXMLFormat_v1_0, 0, &err);
+    if (data) {
+        SInt32 r = CFMessagePortSendRequest(appPort, 1, data, 5.0, 0.0, NULL, NULL);
+        FTLog(r == kCFMessagePortSuccess ? "IPC heartbeat sent" : "IPC heartbeat send failed");
+        CFRelease(data);
+    } else {
+        FTLog("IPC heartbeat: plist serialize failed");
+    }
+    if (t) CFRelease(t);
+    CFRelease(d);
+    CFRelease(appPort);
+    if (err) CFRelease(err);
+}
+
+// tweak→App 发 App 列表（SB 进程枚举 LSApplicationWorkspace，msgID=3）
+static void FTSendAppsListIPC(void) {
+    Class ClsWS = objc_getClass("LSApplicationWorkspace");
+    if (!ClsWS) { FTLog("apps: LSApplicationWorkspace missing"); return; }
+    id ws = ((Msg_Send)objc_msgSend)((id)ClsWS, sel_registerName("defaultWorkspace"));
+    if (!ws) { FTLog("apps: workspace nil"); return; }
+    id apps = ((Msg_AllApps)objc_msgSend)(ws, sel_registerName("allApplications"));
+    if (!apps) { FTLog("apps: allApplications nil"); return; }
+    NSUInteger n = ((Msg_Count)objc_msgSend)(apps, sel_registerName("count"));
+    CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    for (NSUInteger i = 0; i < n; i++) {
+        id a = ((Msg_ObjectAtIndex)objc_msgSend)(apps, sel_registerName("objectAtIndex:"), i);
+        if (!a) continue;
+        id bid = ((Msg_Send)objc_msgSend)(a, sel_registerName("bundleIdentifier"));
+        id nm = ((Msg_Send)objc_msgSend)(a, sel_registerName("name"));
+        const char *bidc = bid ? ((Msg_UTF8String)objc_msgSend)(bid, sel_registerName("UTF8String")) : NULL;
+        if (!bidc) continue;
+        const char *nmc = nm ? ((Msg_UTF8String)objc_msgSend)(nm, sel_registerName("UTF8String")) : NULL;
+        CFStringRef kb = FTCreateCFStr(bidc);
+        if (!kb) continue;
+        CFStringRef kv = FTCreateCFStr(nmc ? nmc : bidc);
+        CFDictionarySetValue(d, kb, kv ? kv : kb);
+        if (kv) CFRelease(kv);
+        CFRelease(kb);
+    }
+    CFStringRef name = FTCreateCFStr("com.floatingtap.autotap");
+    CFMessagePortRef appPort = name ? CFMessagePortCreateRemote(NULL, name) : NULL;
+    if (name) CFRelease(name);
+    if (!appPort) { FTLog("apps: app port unreachable"); CFRelease(d); return; }
+    CFErrorRef err = NULL;
+    CFDataRef data = CFPropertyListCreateData(NULL, d, kCFPropertyListXMLFormat_v1_0, 0, &err);
+    if (data) {
+        SInt32 r = CFMessagePortSendRequest(appPort, 3, data, 5.0, 0.0, NULL, NULL);
+        char diag[128];
+        snprintf(diag, sizeof(diag), "apps: sent %lu entries (r=%d)", (unsigned long)n, (int)r);
+        FTLog(diag);
+        CFRelease(data);
+    } else {
+        FTLog("apps: plist serialize failed");
+    }
+    CFRelease(d);
+    CFRelease(appPort);
+    if (err) CFRelease(err);
+}
+
+// tweak 端 IPC server（com.floatingtap.tweak）+ RocketBootstrap 暴露到全局 bootstrap
+static void FTSetupIPCServer(void) {
+    FTRocketBootstrapInit();
+    CFStringRef name = FTCreateCFStr("com.floatingtap.tweak");
+    if (!name) return;
+    gServerPort = CFMessagePortCreateLocal(NULL, name, FTMessagePortCallback, NULL, NULL);
+    CFRelease(name);
+    if (gServerPort) {
+        FTExposePort(gServerPort);
+        CFRunLoopSourceRef src = CFMessagePortCreateRunLoopSource(NULL, gServerPort, 0);
+        if (src) {
+            CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopCommonModes);
+            CFRelease(src);
+        }
+        gIPCAvailable = 1;
+        FTLog("IPC server ready (com.floatingtap.tweak)");
+    } else {
+        FTLog("IPC server FAILED: CFMessagePortCreateLocal returned NULL");
+    }
+}
+
+// server 回调（App→tweak）：msgid 0=config, 2=request apps
+static void FTMessagePortCallback(CFMessagePortRef local, SInt32 msgid, CFDataRef data, void *info) {
+    (void)local; (void)info;
+    if (msgid == 0 && data) {
+        CFErrorRef err = NULL;
+        CFPropertyListRef plist = CFPropertyListCreateWithData(NULL, data,
+            kCFPropertyListImmutable, NULL, &err);
+        if (plist && CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
+            FTApplyConfigFromIPC((CFDictionaryRef)plist);
+        } else {
+            FTLog("IPC config: parse failed");
+        }
+        if (plist) CFRelease(plist);
+        if (err) CFRelease(err);
+    } else if (msgid == 2) {
+        FTSendAppsListIPC();
+    }
+}
+
+// Darwin 通知回调（纯 C；observer=静态占位，靠 name 区分）——只作唤醒信号，数据走 IPC
 static int sNotifyObserver = 0;
 static void FTNotificationCallback(CFNotificationCenterRef center, void *observer,
                                    CFStringRef name, const void *object, CFDictionaryRef userInfo) {
@@ -353,17 +415,19 @@ static void FTNotificationCallback(CFNotificationCenterRef center, void *observe
     char buf[256];
     if (!name || !CFStringGetCString(name, buf, sizeof(buf), kCFStringEncodingUTF8)) return;
     if (strcmp(buf, "com.floatingtap.autotap.appStarted") == 0) {
-        FTLog("got appStarted");
-        // App（重新）启动：刷新心跳（固定全局路径，无需反查沙盒）
-        FTWriteHeartbeat();
+        FTLog("got appStarted -> push hb + apps via IPC");
+        FTSendHeartbeatIPC();
+        FTSendAppsListIPC();
     } else if (strcmp(buf, "com.floatingtap.autotap.configUpdated") == 0) {
-        FTLog("got configUpdated");
-        FTApplyConfig();
+        // 配置数据经 CFMessagePort msgid=0 推送；这里仅作心跳刷新
+        FTLog("got configUpdated (data via IPC)");
+        FTSendHeartbeatIPC();
     }
 }
 
-// 注册 Darwin 通知监听（name 需长期有效 → 存 static）
+// 注册 IPC server + Darwin 通知（App→tweak 唤醒信号）
 static void FTRegisterNotifications(void) {
+    FTSetupIPCServer();
     CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
     if (!center) return;
     static CFStringRef sNameAppStarted = NULL, sNameConfig = NULL;
@@ -377,10 +441,10 @@ static void FTRegisterNotifications(void) {
     if (sNameConfig)
         CFNotificationCenterAddObserver(center, &sNotifyObserver, FTNotificationCallback,
                                         sNameConfig, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-    FTLog("notifications registered");
-    // 启动即尝试：App 可能已运行（心跳证明 tweak 活着；固定路径直接写/读）
-    FTWriteHeartbeat();
-    FTApplyConfig();
+    FTLog("notifications + IPC registered");
+    // 启动即尝试：App 可能已运行 → 立即推心跳 + App 列表
+    FTSendHeartbeatIPC();
+    FTSendAppsListIPC();
 }
 
 // 恢复球窗口交互（注入后 60ms 回调）
@@ -825,14 +889,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.50-fix3 loaded (pure C ctor, zero static ObjC metadata, multi-path probe)");
+    syslog(LOG_ERR, "FloatingTap v1.0.52 loaded (pure C ctor, CFMessagePort IPC + RocketBootstrap)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.50-fix3 ctor run (arm64e, pure C, multi-path hb probe)\n");
+            fprintf(mk, "FloatingTap v1.0.52 ctor run (arm64e, pure C, IPC)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
