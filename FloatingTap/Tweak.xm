@@ -19,6 +19,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>   // 仅类型声明（UIWindow/UIEvent），不产生运行时元数据；%hook 需要
 #import <CoreFoundation/CoreFoundation.h>
+#import <dlfcn.h>
 #import <stdio.h>
 #import <syslog.h>
 #import <time.h>
@@ -171,28 +172,79 @@ static void FTRestoreBallInteractionCallback(void *ctx);
 typedef void (*Msg_SendEvent)(id, SEL, id);
 typedef const char * (*Msg_UTF8String)(id, SEL);
 
-// 构造 UIEvent 携带 hid 事件并 sendEvent（_hidEvent 用 ivar offset 直接内存写）
+// MARK: - GSEvent（老 UIKit 触摸路径，iOS 15 的 GraphicsServices 仍加载在进程里）
+
+typedef struct __GSEvent *FT_GSEventRef;
+static FT_GSEventRef (*p_GSEventCreateTouchEvent)(CGPoint, CGPoint, NSTimeInterval, unsigned int);
+static bool g_gsLoaded = false;
+
+static void FTLoadGSEvent(void) {
+    if (g_gsLoaded) return;
+    p_GSEventCreateTouchEvent = (FT_GSEventRef (*)(CGPoint, CGPoint, NSTimeInterval, unsigned int))
+        dlsym(RTLD_DEFAULT, "GSEventCreateTouchEvent");
+    g_gsLoaded = true;
+}
+
+// 构造 UIEvent 携带 hid+gs 事件并 sendEvent。
+// v1.0.35 实测：只塞 _hidEvent 时 UIKit 提取触摸失败（无效果）。
+// v1.0.36：同时塞 _gsEvent（GSEventCreateTouchEvent，老路径）+ 补 _timestamp（double ivar）。
 static void FTSendHIDEvent(id app, bool down, double nx, double ny) {
     Class ClsEvent = objc_getClass("UIEvent");
     if (!ClsEvent || !app) return;
+    FTLoadGSEvent();
+
     FT_IOHIDEventRef hid = FT_HIDCreateDigitizerEvent(down, nx, ny);
     if (!hid) {
         FTLog("hid event create failed");
         return;
     }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+
     id event = FTAlloc(ClsEvent);
     if (!event) { CFRelease(hid); return; }
     event = ((Msg_Init)objc_msgSend)(event, sel_registerName("init"));
-    // _hidEvent 是 void* 指针 ivar：用 ivar offset 直接内存写（ARC 下 object_setInstanceVariable 不可用）
+    char *base = (char *)(__bridge void *)event;
+
+    // _hidEvent（IOHIDEventRef 指针 ivar）
     Ivar ivarHid = class_getInstanceVariable(ClsEvent, "_hidEvent");
-    if (!ivarHid) {
+    if (ivarHid) {
+        *(void **)(base + ivar_getOffset(ivarHid)) = hid;
+    } else {
         FTLog("UIEvent no _hidEvent ivar");
         CFRelease(hid);
         return;
     }
-    void **slot = (void **)((char *)(__bridge void *)event + ivar_getOffset(ivarHid));
-    *slot = hid;
+
+    // _gsEvent（GSEventRef 指针 ivar）
+    if (p_GSEventCreateTouchEvent) {
+        FT_GSEventRef gs = p_GSEventCreateTouchEvent(CGPointMake(nx * gScreenW, ny * gScreenH),
+                                                     CGPointZero, now, 0);
+        if (gs) {
+            Ivar ivarGs = class_getInstanceVariable(ClsEvent, "_gsEvent");
+            if (ivarGs) {
+                *(void **)(base + ivar_getOffset(ivarGs)) = gs;
+            } else {
+                FTLog("UIEvent no _gsEvent ivar");
+            }
+        }
+    }
+
+    // _timestamp（NSTimeInterval double ivar）
+    Ivar ivarTs = class_getInstanceVariable(ClsEvent, "_timestamp");
+    if (ivarTs) {
+        *(double *)(base + ivar_getOffset(ivarTs)) = now;
+    }
+
     ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
+
+    // 释放我们持有的引用（event 不 retain 这些 CF 指针）
+    Ivar ivarGs2 = class_getInstanceVariable(ClsEvent, "_gsEvent");
+    if (ivarGs2) {
+        void *gs2 = *(void **)(base + ivar_getOffset(ivarGs2));
+        if (gs2) CFRelease(gs2);
+    }
     CFRelease(hid);
 }
 
@@ -534,10 +586,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.35 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.36 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.35 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.36 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
