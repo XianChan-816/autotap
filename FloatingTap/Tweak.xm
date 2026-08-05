@@ -492,14 +492,16 @@ static void FTTweakInitCallback(void *ctx) {
     id touches = ((Msg_Send)objc_msgSend)(event, sel_registerName("allTouches"));
     NSUInteger n = touches ? ((Msg_Count)objc_msgSend)(touches, sel_registerName("count")) : 0;
     if (n == 0) return;
+    // v1.0.42 诊断：标记命中窗口是否为我们的球窗口（区分注入触摸被拦截 vs 到达下层）
+    BOOL isBall = (self == gBallWindow);
     const char *cls = "?";
     id t = ((Msg_AnyObject)objc_msgSend)(touches, sel_registerName("anyObject"));
     if (t) {
         id v = ((Msg_Send)objc_msgSend)(t, sel_registerName("view"));
         if (v) cls = object_getClassName(v);
     }
-    char buf[128];
-    snprintf(buf, sizeof(buf), "SEND touches=%lu view=%s", (unsigned long)n, cls);
+    char buf[160];
+    snprintf(buf, sizeof(buf), "SEND touches=%lu view=%s ball=%d", (unsigned long)n, cls, isBall ? 1 : 0);
     FTLog(buf);
 }
 %end
@@ -525,10 +527,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.41 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.42 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.41 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.42 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
