@@ -1,19 +1,18 @@
 //
-//  Tweak.xm — FloatingTap v1.0.15
+//  Tweak.xm — FloatingTap v1.0.17
 //
-//  v1.0.14 问题：GR 用错误的 objc_msgSend 一次调用（alloc 被当成
-//  initWithTarget:action: 调），返回未初始化实例 → 后续 setter 全在垃圾内存上
-//  → EXC_BAD_ACCESS → SpringBoard 崩 → Safe Mode。
+//  v1.0.16 问题：tweak 加载了（不再 Safe Mode，arm64 单架构生效），
+//  但悬浮窗不显示。根因：iOS 13+ 起，未绑定 UIWindowScene 的 UIWindow
+//  不会参与渲染（系统按 UIScene 管理窗口）。SpringBoard 的窗口属于某个
+//  UIWindowScene，我们新建的游离窗口没挂场景 → 不显示。
 //
-//  v1.0.15 变更：
-//    1. 修复 GR 初始化：先 alloc 再正确 init（target=nil, action=NULL，
-//       仅轮询 state，不依赖回调）。
-//    2. 创建窗口前检查 SB UI 就绪（UIApplication.windows count > 0），
-//       未就绪则每 2s 重试（最多 10 次）——v1.0.13/14 在 5s 就建窗口可能太早。
-//    3. 首次创建延迟 5s → 15s。
-//    4. 拖动逻辑修正：locationInView:gBallWindow 用窗口坐标，拖动跟随不跳变。
+//  v1.0.17 变更：
+//    1. 新增 FTGetActiveWindowScene：从 UIApplication.connectedScenes 取
+//       当前 foreground-active 的 UIWindowScene（无则退回第一个 window scene）。
+//    2. FTSetupBall 创建窗口后立即 setWindowScene:，确保参与渲染。
+//    3. FTEnsureBall 的 UI 就绪判断放宽：只要能拿到 scene 或 SB 有 window 即建。
 //
-//  仍保持：零 @implementation 零 %hook。
+//  仍保持：零 @implementation 零 %hook，纯 C + objc_msgSend。
 //
 
 #import <UIKit/UIKit.h>
@@ -40,6 +39,7 @@ typedef void       (*Msg_SetNumberOfTapsRequired)(id, SEL, NSUInteger);
 typedef void       (*Msg_SetDelaysTouchesBegan)(id, SEL, BOOL);
 typedef void       (*Msg_SetDelaysTouchesEnded)(id, SEL, BOOL);
 typedef void       (*Msg_SetCancelsTouchesInView)(id, SEL, BOOL);
+typedef void       (*Msg_SetWindowScene)(id, SEL, id);
 typedef id         (*Msg_Layer)(id, SEL);
 typedef id         (*Msg_ColorWithRGBA)(id, SEL, CGFloat, CGFloat, CGFloat, CGFloat);
 typedef CGColorRef (*Msg_CGColor)(id, SEL);
@@ -48,6 +48,9 @@ typedef CGRect     (*Msg_Frame)(id, SEL);
 typedef CGPoint    (*Msg_LocationInView)(id, SEL, id);
 typedef NSUInteger (*Msg_State)(id, SEL);
 typedef NSUInteger (*Msg_Count)(id, SEL);
+typedef id         (*Msg_ObjectAtIndex)(id, SEL, NSUInteger);
+typedef BOOL       (*Msg_IsKindOf)(id, SEL, Class);
+typedef NSInteger  (*Msg_Int)(id, SEL);
 
 // MARK: - 全局状态（纯 C）
 
@@ -72,8 +75,36 @@ static id FTAllocInitWithFrame(Class cls, CGRect frame) {
     return ((Msg_AllocInitWithFrame)objc_msgSend)(obj, @selector(initWithFrame:), frame);
 }
 
-// SB UI 是否就绪：UIApplication 存在且至少有一个 window
+// 取当前前台活跃的 UIWindowScene（iOS 13+ 必需，否则 UIWindow 不渲染）
+static id FTGetActiveWindowScene(void) {
+    Class ClsApp = NSClassFromString(@"UIApplication");
+    if (!ClsApp) return nil;
+    id app = ((Msg_Send)objc_msgSend)((id)ClsApp, @selector(sharedApplication));
+    if (!app) return nil;
+    // 无 connectedScenes（< iOS 13）直接返回 nil，由调用方跳过场景绑定
+    id scenes = ((Msg_Send)objc_msgSend)(app, @selector(connectedScenes));
+    if (!scenes) return nil;
+    id arr = ((Msg_Send)objc_msgSend)(scenes, @selector(allObjects));
+    if (!arr) return nil;
+    NSUInteger n = ((Msg_Count)objc_msgSend)(arr, @selector(count));
+    Class ClsWScene = NSClassFromString(@"UIWindowScene");
+    id firstWS = nil;
+    for (NSUInteger i = 0; i < n; i++) {
+        id s = ((Msg_ObjectAtIndex)objc_msgSend)(arr, @selector(objectAtIndex:), i);
+        if (!s) continue;
+        if (ClsWScene && ((Msg_IsKindOf)objc_msgSend)(s, @selector(isKindOfClass:), ClsWScene)) {
+            if (firstWS == nil) firstWS = s;
+            // UISceneActivationStateForegroundActive = 1
+            NSInteger act = ((Msg_Int)objc_msgSend)(s, @selector(activationState));
+            if (act == 1) return s;
+        }
+    }
+    return firstWS; // 退回第一个 window scene
+}
+
+// SB UI 是否就绪：能拿到 windowScene，或 UIApplication 至少有一个 window
 static BOOL FTUIReady(void) {
+    if (FTGetActiveWindowScene()) return YES;
     Class ClsApp = NSClassFromString(@"UIApplication");
     if (!ClsApp) return NO;
     id app = ((Msg_Send)objc_msgSend)((id)ClsApp, @selector(sharedApplication));
@@ -146,6 +177,13 @@ static void FTSetupBall(void) {
 
     // 独立小球窗口：只有小球大小 → 区域外触摸天然穿透
     id win = FTAllocInitWithFrame(ClsWindow, ballFrame);
+
+    // ⚠️ iOS 13+ 关键：把窗口挂到当前活跃的 UIWindowScene，否则不渲染
+    id scene = FTGetActiveWindowScene();
+    if (scene) {
+        ((Msg_SetWindowScene)objc_msgSend)(win, @selector(setWindowScene:), scene);
+    }
+
     ((Msg_SetWindowLevel)objc_msgSend)(win, @selector(setWindowLevel:), (CGFloat)1001.0);
     ((Msg_SetHidden)objc_msgSend)(win, @selector(setHidden:), NO);
 
@@ -194,7 +232,7 @@ static void FTSetupBall(void) {
     });
     dispatch_resume(timer);
 
-    NSLog(@"[FloatingTap] v1.0.15 ball shown at (%.0f,%.0f)", ballFrame.origin.x, ballFrame.origin.y);
+    NSLog(@"[FloatingTap] v1.0.17 ball shown at (%.0f,%.0f) scene=%@", ballFrame.origin.x, ballFrame.origin.y, (scene?@"yes":@"no"));
 }
 
 // 确保 SB UI 就绪后再创建（每 2s 重试，最多 10 次）
@@ -214,7 +252,7 @@ static void FTEnsureBall(int attempt) {
 }
 
 %ctor {
-    NSLog(@"[FloatingTap] v1.0.15 loaded");
+    NSLog(@"[FloatingTap] v1.0.17 loaded");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         FTEnsureBall(0);
