@@ -1,11 +1,13 @@
 //
-//  Tweak.xm — FloatingTap v1.0.38
+//  Tweak.xm — FloatingTap v1.0.47
 //
-//  v1.0.37 实测：15 参修正 + senderID 捕获后注入仍无效果（senderID 日志走 syslog
-//  文件看不到，状态不明）。v1.0.38 干净验证：注入只走 _gsEvent 单通道（排除
-//  _hidEvent 干扰），senderID 捕获状态改 FTHIDLog 写文件（capture started /
-//  captured senderID / no register callback symbol 均可见），GSEvent 构造状态
-//  也写日志（gs event create unavailable/failed）。
+//  v1.0.47 双进程架构（解决进程隔离：SB 进程注入的触摸到不了前台 App）：
+//    - Filter 增加抖音 com.ss.iphone.ugc.Aweme
+//    - SB 进程（控制端）：球+手势；长按 → 写 /tmp/FloatingTap.task（start x y ms / stop）
+//    - 抖音进程（执行端）：ctor 初始化屏幕尺寸 → 100ms 轮询任务文件 → 收到 start
+//      后在本进程内 FTSyntheticTap（_handleHIDEvent: 注入，命中抖音自己的窗口）
+//  v1.0.44 实测：注入触摸在 SB 进程 tapCount 累积（注入引擎有效）但直播间无反应
+//  = 进程隔离。v1.0.45/46：坐标锁定 + index 递增 + 间隔 400ms（避开双击窗口）。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
@@ -57,6 +59,19 @@ typedef id         (*Msg_ObjectAtIndex)(id, SEL, NSUInteger);
 typedef BOOL       (*Msg_IsKindOf)(id, SEL, Class);
 typedef NSInteger  (*Msg_Int)(id, SEL);
 typedef id         (*Msg_SendID)(id, SEL, void *);
+typedef const char * (*Msg_UTF8String)(id, SEL);
+
+// 判断当前进程 bundle id（v1.0.47：SB 进程控制端 / 抖音进程注入执行端）
+static BOOL FTIsBundle(const char *bundleID) {
+    Class ClsBundle = objc_getClass("NSBundle");
+    if (!ClsBundle) return NO;
+    id mb = ((Msg_Send)objc_msgSend)((id)ClsBundle, sel_registerName("mainBundle"));
+    if (!mb) return NO;
+    id bid = ((Msg_Send)objc_msgSend)(mb, sel_registerName("bundleIdentifier"));
+    if (!bid) return NO;
+    const char *s = ((Msg_UTF8String)objc_msgSend)(bid, sel_registerName("UTF8String"));
+    return (s && strcmp(s, bundleID) == 0);
+}
 
 // MARK: - 全局状态（纯 C）
 
@@ -73,7 +88,6 @@ static double  gScreenW = 0;   // 主屏尺寸（FTSetupBall 时保存）
 static double  gScreenH = 0;
 
 static BOOL    gIsClicking = NO;            // 连点进行中
-static dispatch_source_t gClickTimer = NULL; // 连点定时器（ARC 管理）
 static uint32_t gTapIndex = 0;              // 每次 tap 递增的 index（区分触摸，避免被串流）
 static double  gClickLockX = 0;             // 连点锁定坐标（长按开始时球心，拖动不改变）
 static double  gClickLockY = 0;
@@ -164,7 +178,6 @@ static double FTIntervalMs(void) {
 }
 
 // 恢复球窗口交互（注入后 60ms 回调）
-static void FTRestoreBallInteractionCallback(void *ctx);
 
 // MARK: - 连点注入
 // v1.0.41：走 [UIApplication _handleHIDEvent:]（UIKit 原生 HID 入口）——注入已确认
@@ -230,6 +243,94 @@ static void FTSyntheticTap(double px, double py) {
     }
 }
 
+// MARK: - 抖音进程（v1.0.47 注入执行端）
+// SB 端长按 → 写 /tmp/FloatingTap.task（start x y ms / stop）→ 抖音进程轮询执行注入。
+// 进程隔离：SB 进程注入的触摸到不了前台 App（抖音），必须在抖音进程内注入。
+
+static char gTaskLast[64] = "";
+static BOOL gTaskRunning = NO;
+static double gTaskX = 0.5, gTaskY = 0.5, gTaskMs = 400.0;
+static dispatch_source_t gTaskTimer = NULL; // 注入 timer
+static dispatch_source_t gPollTimer = NULL; // 任务文件轮询
+
+static void FTAppClickCallback(void *ctx);
+static void FTAppStartPollingCallback(void *ctx);
+
+static void FTAppStartClicking(double x, double y, double ms) {
+    gTaskRunning = YES;
+    gTaskX = x; gTaskY = y; gTaskMs = ms;
+    if (gTaskTimer) { dispatch_source_cancel(gTaskTimer); gTaskTimer = NULL; }
+    gTaskTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (gTaskTimer) {
+        dispatch_source_set_timer(gTaskTimer,
+                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms * NSEC_PER_MSEC)),
+                                  (uint64_t)(ms * NSEC_PER_MSEC), 0);
+        dispatch_source_set_event_handler_f(gTaskTimer, FTAppClickCallback);
+        dispatch_resume(gTaskTimer);
+    }
+    FTAppClickCallback(NULL); // 立即点一次
+    FTLog("app clicking start");
+}
+
+static void FTAppStopClicking(void) {
+    if (!gTaskRunning) return;
+    gTaskRunning = NO;
+    if (gTaskTimer) { dispatch_source_cancel(gTaskTimer); gTaskTimer = NULL; }
+    FTLog("app clicking stop");
+}
+
+static void FTAppClickCallback(void *ctx) {
+    (void)ctx;
+    if (!gTaskRunning) return;
+    FTSyntheticTap(gTaskX * gScreenW, gTaskY * gScreenH);
+}
+
+static void FTAppPollCallback(void *ctx) {
+    (void)ctx;
+    FILE *f = fopen("/tmp/FloatingTap.task", "r");
+    if (!f) return;
+    char buf[64];
+    if (fgets(buf, sizeof(buf), f)) {
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) buf[--len] = 0;
+        if (strcmp(buf, gTaskLast) != 0) {
+            strcpy(gTaskLast, buf);
+            if (strncmp(buf, "start", 5) == 0) {
+                double x = 0.5, y = 0.5, ms = 400.0;
+                sscanf(buf + 5, "%lf %lf %lf", &x, &y, &ms);
+                if (ms < 1.0) ms = 400.0;
+                FTAppStartClicking(x, y, ms);
+            } else if (strncmp(buf, "stop", 4) == 0) {
+                FTAppStopClicking();
+            }
+        }
+    }
+    fclose(f);
+}
+
+static void FTAppStartPollingCallback(void *ctx) {
+    (void)ctx;
+    // 屏幕尺寸兜底（ctor 早期可能为 0）
+    if (gScreenW <= 0 || gScreenH <= 0) {
+        Class ClsScreen = objc_getClass("UIScreen");
+        if (ClsScreen) {
+            id ms = ((Msg_Send)objc_msgSend)((id)ClsScreen, sel_registerName("mainScreen"));
+            CGRect sb = ((Msg_Bounds)objc_msgSend)(ms, sel_registerName("bounds"));
+            gScreenW = sb.size.width;
+            gScreenH = sb.size.height;
+        }
+    }
+    gPollTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (gPollTimer) {
+        dispatch_source_set_timer(gPollTimer,
+                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100 * NSEC_PER_MSEC)),
+                                  (uint64_t)(100 * NSEC_PER_MSEC), 0);
+        dispatch_source_set_event_handler_f(gPollTimer, FTAppPollCallback);
+        dispatch_resume(gPollTimer);
+    }
+    FTLog("app polling started");
+}
+
 // 诊断：dump UIEvent 的 ivar 名（已确认有 _hidEvent/_gsEvent）
 static void FTDumpEventIvars(void) {
     Class ClsEvent = objc_getClass("UIEvent");
@@ -252,46 +353,13 @@ static void FTDumpEventIvars(void) {
     FTLog(buf);
 }
 
-// 连点回调：在锁定坐标发一次合成点击。
-// v1.0.45：用 gClickLockX/Y（长按开始时锁定，拖动球不改变注入点——
-// v1.0.44 实测注入坐标漂移产生 phase=1(moved) 导致 tap 手势失败）。
-// ⚠️ 注入坐标可能正好在球窗口下，注入瞬间关掉球窗口交互（穿透），60ms 后恢复。
-static void FTClickCallback(void *ctx) {
-    (void)ctx;
-    if (!gBallWindow || !gIsClicking) return;
-
-    // 注入前：球窗口不参与 hitTest → 注入触摸穿透到下层
-    ((Msg_SetUserInteractionEnabled)objc_msgSend)(gBallWindow, sel_registerName("setUserInteractionEnabled:"), NO);
-
-    FTSyntheticTap(gClickLockX * gScreenW, gClickLockY * gScreenH);
-    gClickCount++;
-
-    char diag[96];
-    snprintf(diag, sizeof(diag), "inject tap nx=%.2f ny=%.2f", gClickLockX, gClickLockY);
-    FTLog(diag);
-
-    // 60ms 后恢复交互（连点 200ms 间隔，恢复后用户可松手停止）
-    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)),
-                     dispatch_get_main_queue(), NULL, FTRestoreBallInteractionCallback);
-}
-
-static void FTRestoreBallInteractionCallback(void *ctx) {
-    (void)ctx;
-    if (gBallWindow) {
-        ((Msg_SetUserInteractionEnabled)objc_msgSend)(gBallWindow, sel_registerName("setUserInteractionEnabled:"), YES);
-    }
-}
-
+// v1.0.47：SB 端不再直接注入（进程隔离，注入触摸到不了前台 App）。
+// 改为写任务文件 /tmp/FloatingTap.task（start x y ms / stop），抖音进程轮询执行注入。
 static void FTStartClicking(void) {
     if (gIsClicking) return;
-    if (!FT_HIDConnect()) {
-        FTLog("clicking failed: HID connect failed");
-        return;
-    }
     gIsClicking = YES;
     gClickCount = 0;
-    gTapIndex = 0;
-    // 锁定点击坐标 = 当前球心（v1.0.45：拖动球不改变注入点，避免 tap 因移动失败）
+    // 锁定点击坐标 = 当前球心（拖动球不改变注入点）
     if (gBallWindow) {
         CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
         double cx = f.origin.x + f.size.width * 0.5;
@@ -302,30 +370,23 @@ static void FTStartClicking(void) {
         if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
     }
     double ms = FTIntervalMs();
-    // 一碰到球立即点一次（不等第一个 timer tick，短按也有一次点击）
-    FTClickCallback(NULL);
-    gClickTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    if (gClickTimer) {
-        dispatch_source_set_timer(gClickTimer,
-                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms * NSEC_PER_MSEC)),
-                                  (uint64_t)(ms * NSEC_PER_MSEC), 0);
-        dispatch_source_set_event_handler_f(gClickTimer, FTClickCallback);
-        dispatch_resume(gClickTimer);
+    FILE *f = fopen("/tmp/FloatingTap.task", "w");
+    if (f) {
+        fprintf(f, "start %.4f %.4f %.0f\n", gClickLockX, gClickLockY, ms);
+        fclose(f);
     }
-    FTLog("clicking started");
+    FTLog("clicking started (task file written)");
 }
 
 static void FTStopClicking(void) {
     if (!gIsClicking) return;
     gIsClicking = NO;
-    if (gClickTimer) {
-        dispatch_source_cancel(gClickTimer);
-        gClickTimer = NULL;
+    FILE *f = fopen("/tmp/FloatingTap.task", "w");
+    if (f) {
+        fprintf(f, "stop\n");
+        fclose(f);
     }
     FTLog("clicking stopped");
-    char buf[96];
-    snprintf(buf, sizeof(buf), "clicks this period: %lu", gClickCount);
-    FTLog(buf);
 }
 
 // MARK: - 动态 GR target（运行时创建类，零静态 ObjC 元数据）
@@ -563,15 +624,37 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
-    FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
-    if (mk) {
-        fprintf(mk, "FloatingTap v1.0.46 ctor run (arm64e, pure C)\n");
-        fclose(mk);
-    }
-    syslog(LOG_ERR, "FloatingTap v1.0.46 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.47 loaded (pure C ctor, zero static ObjC metadata)");
 
-    // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
-    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
-                     dispatch_get_main_queue(), NULL, FTTweakInitCallback);
+    // v1.0.47 进程分工：SB=控制端（球+手势+写任务文件）；抖音=执行端（轮询任务文件+注入）
+    if (FTIsBundle("com.apple.springboard")) {
+        // 【诊断标记】SB 进程覆盖写；抖音进程追加写（避免互相覆盖）
+        FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
+        if (mk) {
+            fprintf(mk, "FloatingTap v1.0.47 ctor run (arm64e, pure C)\n");
+            fclose(mk);
+        }
+        syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
+        // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
+                         dispatch_get_main_queue(), NULL, FTTweakInitCallback);
+    } else if (FTIsBundle("com.ss.iphone.ugc.Aweme")) {
+        FILE *mk = fopen("/tmp/floatingtap_ctor.log", "a");
+        if (mk) {
+            fprintf(mk, "FloatingTap v1.0.47 Douyin injector ctor\n");
+            fclose(mk);
+        }
+        syslog(LOG_ERR, "FloatingTap role: Douyin injector");
+        // 初始化屏幕尺寸（注入坐标换算用）
+        Class ClsScreen = objc_getClass("UIScreen");
+        if (ClsScreen) {
+            id ms = ((Msg_Send)objc_msgSend)((id)ClsScreen, sel_registerName("mainScreen"));
+            CGRect sb = ((Msg_Bounds)objc_msgSend)(ms, sel_registerName("bounds"));
+            gScreenW = sb.size.width;
+            gScreenH = sb.size.height;
+        }
+        // 延迟 5s 等 App 起来后启动任务文件轮询
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                         dispatch_get_main_queue(), NULL, FTAppStartPollingCallback);
+    }
 }
