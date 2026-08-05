@@ -12,3 +12,6 @@ DerivedData/
 .workbuddy/
 runs.json
 wf.json
+arts.json
+jobs.json
+build-log.zip
