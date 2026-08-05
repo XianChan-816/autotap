@@ -36,11 +36,6 @@ typedef void (*FT_IOHIDSystemCallback)(void *target, void *refcon,
                                        FT_IOHIDEventRef event);
 
 enum {
-    FT_kIOHIDEventTypeNULL      = 0,
-    FT_kIOHIDEventTypeDigitizer = 11,
-};
-
-enum {
     FT_kIOHIDDigitizerEventRange    = 0x00000001,
     FT_kIOHIDDigitizerEventTouch    = 0x00000002,
     FT_kIOHIDDigitizerEventPosition = 0x00000004,
@@ -65,23 +60,9 @@ static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerEvent)(CFAllocatorRef,
                                                             Boolean touch,
                                                             FT_IOOptionBits optionsBits);
 
-static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerFingerEvent)(CFAllocatorRef,
-                                                                  uint64_t timeStamp,
-                                                                  uint32_t index,
-                                                                  uint32_t identity,
-                                                                  uint32_t eventMask,
-                                                                  uint32_t buttonMask,
-                                                                  double x, double y, double z,
-                                                                  double tipPressure,
-                                                                  double twist,
-                                                                  Boolean range,
-                                                                  Boolean touch,
-                                                                  FT_IOOptionBits optionsBits);
-
 static FT_IOHIDEventSystemClientRef (*p_IOHIDEventSystemClientCreate)(CFAllocatorRef);
 static FT_IOReturn (*p_IOHIDEventSystemClientDispatchEvent)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef);
 static void (*p_IOHIDEventSystemClientScheduleWithRunLoop)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef);
-static void (*p_IOHIDEventAppendEvent)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits);
 static void (*p_IOHIDEventSetSenderID)(FT_IOHIDEventRef, uint64_t);
 
 // MARK: - 状态
@@ -106,26 +87,18 @@ static bool FT_HIDLoadSymbols(void) {
                               uint32_t, uint32_t, double, double, double, double, double,
                               Boolean, Boolean, FT_IOOptionBits))
         dlsym(handle, "IOHIDEventCreateDigitizerEvent");
-    p_IOHIDEventCreateDigitizerFingerEvent =
-        (FT_IOHIDEventRef (*)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
-                              double, double, double, double, double, Boolean, Boolean, FT_IOOptionBits))
-        dlsym(handle, "IOHIDEventCreateDigitizerFingerEvent");
     p_IOHIDEventSystemClientCreate =
         (FT_IOHIDEventSystemClientRef (*)(CFAllocatorRef))dlsym(handle, "IOHIDEventSystemClientCreate");
     p_IOHIDEventSystemClientDispatchEvent =
         (FT_IOReturn (*)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef))dlsym(handle, "IOHIDEventSystemClientDispatchEvent");
     p_IOHIDEventSystemClientScheduleWithRunLoop =
         (void (*)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef))dlsym(handle, "IOHIDEventSystemClientScheduleWithRunLoop");
-    p_IOHIDEventAppendEvent =
-        (void (*)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits))dlsym(handle, "IOHIDEventAppendEvent");
     p_IOHIDEventSetSenderID =
         (void (*)(FT_IOHIDEventRef, uint64_t))dlsym(handle, "IOHIDEventSetSenderID");
 
     g_hidLoaded = (p_IOHIDEventCreateDigitizerEvent &&
-                   p_IOHIDEventCreateDigitizerFingerEvent &&
                    p_IOHIDEventSystemClientCreate &&
                    p_IOHIDEventSystemClientDispatchEvent &&
-                   p_IOHIDEventAppendEvent &&
                    p_IOHIDEventSetSenderID);
     if (!g_hidLoaded) {
         syslog(LOG_ERR, "FloatingTap HID symbol load failed");
@@ -157,60 +130,35 @@ bool FT_HIDIsConnected(void) {
 
 // MARK: - 事件构造
 
-static uint64_t FT_NowNanoseconds(void) {
-    static mach_timebase_info_data_t s_tb;
-    static int s_init = 0;
-    if (!s_init) {
-        mach_timebase_info(&s_tb);
-        s_init = 1;
-    }
-    uint64_t now = mach_absolute_time();
-    return now * s_tb.numer / s_tb.denom;
-}
-
 static uint64_t FT_SenderID(void) {
     return 0x8000000817371935ULL;
 }
 
+// 经典单事件写法（社区验证 iOS 13-16 有效）：
+// type 参数必须是转换器类型 kIOHIDDigitizerTransducerTypeHand(3)，不是事件类型(11)；
+// 坐标直接放事件本体；时间戳用 mach_absolute_time() 原始值（不做 timebase 换算）。
 static FT_IOHIDEventRef FT_DigitizerEvent(bool down, double x, double y) {
-    uint64_t now = FT_NowNanoseconds();
+    uint32_t mask = down
+        ? (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventTouch |
+           FT_kIOHIDDigitizerEventPosition | FT_kIOHIDDigitizerEventTip |
+           FT_kIOHIDDigitizerEventIdentity)
+        : (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventIdentity);
 
-    FT_IOHIDEventRef finger = p_IOHIDEventCreateDigitizerFingerEvent(
+    return p_IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault,
-        now,
-        0, 0x1,
-        down ? (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventTouch |
-                FT_kIOHIDDigitizerEventPosition | FT_kIOHIDDigitizerEventTip |
-                FT_kIOHIDDigitizerEventIdentity)
-             : (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventIdentity),
-        0,
-        x, y, 0.0,
-        down ? 1.0 : 0.0,
-        0.0,
-        true, down,
-        0);
-    if (!finger) return NULL;
-
-    FT_IOHIDEventRef parent = p_IOHIDEventCreateDigitizerEvent(
-        kCFAllocatorDefault,
-        now,
-        FT_kIOHIDEventTypeDigitizer,
-        0,
-        0, 0x1,
-        FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventTouch | FT_kIOHIDDigitizerEventIdentity,
-        0,
-        0, 0, 0,
-        0, 0,
-        true, true,
-        0);
-    if (!parent) {
-        CFRelease(finger);
-        return NULL;
-    }
-
-    p_IOHIDEventAppendEvent(parent, finger, 0);
-    CFRelease(finger);
-    return parent;
+        mach_absolute_time(),          // 原始 tick，不做纳秒换算
+        3,                             // kIOHIDDigitizerTransducerTypeHand
+        0,                             // options
+        0,                             // index
+        1,                             // identity
+        mask,                          // eventMask
+        0,                             // buttonMask
+        x, y, 0.0,                     // x, y, z（归一化 0~1）
+        down ? 1.0 : 0.0,              // tipPressure
+        0.0,                           // barrelPressure
+        true,                          // range
+        down,                          // touch
+        0);                            // optionsBits
 }
 
 static void FT_DispatchEvent(FT_IOHIDEventRef event) {

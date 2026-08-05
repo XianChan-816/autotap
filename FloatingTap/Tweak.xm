@@ -1,12 +1,12 @@
 //
-//  Tweak.xm — FloatingTap v1.0.23
+//  Tweak.xm — FloatingTap v1.0.24
 //
-//  v1.0.21 诊断（floatingtap_ctor.log）：GR 已触发（clicking started/stopped 反复配对），
-//  但每次 started 后立刻 stopped——短按等不到 200ms 首 tick 无点击；长按也可能因
-//  allowableMovement=30 太小被 iPad 手指抖动超限失败。
-//  v1.0.22 修复：一碰到球立即点一次 + 点击计数日志 + HID client 挂 main runloop。
-//  v1.0.23 修复：allowableMovement 30→200（长按不因抖动失败）；FTLog 加单调时间戳
-//  （日志可见每次 started→stopped 按住时长，定位长按是否被中断）。
+//  v1.0.23 实测：日志显示长按 0.4~0.9s 正常触发（clicking started/stopped 带时间戳），
+//  HID connect 成功、无 DispatchEvent failed——但屏幕无点击效果 → **HID 事件构造无效**。
+//  根因（HIDInject.c）：IOHIDEventCreateDigitizerEvent 的 type 参数误传事件类型 11，
+//  应为转换器类型 Hand(3)；坐标放在 finger 子事件而 parent 坐标=0；时间戳做了
+//  timebase 纳秒换算。v1.0.24 改为经典单事件写法（坐标直传 + Hand type +
+//  mach_absolute_time 原始值），并删掉 finger/append 子事件组合。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
@@ -206,7 +206,9 @@ static void FTStopClicking(void) {
         gClickTimer = NULL;
     }
     FTLog("clicking stopped");
-    syslog(LOG_ERR, "FloatingTap clicks in this period: %lu", gClickCount);
+    char buf[96];
+    snprintf(buf, sizeof(buf), "clicks this period: %lu", gClickCount);
+    FTLog(buf);
 }
 
 // MARK: - 动态 GR target（运行时创建类，零静态 ObjC 元数据）
@@ -411,10 +413,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.23 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.24 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.23 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.24 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
