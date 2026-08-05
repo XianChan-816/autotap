@@ -16,7 +16,6 @@
 //
 
 import UIKit
-import Darwin  // notify_post / notify_register_dispatch（Darwin notification）
 
 // MARK: - tweak handler 包装（保留以备后用，当前用 polling 替代）
 
@@ -61,9 +60,12 @@ enum TargetAppManager {
     // MARK: - 启动与监听
 
     /// App 启动时调用：通知 tweak 通过 sysctl 找 App PID 后开始写数据
-    /// 用 notify_post（纯 C 机制，不经 CFNotificationCenter，避免初始化成本）
+    /// 用 CFNotificationCenter 发送 Darwin notification（tweak 端 notify_register_dispatch 接收，
+    /// 两者底层都是 Darwin notification，互通）
     static func notifyAppStarted() {
-        notifyAppStartedName.withCString { notify_post($0) }
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let name = CFNotificationName(rawValue: notifyAppStartedName as CFString)
+        CFNotificationCenterPostNotification(center, name, nil, nil, true)
     }
 
     /// App 端轮询心跳文件变化（每 2s 检查 tweak.plist 的 _time 字段，变化就 reload）
@@ -137,7 +139,9 @@ enum TargetAppManager {
     /// 写配置 + 通知 tweak（Darwin notification 无 payload，tweak 收到后从 App 沙盒反查读 config）
     private static func writeConfig(_ dict: NSDictionary) {
         dict.write(toFile: configPath, atomically: true)
-        notifyConfigUpdatedName.withCString { notify_post($0) }
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let name = CFNotificationName(rawValue: notifyConfigUpdatedName as CFString)
+        CFNotificationCenterPostNotification(center, name, nil, nil, true)
     }
 
     // MARK: - 已安装 App 枚举
