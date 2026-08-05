@@ -223,15 +223,6 @@ static void FTSendHIDEvent(id app, bool down, double nx, double ny) {
     ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
     CFRelease(gs);
 }
-    // _timestamp（NSTimeInterval double ivar）
-    Ivar ivarTs = class_getInstanceVariable(ClsEvent, "_timestamp");
-    if (ivarTs) {
-        *(double *)(base + ivar_getOffset(ivarTs)) = now;
-    }
-
-    ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
-    CFRelease(gs);
-}
 
 // 诊断：dump UIEvent 的 ivar 名（已确认有 _hidEvent/_gsEvent）
 static void FTDumpEventIvars(void) {
