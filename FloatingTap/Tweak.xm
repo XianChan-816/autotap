@@ -513,15 +513,20 @@ static void FTTweakInitCallback(void *ctx) {
     NSUInteger n = touches ? ((Msg_Count)objc_msgSend)(touches, sel_registerName("count")) : 0;
     if (n == 0) return;
     // v1.0.42 诊断：标记命中窗口是否为我们的球窗口（区分注入触摸被拦截 vs 到达下层）
+    // v1.0.44 诊断：加 UITouch phase/tapCount（判断 down/up 是否关联成完整 tap）
     BOOL isBall = (self == gBallWindow);
     const char *cls = "?";
+    long ph = -1, tapc = -1;
     id t = ((Msg_AnyObject)objc_msgSend)(touches, sel_registerName("anyObject"));
     if (t) {
         id v = ((Msg_Send)objc_msgSend)(t, sel_registerName("view"));
         if (v) cls = object_getClassName(v);
+        ph = (long)((Msg_Int)objc_msgSend)(t, sel_registerName("phase"));
+        tapc = (long)((Msg_Int)objc_msgSend)(t, sel_registerName("tapCount"));
     }
-    char buf[160];
-    snprintf(buf, sizeof(buf), "SEND touches=%lu view=%s ball=%d", (unsigned long)n, cls, isBall ? 1 : 0);
+    char buf[200];
+    snprintf(buf, sizeof(buf), "SEND touches=%lu view=%s ball=%d phase=%ld tap=%ld",
+             (unsigned long)n, cls, isBall ? 1 : 0, ph, tapc);
     FTLog(buf);
 }
 %end
@@ -547,10 +552,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.43 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.44 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.43 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.44 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
