@@ -1,16 +1,12 @@
 //
-//  Tweak.xm — FloatingTap v1.0.34
+//  Tweak.xm — FloatingTap v1.0.37
 //
-//  v1.0.33 ivar dump 实锤：iOS 15.5 的 UIEvent 没有 _touches ivar——
-//  ivars: _gsEvent _hidEvent _hasValidModifiers _mzModifierFlags _mzClickCount
-//  _buttonMask _cachedScreen _eventObservers _timestamp _eventEnvironment
-//  _trackpadFingerDownCount __initialTouchTimestamp —— 触摸数据存在 _hidEvent/_gsEvent。
-//  v1.0.34：构造 IOHIDEvent（FT_HIDCreateDigitizerEvent）→ object_setInstanceVariable
-//  直写 UIEvent._hidEvent（C 指针 ivar 无 retain）→ [app sendEvent:] —— UIKit 从
-//  _hidEvent 自提取触摸并 hitTest 分发，完全绕开被丢弃的 IOKit 分发层。
+//  参考 zxtouch 源码（DeepWiki）发现根因：IOHIDEventCreateDigitizerEvent 是 15 参数，
+//  v1.0.24~36 误用 16 参数（多一个 options）→ index 起全部参数错位 → 事件畸形被 iOS 忽略。
+//  v1.0.37：修正 15 参数签名（HIDInject.c）。保持 _hidEvent+_gsEvent 双通道注入。
+//  若仍无效：下一步从真实触摸提取设备 senderID（zxtouch 机制，硬编码 0x8000000817371935 可能被拒）。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
-//  （KVC key 用 FTString 运行时创建 NSString）
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
 //
 
@@ -586,10 +582,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.36 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.37 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.36 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.37 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),

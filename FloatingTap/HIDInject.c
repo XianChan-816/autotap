@@ -47,10 +47,13 @@ enum {
 
 // MARK: - 私有函数指针（dlopen 动态解析）
 
+// ⚠️ v1.0.37: IOHIDEventCreateDigitizerEvent 是 15 参数（无第 4 位 options）！
+// 参考 zxtouch 源码：allocator, ts, type, index, identity, eventMask, buttonMask,
+// x, y, z, tipPressure, barrelPressure, range, touch, options。
+// v1.0.24~36 误用 16 参数导致 index 起全部参数错位 → 事件畸形被 iOS 忽略。
 static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerEvent)(CFAllocatorRef,
                                                             uint64_t timeStamp,
                                                             uint32_t type,
-                                                            uint32_t options,
                                                             uint32_t index,
                                                             uint32_t identity,
                                                             uint32_t eventMask,
@@ -60,7 +63,7 @@ static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerEvent)(CFAllocatorRef,
                                                             double barrelPressure,
                                                             Boolean range,
                                                             Boolean touch,
-                                                            FT_IOOptionBits optionsBits);
+                                                            FT_IOOptionBits options);
 
 static FT_IOHIDEventSystemClientRef (*p_IOHIDEventSystemClientCreate)(CFAllocatorRef);
 static FT_IOReturn (*p_IOHIDEventSystemClientDispatchEvent)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef);
@@ -87,7 +90,7 @@ static bool FT_HIDLoadSymbols(void) {
     }
 
     p_IOHIDEventCreateDigitizerEvent =
-        (FT_IOHIDEventRef (*)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
+        (FT_IOHIDEventRef (*)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t,
                               uint32_t, uint32_t, double, double, double, double, double,
                               Boolean, Boolean, FT_IOOptionBits))
         dlsym(handle, "IOHIDEventCreateDigitizerEvent");
@@ -167,8 +170,7 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y) {
         kCFAllocatorDefault,
         mach_absolute_time(),          // 原始 tick，不做纳秒换算
         3,                             // kIOHIDDigitizerTransducerTypeHand
-        0,                             // options
-        1,                             // index（zxtouch 用 1）
+        1,                             // index
         1,                             // identity
         mask,                          // eventMask
         0,                             // buttonMask
@@ -177,7 +179,7 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y) {
         0.0,                           // barrelPressure
         true,                          // range
         down,                          // touch
-        0);                            // optionsBits
+        0);                            // options
 
     if (event && p_IOHIDEventSetIntegerValue) {
         // kIOHIDEventFieldDigitizerIndex = 0x0B0002
