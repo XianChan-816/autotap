@@ -18,12 +18,24 @@
 #import "FloatingBallView.h"
 #import <notify.h>
 #import <libproc.h>
-#import <sandbox.h>
+#import <dlfcn.h>
 
 // Darwin notification 名（与 AutoTap/Sources/TargetAppManager.swift 严格一致）
 static NSString *const kFTNotifyAppStarted = @"com.floatingtap.autotap.appStarted";
 static NSString *const kFTNotifyConfigUpdated = @"com.floatingtap.autotap.configUpdated";
 static NSString *const kFTNotifyTweakDataUpdated = @"com.floatingtap.autotap.tweakDataUpdated";
+
+// 私有 API sandbox_container_path_for_pid 通过 dlsym 动态解析（SDK 无声明，避免编译报错）
+// 签名：int sandbox_container_path_for_pid(pid_t pid, char *buf, size_t bufsize);
+typedef int (*FTSandboxContainerPathForPID)(pid_t, char *, size_t);
+static FTSandboxContainerPathForPID gSandboxPathForPid = NULL;
+static void FTSandboxLoad(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gSandboxPathForPid = (FTSandboxContainerPathForPID)dlsym(RTLD_DEFAULT, "sandbox_container_path_for_pid");
+        NSLog(@"[FloatingTap] sandbox_container_path_for_pid 解析: %p", gSandboxPathForPid);
+    });
+}
 
 // 找到 App 沙盒 Caches 路径后通知 tweak 写入端
 static pid_t gAppPID = 0;  // 0 = 未发现
@@ -50,13 +62,17 @@ static pid_t FTFindAppPID(void) {
 }
 
 // 用 sandbox_container_path_for_pid 拿 App 沙盒根路径，然后拼 Caches/ 子目录
-// iOS 私有 API（libsystem_sandbox.dylib），签名：
-//   int sandbox_container_path_for_pid(pid_t pid, char *buf, size_t bufsize);
-// 返回 0 成功，buf 写入 /var/mobile/Containers/Data/Application/<UUID>/
+// 私有 API（libsystem_sandbox.dylib），dlsym 解析；返回 0 成功，
+// buf 写入 /var/mobile/Containers/Data/Application/<UUID>/
 static NSString *FTResolveAppCaches(pid_t pid) {
     if (pid <= 0) return nil;
+    FTSandboxLoad();
+    if (!gSandboxPathForPid) {
+        NSLog(@"[FloatingTap] sandbox_container_path_for_pid 未解析到，无法定位 App 沙盒");
+        return nil;
+    }
     char buf[PATH_MAX] = {0};
-    int ret = sandbox_container_path_for_pid(pid, buf, sizeof(buf));
+    int ret = gSandboxPathForPid(pid, buf, sizeof(buf));
     if (ret != 0 || buf[0] == '\0') {
         NSLog(@"[FloatingTap] sandbox_container_path_for_pid 失败: pid=%d ret=%d", pid, ret);
         return nil;

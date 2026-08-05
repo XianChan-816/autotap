@@ -13,7 +13,7 @@ TWEAK_NAME = FloatingTap
 FloatingTap_FILES = Tweak.xm FloatingBallView.m HIDInject.m
 FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 FloatingTap_FRAMEWORKS = UIKit CoreGraphics
-# libsystem_sandbox 提供 sandbox_get_container_for_pid（私有 API，需显式链接）
-FloatingTap_LDFLAGS = -lz -lsandbox
+# sandbox_container_path_for_pid 用 dlsym 动态解析（libSystem 自带，无需 -lsandbox）
+FloatingTap_LDFLAGS = -lz
 
 include $(THEOS_MAKE_PATH)/tweak.mk
