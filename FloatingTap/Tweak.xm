@@ -1,25 +1,43 @@
 //
-//  Tweak.xm — FloatingTap v1.0.18
+//  Tweak.xm — FloatingTap v1.0.19
 //
-//  v1.0.17 实测：绑了 UIWindowScene 仍不显示蓝球。两个问题待区分：
-//    (A) tweak 没真正注入 SpringBoard（不弹 Safe Mode 也可能只是没加载）
-//    (B) 窗口渲染方式在 SB 上不工作（VC + rootViewController 路径不可靠）
+//  v1.0.18 实测结论（决定性）：/tmp/floatingtap_ctor.log 不存在 = 纯 arm64 dylib
+//  根本没被注入 SpringBoard（SB 是 arm64e 进程，只接受 arm64e slice）。
+//  结合历史二分：
+//    - v1.0.9（双架构 arm64+arm64e + 空 %ctor）→ 不卡
+//    - v1.0.11/1.0.12（双架构 + 含任何 ObjC 类，哪怕空类）→ 卡屏
+//    - v1.0.13/1.0.14（双架构 + 零自定义类，但 %ctor 里 NSLog(@"...")）→ PAC 崩 → SafeMode
+//    - v1.0.16~18（纯 arm64）→ 静默不注入（无标记文件、无球、无崩溃）
+//  铁证结论：
+//    1) M1 的 SpringBoard 是 arm64e 进程，纯 arm64 dylib 无法注入；
+//    2) arm64e 注入路径（ellekit/Dopamine）下，dylib 内任何 ObjC 元数据
+//       （自定义类、@"..." 常量字符串 isa）都会触发指针认证(PAC)失败 → SB 崩；
+//    3) 纯 C（零 ObjC 元数据）安全。
 //
-//  v1.0.18 变更：
-//    1. 【决定性诊断】%ctor 最开头写 /tmp/floatingtap_ctor.log 标记文件。
-//       装完重启后该文件存在 = tweak 确实加载；不存在 = 没注入（查 plist/安装）。
-//    2. 窗口改更可靠路径：windowScene + 直接 addSubview（去掉 VC 中间层）
-//       + makeKeyAndVisible（强制参与渲染并显示）。
+//  v1.0.19 策略：「纯 C 驱动的 ObjC 动态调用」
+//    - ARCHS 恢复 arm64 arm64e
+//    - 零 @implementation / %hook / @"..." / block 字面量 / @selector / NSLog
+//    - 类获取用 objc_getClass("...")（纯 C），SEL 用 sel_registerName("...")
+//      （运行时查找，不产生 __objc_selrefs/__cfstring 元数据）
+//    - 日志用 syslog（纯 C），GCD 用 dispatch_after_f / dispatch_source_set_event_handler_f
+//      （C 函数回调，不用 block）
+//    - 双击计时用 clock_gettime（纯 C）
+//    - ctor 保持纯 C：只写标记文件 + 调度 30s 后建球
 //
-//  仍保持：零 @implementation 零 %hook，纯 C + objc_msgSend，仅 arm64。
+//  目标：验证「运行期 objc_msgSend 动态调用系统类」在 arm64e 注入环境下安全。
 //
 
-#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <Foundation/Foundation.h>
 #import <stdio.h>
+#import <syslog.h>
+#import <time.h>
+#import <stdint.h>
+#import <dispatch/dispatch.h>
+#import <CoreGraphics/CoreGraphics.h>
 
-// MARK: - objc_msgSend 类型化函数指针
+// MARK: - objc_msgSend 类型化函数指针（ARM64 下结构体参数需与目标方法签名一致）
 
 typedef id         (*Msg_Send)(id, SEL);
 typedef id         (*Msg_Init)(id, SEL);
@@ -58,67 +76,87 @@ static id gBallView   = nil;
 static id gPanGR      = nil;
 static id gTapGR      = nil;
 
-static CGPoint      gPanStartLoc;   // 触摸起始点（窗口坐标）
-static CGPoint      gPanOrigin0;    // 触摸起始时窗口 frame.origin
-static BOOL         gPanActive = NO;
-static NSTimeInterval gLastTapAt = 0;
+static CGPoint gPanStartLoc;   // 触摸起始点（窗口坐标）
+static CGPoint gPanOrigin0;    // 触摸起始时窗口 frame.origin
+static BOOL    gPanActive = NO;
+static double  gLastTapAt = 0; // mach monotonic 秒
 
 // MARK: - 工具
 
 static id FTAlloc(Class cls) {
-    return ((Msg_Send)objc_msgSend)((id)cls, @selector(alloc));
+    return ((Msg_Send)objc_msgSend)((id)cls, sel_registerName("alloc"));
 }
 
 static id FTAllocInitWithFrame(Class cls, CGRect frame) {
     id obj = FTAlloc(cls);
-    return ((Msg_AllocInitWithFrame)objc_msgSend)(obj, @selector(initWithFrame:), frame);
+    return ((Msg_AllocInitWithFrame)objc_msgSend)(obj, sel_registerName("initWithFrame:"), frame);
 }
 
 // 取当前前台活跃的 UIWindowScene（iOS 13+ 必需，否则 UIWindow 不渲染）
 static id FTGetActiveWindowScene(void) {
-    Class ClsApp = NSClassFromString(@"UIApplication");
+    Class ClsApp = objc_getClass("UIApplication");
     if (!ClsApp) return nil;
-    id app = ((Msg_Send)objc_msgSend)((id)ClsApp, @selector(sharedApplication));
+    id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
     if (!app) return nil;
-    id scenes = ((Msg_Send)objc_msgSend)(app, @selector(connectedScenes));
+    id scenes = ((Msg_Send)objc_msgSend)(app, sel_registerName("connectedScenes"));
     if (!scenes) return nil;
-    id arr = ((Msg_Send)objc_msgSend)(scenes, @selector(allObjects));
+    id arr = ((Msg_Send)objc_msgSend)(scenes, sel_registerName("allObjects"));
     if (!arr) return nil;
-    NSUInteger n = ((Msg_Count)objc_msgSend)(arr, @selector(count));
-    Class ClsWScene = NSClassFromString(@"UIWindowScene");
+    NSUInteger n = ((Msg_Count)objc_msgSend)(arr, sel_registerName("count"));
+    Class ClsWScene = objc_getClass("UIWindowScene");
     id firstWS = nil;
     for (NSUInteger i = 0; i < n; i++) {
-        id s = ((Msg_ObjectAtIndex)objc_msgSend)(arr, @selector(objectAtIndex:), i);
+        id s = ((Msg_ObjectAtIndex)objc_msgSend)(arr, sel_registerName("objectAtIndex:"), i);
         if (!s) continue;
-        if (ClsWScene && ((Msg_IsKindOf)objc_msgSend)(s, @selector(isKindOfClass:), ClsWScene)) {
+        if (ClsWScene && ((Msg_IsKindOf)objc_msgSend)(s, sel_registerName("isKindOfClass:"), ClsWScene)) {
             if (firstWS == nil) firstWS = s;
-            NSInteger act = ((Msg_Int)objc_msgSend)(s, @selector(activationState));
+            NSInteger act = ((Msg_Int)objc_msgSend)(s, sel_registerName("activationState"));
             if (act == 1) return s; // UISceneActivationStateForegroundActive = 1
         }
     }
     return firstWS;
 }
 
-// MARK: - 触摸轮询（GR target=nil，只能读 state）
+// SB UI 是否就绪：能拿到 windowScene，或 UIApplication 至少有一个 window
+static BOOL FTUIReady(void) {
+    if (FTGetActiveWindowScene()) return YES;
+    Class ClsApp = objc_getClass("UIApplication");
+    if (!ClsApp) return NO;
+    id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
+    if (!app) return NO;
+    id wins = ((Msg_Send)objc_msgSend)(app, sel_registerName("windows"));
+    if (!wins) return NO;
+    NSUInteger n = ((Msg_Count)objc_msgSend)(wins, sel_registerName("count"));
+    return n > 0;
+}
+
+// MARK: - GCD C 函数回调（代替 block）——前向声明
+
+static void FTTickCallback(void *ctx);
+static void FTEnsureBallCallback(void *ctx);
+static void FTTweakInitCallback(void *ctx);
+static void FTEnsureBall(int attempt);
+
+// MARK: - 触摸轮询（GR target=nil，只读 state）
 
 static void FTOnPanTick(void) {
     if (!gPanGR || !gBallWindow) return;
-    NSUInteger st = ((Msg_State)objc_msgSend)(gPanGR, @selector(state));
+    NSUInteger st = ((Msg_State)objc_msgSend)(gPanGR, sel_registerName("state"));
     if (st == 1) { // Began
-        gPanStartLoc = ((Msg_LocationInView)objc_msgSend)(gPanGR, @selector(locationInView:), gBallWindow);
-        gPanOrigin0  = ((Msg_Frame)objc_msgSend)(gBallWindow, @selector(frame)).origin;
+        gPanStartLoc = ((Msg_LocationInView)objc_msgSend)(gPanGR, sel_registerName("locationInView:"), gBallWindow);
+        gPanOrigin0  = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame")).origin;
         gPanActive   = YES;
-        NSLog(@"[FloatingTap] Pan BEGIN");
+        syslog(LOG_ERR, "FloatingTap Pan BEGIN");
     } else if (st == 2 && gPanActive) { // Changed
-        CGPoint cur = ((Msg_LocationInView)objc_msgSend)(gPanGR, @selector(locationInView:), gBallWindow);
-        CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, @selector(frame));
-        ((Msg_SetFrame)objc_msgSend)(gBallWindow, @selector(setFrame:),
+        CGPoint cur = ((Msg_LocationInView)objc_msgSend)(gPanGR, sel_registerName("locationInView:"), gBallWindow);
+        CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
+        ((Msg_SetFrame)objc_msgSend)(gBallWindow, sel_registerName("setFrame:"),
             CGRectMake(gPanOrigin0.x + (cur.x - gPanStartLoc.x),
                        gPanOrigin0.y + (cur.y - gPanStartLoc.y),
                        f.size.width, f.size.height));
     } else if (st == 3 && gPanActive) { // Ended
         gPanActive = NO;
-        NSLog(@"[FloatingTap] Pan END");
+        syslog(LOG_ERR, "FloatingTap Pan END");
     } else if (st == 4) { // Cancelled
         gPanActive = NO;
     }
@@ -126,28 +164,17 @@ static void FTOnPanTick(void) {
 
 static void FTOnTapTick(void) {
     if (!gTapGR) return;
-    NSUInteger st = ((Msg_State)objc_msgSend)(gTapGR, @selector(state));
+    NSUInteger st = ((Msg_State)objc_msgSend)(gTapGR, sel_registerName("state"));
     if (st != 3) return; // Ended
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
     if (now - gLastTapAt < 0.4) {
-        NSLog(@"[FloatingTap] DOUBLE TAP detected");
+        syslog(LOG_ERR, "FloatingTap DOUBLE TAP detected");
         gLastTapAt = 0;
     } else {
         gLastTapAt = now;
     }
-}
-
-// SB UI 是否就绪：能拿到 windowScene，或 UIApplication 至少有一个 window
-static BOOL FTUIReady(void) {
-    if (FTGetActiveWindowScene()) return YES;
-    Class ClsApp = NSClassFromString(@"UIApplication");
-    if (!ClsApp) return NO;
-    id app = ((Msg_Send)objc_msgSend)((id)ClsApp, @selector(sharedApplication));
-    if (!app) return NO;
-    id wins = ((Msg_Send)objc_msgSend)(app, @selector(windows));
-    if (!wins) return NO;
-    NSUInteger n = ((Msg_Count)objc_msgSend)(wins, @selector(count));
-    return n > 0;
 }
 
 // MARK: - 创建小球
@@ -155,19 +182,19 @@ static BOOL FTUIReady(void) {
 static void FTSetupBall(void) {
     if (gBallWindow) return;
 
-    Class ClsWindow = NSClassFromString(@"UIWindow");
-    Class ClsView   = NSClassFromString(@"UIView");
-    Class ClsScreen = NSClassFromString(@"UIScreen");
-    Class ClsColor  = NSClassFromString(@"UIColor");
-    Class ClsPanGR  = NSClassFromString(@"UIPanGestureRecognizer");
-    Class ClsTapGR  = NSClassFromString(@"UITapGestureRecognizer");
+    Class ClsWindow = objc_getClass("UIWindow");
+    Class ClsView   = objc_getClass("UIView");
+    Class ClsScreen = objc_getClass("UIScreen");
+    Class ClsColor  = objc_getClass("UIColor");
+    Class ClsPanGR  = objc_getClass("UIPanGestureRecognizer");
+    Class ClsTapGR  = objc_getClass("UITapGestureRecognizer");
     if (!ClsWindow || !ClsView || !ClsScreen || !ClsColor || !ClsPanGR || !ClsTapGR) {
-        NSLog(@"[FloatingTap] system classes missing, skip");
+        syslog(LOG_ERR, "FloatingTap system classes missing, skip");
         return;
     }
 
-    id mainScreen = ((Msg_Send)objc_msgSend)((id)ClsScreen, @selector(mainScreen));
-    CGRect sb = ((Msg_Bounds)objc_msgSend)(mainScreen, @selector(bounds));
+    id mainScreen = ((Msg_Send)objc_msgSend)((id)ClsScreen, sel_registerName("mainScreen"));
+    CGRect sb = ((Msg_Bounds)objc_msgSend)(mainScreen, sel_registerName("bounds"));
     CGFloat d = 56.0;
     CGRect ballFrame = CGRectMake(sb.size.width / 2 - d / 2, sb.size.height / 2 - d / 2, d, d);
 
@@ -177,87 +204,103 @@ static void FTSetupBall(void) {
     // iOS 13+：挂到当前活跃的 UIWindowScene，否则不渲染
     id scene = FTGetActiveWindowScene();
     if (scene) {
-        ((Msg_SetWindowScene)objc_msgSend)(win, @selector(setWindowScene:), scene);
+        ((Msg_SetWindowScene)objc_msgSend)(win, sel_registerName("setWindowScene:"), scene);
     }
 
-    ((Msg_SetWindowLevel)objc_msgSend)(win, @selector(setWindowLevel:), (CGFloat)1001.0);
+    ((Msg_SetWindowLevel)objc_msgSend)(win, sel_registerName("setWindowLevel:"), (CGFloat)1001.0);
 
     id ball = FTAllocInitWithFrame(ClsView, CGRectMake(0, 0, d, d));
-    ((Msg_SetUserInteractionEnabled)objc_msgSend)(ball, @selector(setUserInteractionEnabled:), YES);
-    ((Msg_SetBackgroundColor)objc_msgSend)(ball, @selector(setBackgroundColor:),
-        ((Msg_ColorWithRGBA)objc_msgSend)((id)ClsColor, @selector(colorWithRed:green:blue:alpha:),
+    ((Msg_SetUserInteractionEnabled)objc_msgSend)(ball, sel_registerName("setUserInteractionEnabled:"), YES);
+    ((Msg_SetBackgroundColor)objc_msgSend)(ball, sel_registerName("setBackgroundColor:"),
+        ((Msg_ColorWithRGBA)objc_msgSend)((id)ClsColor, sel_registerName("colorWithRed:green:blue:alpha:"),
                                           0.0, 0.478, 1.0, 0.9));
 
-    id layer = ((Msg_Layer)objc_msgSend)(ball, @selector(layer));
-    ((Msg_SetCGFloat)objc_msgSend)(layer, @selector(setCornerRadius:), (CGFloat)(d / 2.0));
-    ((Msg_SetCGFloat)objc_msgSend)(layer, @selector(setBorderWidth:), (CGFloat)2.5);
-    id white = ((Msg_ColorWithRGBA)objc_msgSend)((id)ClsColor, @selector(colorWithRed:green:blue:alpha:),
+    id layer = ((Msg_Layer)objc_msgSend)(ball, sel_registerName("layer"));
+    ((Msg_SetCGFloat)objc_msgSend)(layer, sel_registerName("setCornerRadius:"), (CGFloat)(d / 2.0));
+    ((Msg_SetCGFloat)objc_msgSend)(layer, sel_registerName("setBorderWidth:"), (CGFloat)2.5);
+    id white = ((Msg_ColorWithRGBA)objc_msgSend)((id)ClsColor, sel_registerName("colorWithRed:green:blue:alpha:"),
                                                  1.0, 1.0, 1.0, 1.0);
-    ((Msg_SetBorderColor)objc_msgSend)(layer, @selector(setBorderColor:),
-                                       ((Msg_CGColor)objc_msgSend)(white, @selector(CGColor)));
+    ((Msg_SetBorderColor)objc_msgSend)(layer, sel_registerName("setBorderColor:"),
+                                       ((Msg_CGColor)objc_msgSend)(white, sel_registerName("CGColor")));
 
-    // GR：先 alloc 再 init（target=nil, action=NULL，仅轮询 state）
+    // GR：先 alloc 再 init（v1.0.14 教训：误把 alloc 当 initWithTarget: 用会崩）
     gPanGR = FTAlloc(ClsPanGR);
-    ((Msg_Init)objc_msgSend)(gPanGR, @selector(init));
+    ((Msg_Init)objc_msgSend)(gPanGR, sel_registerName("init"));
     gTapGR = FTAlloc(ClsTapGR);
-    ((Msg_Init)objc_msgSend)(gTapGR, @selector(init));
-    ((Msg_SetNumberOfTapsRequired)objc_msgSend)(gTapGR, @selector(setNumberOfTapsRequired:), (NSUInteger)2);
-    ((Msg_SetDelaysTouchesBegan)objc_msgSend)(gPanGR, @selector(setDelaysTouchesBegan:), NO);
-    ((Msg_SetDelaysTouchesEnded)objc_msgSend)(gPanGR, @selector(setDelaysTouchesEnded:), NO);
-    ((Msg_SetCancelsTouchesInView)objc_msgSend)(gPanGR, @selector(setCancelsTouchesInView:), NO);
+    ((Msg_Init)objc_msgSend)(gTapGR, sel_registerName("init"));
+    ((Msg_SetNumberOfTapsRequired)objc_msgSend)(gTapGR, sel_registerName("setNumberOfTapsRequired:"), (NSUInteger)2);
+    ((Msg_SetDelaysTouchesBegan)objc_msgSend)(gPanGR, sel_registerName("setDelaysTouchesBegan:"), NO);
+    ((Msg_SetDelaysTouchesEnded)objc_msgSend)(gPanGR, sel_registerName("setDelaysTouchesEnded:"), NO);
+    ((Msg_SetCancelsTouchesInView)objc_msgSend)(gPanGR, sel_registerName("setCancelsTouchesInView:"), NO);
 
-    ((Msg_AddGestureRecognizer)objc_msgSend)(ball, @selector(addGestureRecognizer:), gPanGR);
-    ((Msg_AddGestureRecognizer)objc_msgSend)(ball, @selector(addGestureRecognizer:), gTapGR);
+    ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gPanGR);
+    ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gTapGR);
 
     // 直接把 ball 加到 window（不走 VC），更可靠
-    ((Msg_AddSubview)objc_msgSend)(win, @selector(addSubview:), ball);
+    ((Msg_AddSubview)objc_msgSend)(win, sel_registerName("addSubview:"), ball);
 
-    ((Msg_SetHidden)objc_msgSend)(win, @selector(setHidden:), NO);
-    ((Msg_MakeKeyAndVisible)objc_msgSend)(win, @selector(makeKeyAndVisible));
+    ((Msg_SetHidden)objc_msgSend)(win, sel_registerName("setHidden:"), NO);
+    ((Msg_MakeKeyAndVisible)objc_msgSend)(win, sel_registerName("makeKeyAndVisible"));
 
     gBallWindow = win;
     gBallView   = ball;
 
-    // 20Hz 轮询 GR 状态
+    // 20Hz 轮询 GR 状态（C 函数回调，无 block）
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
                               (uint64_t)(0.05 * NSEC_PER_SEC), (uint64_t)(0.01 * NSEC_PER_SEC));
-    dispatch_source_set_event_handler(timer, ^{
-        FTOnPanTick();
-        FTOnTapTick();
-    });
+    dispatch_source_set_event_handler_f(timer, FTTickCallback);
     dispatch_resume(timer);
 
-    NSLog(@"[FloatingTap] v1.0.18 ball created, scene=%@ win=%p",
-          (scene ? @"yes" : @"no"), (__bridge void*)win);
+    syslog(LOG_ERR, "FloatingTap ball created, scene=%d win=%lu",
+           scene ? 1 : 0, (unsigned long)(uintptr_t)win);
 }
 
-// 确保 SB UI 就绪后再创建（每 2s 重试，最多 10 次）
+// MARK: - GCD C 函数回调（代替 block）
+
+static void FTTickCallback(void *ctx) {
+    (void)ctx;
+    FTOnPanTick();
+    FTOnTapTick();
+}
+
 static void FTEnsureBall(int attempt) {
     if (FTUIReady()) {
         FTSetupBall();
         return;
     }
     if (attempt >= 10) {
-        NSLog(@"[FloatingTap] SB UI not ready after 20s, giving up");
+        syslog(LOG_ERR, "FloatingTap SB UI not ready after 20s, giving up");
         return;
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        FTEnsureBall(attempt + 1);
-    });
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), NULL, FTEnsureBallCallback);
 }
 
-%ctor {
+static void FTEnsureBallCallback(void *ctx) {
+    (void)ctx;
+    FTEnsureBall(0);
+}
+
+static void FTTweakInitCallback(void *ctx) {
+    (void)ctx;
+    syslog(LOG_ERR, "FloatingTap init callback, UI ready? calling FTEnsureBall");
+    FTEnsureBall(0);
+}
+
+// MARK: - 入口（纯 C constructor，等效 %ctor 但无 Logos 依赖、零 ObjC）
+
+__attribute__((constructor))
+static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.18 ctor run\n");
+        fprintf(mk, "FloatingTap v1.0.19 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    NSLog(@"[FloatingTap] v1.0.18 loaded");
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        FTEnsureBall(0);
-    });
+    syslog(LOG_ERR, "FloatingTap v1.0.19 loaded (pure C ctor, zero ObjC metadata)");
+
+    // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), NULL, FTTweakInitCallback);
 }

@@ -1,15 +1,18 @@
 # FloatingTap — 全局悬浮球自动点击器（越狱 tweak）
-# ⚠️ v1.0.13 零 ObjC 类验证版：只编译 Tweak.xm（纯 C + objc_msgSend 动态调用）。
-# 背景：任何含 @implementation 的 dylib 注入 SpringBoard 都卡死（与 ElleKit 版本无关）。
-# 本版彻底不定义自定义 ObjC 类，验证注入不再卡死且小球可显示。
+# ⚠️ v1.0.19 「纯 C 驱动的 ObjC 动态调用」版：只编译 Tweak.xm。
+# 背景链：
+#   - v1.0.9（双架构 + 空 %ctor）不卡；v1.0.11/12（双架构 + 含 ObjC 类）卡；
+#   - v1.0.13/14（双架构 + %ctor 里 NSLog(@"...")）PAC 崩 → SafeMode；
+#   - v1.0.16~18（纯 arm64）→ 不注入（M1 的 SpringBoard 是 arm64e 进程，只收 arm64e slice）。
+# 结论：必须编回 arm64e 才能注入；且 dylib 内零 ObjC 元数据（无类、无 @"..."、无 block、
+# 无 @selector/__cfstring）才能避开 ellekit 注入路径的 PAC 指针认证问题。
+# 本版恢复双架构，代码全部纯 C + objc_msgSend 动态调系统类。
 
 export THEOS_PACKAGE_SCHEME = rootless
 export TARGET := iphone:clang:latest:15.0
-# v1.0.16: 去掉 arm64e，只编 arm64。
-# 根因：崩溃日志显示 FloatingTap.dylib 以 arm64e 注入 M1 时，%ctor 内 NSLog 的
-# objc_msgSend 触发 ARM64E PAC（指针认证）失败 → SB 崩 → Safe Mode。
-# 只编 arm64（无 PAC）在 M1 上可正常运行，ElleKit 注入不走指针认证，绕开此坑。
-export ARCHS = arm64
+# v1.0.19: 恢复 arm64 arm64e（纯 arm64 无法注入 arm64e 的 SpringBoard）。
+# 代码已做到零 ObjC 元数据，arm64e slice 在 ellekit 注入路径下不再触发 PAC 失败。
+export ARCHS = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
