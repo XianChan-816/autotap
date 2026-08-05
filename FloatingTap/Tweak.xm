@@ -56,6 +56,7 @@ typedef id         (*Msg_AnyObject)(id, SEL);
 typedef id         (*Msg_ObjectAtIndex)(id, SEL, NSUInteger);
 typedef BOOL       (*Msg_IsKindOf)(id, SEL, Class);
 typedef NSInteger  (*Msg_Int)(id, SEL);
+typedef id         (*Msg_SendID)(id, SEL, void *);
 
 // MARK: - 全局状态（纯 C）
 
@@ -167,14 +168,31 @@ static void FTRestoreBallInteractionCallback(void *ctx);
 // 15参构造 + 真实 senderID + IOHIDEventSystemClientDispatchEvent）。
 // 注入前关球窗口交互（穿透），60ms 后恢复（FTClickCallback 处理）。
 
-// 在屏幕像素点 (px,py) 发一次合成点击（HID DispatchEvent 派发，@try 兜底防崩）
+// 在屏幕像素点 (px,py) 发一次合成点击。
+// v1.0.41：注入走 [UIApplication _handleHIDEvent:]（UIKit 原生 HID 入口，绕开被
+// 丢弃的 IOKit 分发层）——构造好的父+子 IOHIDEvent 直接喂给 UIKit。
 static void FTSyntheticTap(double px, double py) {
     @try {
         double nx = (gScreenW > 0) ? px / gScreenW : 0.5;
         double ny = (gScreenH > 0) ? py / gScreenH : 0.5;
         if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
         if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
-        FT_HIDTapAt(nx, ny);
+
+        Class ClsApp = objc_getClass("UIApplication");
+        if (!ClsApp) return;
+        id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
+        if (!app) return;
+
+        FT_IOHIDEventRef down = FT_HIDCreateDigitizerEvent(true, nx, ny);
+        if (down) {
+            ((Msg_SendID)objc_msgSend)(app, sel_registerName("_handleHIDEvent:"), down);
+            CFRelease(down);
+        }
+        FT_IOHIDEventRef up = FT_HIDCreateDigitizerEvent(false, nx, ny);
+        if (up) {
+            ((Msg_SendID)objc_msgSend)(app, sel_registerName("_handleHIDEvent:"), up);
+            CFRelease(up);
+        }
     } @catch (NSException *ex) {
         (void)ex;
         FTLog("inject exception");
@@ -486,6 +504,20 @@ static void FTTweakInitCallback(void *ctx) {
 }
 %end
 
+// v1.0.41 诊断 hook：确认真实触摸是否经过 UIApplication _handleHIDEvent:（HID 入口）
+%hook UIApplication
+- (void)_handleHIDEvent:(void *)event {
+    %orig;
+    static double sLastHID = 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    if (now - sLastHID < 1.0) return; // 节流 1s
+    sLastHID = now;
+    if (event) FTLog("UIApp handleHIDEvent called");
+}
+%end
+
 // MARK: - 入口（纯 C constructor，等效 %ctor 但无 Logos 依赖、零 ObjC）
 
 __attribute__((constructor))
@@ -493,10 +525,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.40 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.41 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.40 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.41 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
