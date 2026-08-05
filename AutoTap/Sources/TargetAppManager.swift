@@ -27,24 +27,25 @@ final class TweakUpdateBox: NSObject {
 
 enum TargetAppManager {
 
-    // MARK: - 路径（全部在 App 沙盒 Caches 内，App 100% 可写可读）
+    // MARK: - 路径（v1.0.50-fix：全部固定系统全局路径——App 有 no-sandbox entitlement 可写；
+    // 原方案 tweak 反查 App 沙盒（sandbox_container_path_for_pid）在 arm64e 下崩溃 → 废弃）
 
-    /// App 自己的 Caches 目录（每启动时不变；UUID 由 iOS 固定）
+    /// App 自己的 Caches 目录（保留给写测试用）
     static let appCachesDir: String = {
         return NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first!
     }()
 
     /// App 写、tweak 读：目标 App 列表 + 间隔 + 点击位置
-    static let configPath = appCachesDir + "/AutoTapConfig.plist"
+    static let configPath = "/var/mobile/Library/Preferences/com.floatingtap.config.plist"
 
     /// tweak 写、App 读：已装 App 清单
-    static let appsDumpPath = appCachesDir + "/FloatingTap.apps.plist"
+    static let appsDumpPath = "/var/mobile/Library/Preferences/com.floatingtap.apps.plist"
 
     /// tweak 写、App 读：枚举状态（_count / _error / _time）
-    static let appsStatusPath = appCachesDir + "/FloatingTap.apps.status.plist"
+    static let appsStatusPath = "/var/mobile/Library/Preferences/com.floatingtap.apps.status.plist"
 
     /// tweak 写、App 读：心跳（证明 tweak 已加载并运行）
-    static let tweakStatusPath = appCachesDir + "/FloatingTap.tweak.plist"
+    static let tweakStatusPath = "/var/mobile/Library/Preferences/com.floatingtap.tweak.plist"
 
     // MARK: - Darwin notification 名（跨进程 ABI，tweak 端必须一字不差）
 

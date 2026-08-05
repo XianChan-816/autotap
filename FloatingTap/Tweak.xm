@@ -189,22 +189,23 @@ static double FTIntervalMs(void) {
     return 400.0;
 }
 
-// MARK: - App 通信（v1.0.50 对接 AutoTap App）
+// MARK: - App 通信（v1.0.50 对接 AutoTap App / v1.0.50-fix 改固定全局路径）
 // 协议（见 AutoTap/Sources/TargetAppManager.swift，App 端早已定义，tweak 端此前从未对接）：
-//  - 配置：<AutoTap沙盒>/Library/Caches/AutoTapConfig.plist
+//  - 配置：/var/mobile/Library/Preferences/com.floatingtap.config.plist（App no-sandbox 可写，tweak 可读）
 //    keys：Targets([String]) / IntervalMs / ClickX / ClickY（归一化 0~1）
-//  - tweak 写心跳：<AutoTap沙盒>/Library/Caches/FloatingTap.tweak.plist（_loaded / _time 毫秒）
-//  - tweak 写枚举：FloatingTap.apps.plist + FloatingTap.apps.status.plist（下一步）
+//  - tweak 写心跳：/var/mobile/Library/Preferences/com.floatingtap.tweak.plist（_loaded / _time 毫秒）
 //  - Darwin 通知：com.floatingtap.autotap.appStarted / configUpdated / tweakDataUpdated
-// 实现：CFNotificationCenter（纯 C API）+ sysctl 找 PID + sandbox_container_path_for_pid 反查沙盒。
+// ⚠️ v1.0.50-fix：原方案用 sandbox_container_path_for_pid 反查 App 沙盒，dlsym 私有函数
+// 在 arm64e 下调用崩溃（Safe Mode，日志停在 notifications registered 后）。App 有
+// no-sandbox entitlement，可直接读写系统全局路径 → 删掉反查，用固定路径，零私有函数。
 
 typedef id         (*Msg_StringWithUTF8String)(id, SEL, const char *);
 typedef id         (*Msg_DictWithFile)(id, SEL, id);
 typedef id         (*Msg_ObjectForKey)(id, SEL, id);
 typedef double     (*Msg_DoubleValue)(id, SEL);
 
-static char gAutoTapSandbox[1024] = "";  // AutoTap App 沙盒路径（缓存）
-static int  gAutoTapSandboxReady = 0;
+#define FT_CFG_PATH   "/var/mobile/Library/Preferences/com.floatingtap.config.plist"
+#define FT_HB_PATH    "/var/mobile/Library/Preferences/com.floatingtap.tweak.plist"
 
 // 运行时创建 NSString（禁止 @"..."：arm64e PAC 元数据雷区）
 static id FTStr(const char *s) {
@@ -213,52 +214,10 @@ static id FTStr(const char *s) {
     return ((Msg_StringWithUTF8String)objc_msgSend)((id)ClsStr, sel_registerName("stringWithUTF8String:"), s);
 }
 
-// 通过进程名找 PID（sysctl KERN_PROC_ALL，纯 C）
-static pid_t FTFindPIDByName(const char *name) {
-    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-    size_t len = 0;
-    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0) return -1;
-    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(len);
-    if (!procs) return -1;
-    if (sysctl(mib, 4, procs, &len, NULL, 0) != 0) { free(procs); return -1; }
-    int n = (int)(len / sizeof(struct kinfo_proc));
-    pid_t found = -1;
-    for (int i = 0; i < n; i++) {
-        if (strcmp(procs[i].kp_proc.p_comm, name) == 0) { found = procs[i].kp_proc.p_pid; break; }
-    }
-    free(procs);
-    return found;
-}
-
-// 反查 AutoTap 沙盒路径（sandbox_container_path_for_pid，dlsym 动态解析）
-static void FTResolveAutoTapSandbox(void) {
-    if (gAutoTapSandboxReady) return;
-    gAutoTapSandboxReady = 1; // 只尝试一次（App 不在运行则等下次 appStarted 通知重试）
-    pid_t pid = FTFindPIDByName("AutoTap");
-    if (pid <= 0) { FTLog("autotap: process not running"); return; }
-    static const char *(*p_sandbox_container_path_for_pid)(pid_t) = NULL;
-    if (!p_sandbox_container_path_for_pid) {
-        p_sandbox_container_path_for_pid =
-            (const char *(*)(pid_t))dlsym(RTLD_DEFAULT, "sandbox_container_path_for_pid");
-    }
-    if (!p_sandbox_container_path_for_pid) { FTLog("autotap: no sandbox symbol"); return; }
-    const char *sp = p_sandbox_container_path_for_pid(pid);
-    if (!sp || !*sp) { FTLog("autotap: sandbox path empty"); return; }
-    snprintf(gAutoTapSandbox, sizeof(gAutoTapSandbox), "%s", sp);
-    gAutoTapSandboxReady = 2; // 成功
-    char diag[300];
-    snprintf(diag, sizeof(diag), "autotap sandbox: %s", gAutoTapSandbox);
-    FTLog(diag);
-}
-
-// 写心跳（FloatingTap.tweak.plist，手动生成 XML plist，零 ObjC 元数据）
+// 写心跳（com.floatingtap.tweak.plist，固定全局路径，手动生成 XML plist，零 ObjC 元数据）
 static void FTWriteHeartbeat(void) {
-    FTResolveAutoTapSandbox();
-    if (gAutoTapSandboxReady != 2) return;
-    char path[1150];
-    snprintf(path, sizeof(path), "%s/Library/Caches/FloatingTap.tweak.plist", gAutoTapSandbox);
-    FILE *f = fopen(path, "w");
-    if (!f) return;
+    FILE *f = fopen(FT_HB_PATH, "w");
+    if (!f) { FTLog("heartbeat write failed"); return; }
     double now = (double)time(NULL) * 1000.0; // App 端 _time 为毫秒
     fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
@@ -271,13 +230,9 @@ static void FTWriteHeartbeat(void) {
     FTLog("heartbeat written");
 }
 
-// 读配置（dictionaryWithContentsOfFile: 动态调用）
+// 读配置（dictionaryWithContentsOfFile: 动态调用，固定全局路径）
 static id FTReadConfigDict(void) {
-    FTResolveAutoTapSandbox();
-    if (gAutoTapSandboxReady != 2) return nil;
-    char path[1150];
-    snprintf(path, sizeof(path), "%s/Library/Caches/AutoTapConfig.plist", gAutoTapSandbox);
-    id fstr = FTStr(path);
+    id fstr = FTStr(FT_CFG_PATH);
     if (!fstr) return nil;
     Class ClsDict = objc_getClass("NSDictionary");
     if (!ClsDict) return nil;
@@ -323,9 +278,7 @@ static void FTNotificationCallback(CFNotificationCenterRef center, void *observe
     if (!name || !CFStringGetCString(name, buf, sizeof(buf), kCFStringEncodingUTF8)) return;
     if (strcmp(buf, "com.floatingtap.autotap.appStarted") == 0) {
         FTLog("got appStarted");
-        // App（重新）启动：强制重试反查沙盒（之前可能因 App 未运行失败）
-        gAutoTapSandboxReady = 0;
-        FTResolveAutoTapSandbox();
+        // App（重新）启动：刷新心跳（固定全局路径，无需反查沙盒）
         FTWriteHeartbeat();
     } else if (strcmp(buf, "com.floatingtap.autotap.configUpdated") == 0) {
         FTLog("got configUpdated");
@@ -349,8 +302,7 @@ static void FTRegisterNotifications(void) {
         CFNotificationCenterAddObserver(center, &sNotifyObserver, FTNotificationCallback,
                                         sNameConfig, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     FTLog("notifications registered");
-    // 启动即尝试：App 可能已运行（心跳证明 tweak 活着）
-    FTResolveAutoTapSandbox();
+    // 启动即尝试：App 可能已运行（心跳证明 tweak 活着；固定路径直接写/读）
     FTWriteHeartbeat();
     FTApplyConfig();
 }
