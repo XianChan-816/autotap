@@ -1,12 +1,12 @@
 //
-//  Tweak.xm — FloatingTap v1.0.48
+//  Tweak.xm — FloatingTap v1.0.49
 //
-//  v1.0.47 双进程架构（解决进程隔离）实测失败：SB 端写 /tmp/FloatingTap.task，
-//  但 iOS 沙盒 App（抖音）的 /tmp 是容器私有路径，读不到系统 /tmp → 通信断裂。
-//  v1.0.48 回到 SB 端直接注入（用户要求先修好基本连点）：
-//    - SB 进程内 _handleHIDEvent: 注入（v1.0.41~46 已验证能到达 UIKit、触摸到下层窗口）
-//    - 保留：坐标锁定 + index 递增 + down/up 分离 50ms + 间隔 400ms（避开双击窗口）
-//    - 抖音双进程方案暂停（代码已删），待基本功能验证后再启用
+//  v1.0.48 实测：注入触摸到达 UIWindow sendEvent，但 view=?（touch.view=nil）
+//  = UIKit hitTest 没命中任何 view → 图标手势收不到 → 不开。
+//  对照：真实触摸 view=NCNotificationListView（有值）。
+//  v1.0.49 决定性诊断：SEND 日志加 locationInWindow 像素坐标（loc=）+
+//  窗口类（win=）——若 loc=0.33,0.42（还是归一化值）→ UIKit 期望像素，
+//  坐标单位错误实锤 → 修事件构造；若 loc=788,700（正确像素）→ hitTest 链路问题。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
@@ -59,6 +59,7 @@ typedef BOOL       (*Msg_IsKindOf)(id, SEL, Class);
 typedef NSInteger  (*Msg_Int)(id, SEL);
 typedef id         (*Msg_SendID)(id, SEL, void *);
 typedef const char * (*Msg_UTF8String)(id, SEL);
+typedef CGPoint    (*Msg_LocationInView)(id, SEL, id);
 
 // 判断当前进程 bundle id（v1.0.47：SB 进程控制端 / 抖音进程注入执行端）
 static BOOL FTIsBundle(const char *bundleID) {
@@ -548,19 +549,26 @@ static void FTTweakInitCallback(void *ctx) {
     if (n == 0) return;
     // v1.0.42 诊断：标记命中窗口是否为我们的球窗口（区分注入触摸被拦截 vs 到达下层）
     // v1.0.44 诊断：加 UITouch phase/tapCount（判断 down/up 是否关联成完整 tap）
+    // v1.0.49 诊断：加 locationInWindow 像素坐标——判断坐标单位是否被 UIKit 误解
+    //  （注入传归一化 0~1，若 UIKit 期望像素 → 触摸落在屏幕角落 → hitTest 命中不了图标）
     BOOL isBall = (self == gBallWindow);
     const char *cls = "?";
+    const char *winCls = object_getClassName(self);
+    if (!winCls) winCls = "?";
     long ph = -1, tapc = -1;
+    double lx = -1, ly = -1;
     id t = ((Msg_AnyObject)objc_msgSend)(touches, sel_registerName("anyObject"));
     if (t) {
         id v = ((Msg_Send)objc_msgSend)(t, sel_registerName("view"));
         if (v) cls = object_getClassName(v);
         ph = (long)((Msg_Int)objc_msgSend)(t, sel_registerName("phase"));
         tapc = (long)((Msg_Int)objc_msgSend)(t, sel_registerName("tapCount"));
+        CGPoint loc = ((Msg_LocationInView)objc_msgSend)(t, sel_registerName("locationInView:"), nil);
+        lx = loc.x; ly = loc.y;
     }
-    char buf[200];
-    snprintf(buf, sizeof(buf), "SEND touches=%lu view=%s ball=%d phase=%ld tap=%ld",
-             (unsigned long)n, cls, isBall ? 1 : 0, ph, tapc);
+    char buf[240];
+    snprintf(buf, sizeof(buf), "SEND touches=%lu view=%s win=%s ball=%d phase=%ld tap=%ld loc=%.1f,%.1f",
+             (unsigned long)n, cls, winCls, isBall ? 1 : 0, ph, tapc, lx, ly);
     FTLog(buf);
 }
 %end
@@ -583,14 +591,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.48 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.49 loaded (pure C ctor, zero static ObjC metadata)");
 
     // v1.0.48：先修好 SB 端基本连点（直接注入），抖音双进程方案暂停。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写；抖音进程追加写（避免互相覆盖）
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.48 ctor run (arm64e, pure C)\n");
+            fprintf(mk, "FloatingTap v1.0.49 ctor run (arm64e, pure C)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
