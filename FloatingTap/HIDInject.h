@@ -30,10 +30,10 @@ bool FT_HIDIsConnected(void);
 // 在归一化坐标 (0~1, 0~1) 处发一次完整点击（down + up）
 void FT_HIDTapAt(double normalizedX, double normalizedY);
 
-// 构造一个 digitizer 事件（down=true 按下 / down=false 抬起），坐标归一化。
+// 构造一个 digitizer 事件（down=true 按下 / down=false 抬起），坐标归一化，
+// index 用于区分触摸（同一 tap 的 down/up 用相同 index，不同 tap 递增避免被串流）。
 // 返回 +1 的 IOHIDEvent（调用方负责 CFRelease）。
-// 供 Tweak.xm 塞入 UIEvent._hidEvent 使用（绕开 IOKit 分发层）。
-FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double normalizedX, double normalizedY);
+FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double normalizedX, double normalizedY, uint32_t index);
 
 // 启动 senderID 捕获（zxtouch 机制：从真实触摸提取设备专属 senderID，
 // 硬编码 0x8000000817371935 可能被 iOS 拒绝）。注册 IOHIDEventSystemClient 回调，

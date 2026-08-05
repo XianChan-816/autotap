@@ -233,7 +233,7 @@ uint64_t FT_HIDSenderID(void) {
 // - parent: IOHIDEventCreateDigitizerEvent(alloc, ts, Hand(3), index, identity, mask, 0, x,y,z, tip, 0, range, touch, 0)
 // - child:  IOHIDEventCreateDigitizerFingerEvent(alloc, ts, index, identity, mask, 0, x,y,z, tip, 0, range, touch, 0)
 // - IOHIDEventAppendEvent(parent, child, 0)
-FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y) {
+FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint32_t index) {
     if (!FT_HIDLoadSymbols()) return NULL;
     if (!p_IOHIDEventCreateDigitizerEvent || !p_IOHIDEventCreateDigitizerFingerEvent ||
         !p_IOHIDEventAppendEvent) {
@@ -249,7 +249,7 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y) {
     // 子事件（finger）
     FT_IOHIDEventRef child = p_IOHIDEventCreateDigitizerFingerEvent(
         kCFAllocatorDefault, ts,
-        1, 1,                          // index, identity
+        index, 1,                      // index（每次 tap 递增）, identity
         mask, 0,                       // eventMask, buttonMask
         x, y, 0.0,                     // x, y, z（归一化）
         down ? 1.0 : 0.0,              // tipPressure
@@ -262,7 +262,7 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y) {
     FT_IOHIDEventRef parent = p_IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault, ts,
         3,                             // kIOHIDDigitizerTransducerTypeHand
-        1,                             // index
+        index,                         // index（每次 tap 递增，避免被串流）
         1,                             // identity
         mask, 0,                       // eventMask, buttonMask
         x, y, 0.0,                     // x, y, z（归一化）
@@ -280,7 +280,7 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y) {
 
     if (p_IOHIDEventSetIntegerValue) {
         // kIOHIDEventFieldDigitizerIndex = 0x0B0002
-        p_IOHIDEventSetIntegerValue(parent, 0x0B0002, 1);
+        p_IOHIDEventSetIntegerValue(parent, 0x0B0002, (int64_t)index);
         // kIOHIDEventFieldDigitizerIdentity = 0x0B0003
         p_IOHIDEventSetIntegerValue(parent, 0x0B0003, 1);
         // kIOHIDEventFieldDigitizerIsDisplayIntegrated = 0x0B0014 —— 屏幕集成触摸标记
@@ -307,6 +307,6 @@ static void FT_DispatchEvent(FT_IOHIDEventRef event) {
 
 void FT_HIDTapAt(double normalizedX, double normalizedY) {
     if (!g_hidClient) return;
-    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(true, normalizedX, normalizedY));
-    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(false, normalizedX, normalizedY));
+    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(true, normalizedX, normalizedY, 1));
+    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(false, normalizedX, normalizedY, 1));
 }

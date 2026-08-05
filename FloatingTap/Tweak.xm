@@ -74,6 +74,9 @@ static double  gScreenH = 0;
 
 static BOOL    gIsClicking = NO;            // 连点进行中
 static dispatch_source_t gClickTimer = NULL; // 连点定时器（ARC 管理）
+static uint32_t gTapIndex = 0;              // 每次 tap 递增的 index（区分触摸，避免被串流）
+static double  gClickLockX = 0;             // 连点锁定坐标（长按开始时球心，拖动不改变）
+static double  gClickLockY = 0;
 
 // MARK: - 诊断日志（append 到标记文件，Filza 可见；带单调时间戳）
 
@@ -169,6 +172,7 @@ static void FTRestoreBallInteractionCallback(void *ctx);
 
 static double gPendingUpX = 0;
 static double gPendingUpY = 0;
+static uint32_t gPendingUpIndex = 0;
 static void FTSendHIDUpCallback(void *ctx);
 
 // 发送一次 up（延迟回调）
@@ -179,7 +183,7 @@ static void FTSendHIDUpCallback(void *ctx) {
         if (!ClsApp) return;
         id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
         if (!app) return;
-        FT_IOHIDEventRef up = FT_HIDCreateDigitizerEvent(false, gPendingUpX, gPendingUpY);
+        FT_IOHIDEventRef up = FT_HIDCreateDigitizerEvent(false, gPendingUpX, gPendingUpY, gPendingUpIndex);
         if (up) {
             ((Msg_SendID)objc_msgSend)(app, sel_registerName("_handleHIDEvent:"), up);
             CFRelease(up);
@@ -189,7 +193,7 @@ static void FTSendHIDUpCallback(void *ctx) {
     }
 }
 
-// 在屏幕像素点 (px,py) 发一次合成点击（down 立即 + up 延迟 50ms）
+// 在屏幕像素点 (px,py) 发一次合成点击（down 立即 + up 延迟 50ms；每次 tap index 递增）
 static void FTSyntheticTap(double px, double py) {
     @try {
         double nx = (gScreenW > 0) ? px / gScreenW : 0.5;
@@ -202,8 +206,12 @@ static void FTSyntheticTap(double px, double py) {
         id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
         if (!app) return;
 
+        // 每次 tap 递增 index（v1.0.45：避免 UIKit 把连续注入事件串成同一触摸流）
+        gTapIndex = (gTapIndex % 19) + 1;
+        uint32_t idx = gTapIndex;
+
         // down 立即
-        FT_IOHIDEventRef down = FT_HIDCreateDigitizerEvent(true, nx, ny);
+        FT_IOHIDEventRef down = FT_HIDCreateDigitizerEvent(true, nx, ny, idx);
         if (down) {
             ((Msg_SendID)objc_msgSend)(app, sel_registerName("_handleHIDEvent:"), down);
             CFRelease(down);
@@ -211,6 +219,7 @@ static void FTSyntheticTap(double px, double py) {
         // up 延迟 50ms（关联同一触摸）
         gPendingUpX = nx;
         gPendingUpY = ny;
+        gPendingUpIndex = idx;
         dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
                          dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
     } @catch (NSException *ex) {
@@ -241,30 +250,22 @@ static void FTDumpEventIvars(void) {
     FTLog(buf);
 }
 
-// 连点回调：在球心发一次合成点击。
-// ⚠️ 注入坐标=球心，球窗口(windowLevel 1001)正好在球心，注入触摸会先命中
-// 球窗口被吃掉 → 下层永远收不到。因此注入瞬间关掉球窗口交互
-// （userInteractionEnabled=NO，窗口不参与 hitTest，注入触摸穿透），60ms 后恢复。
+// 连点回调：在锁定坐标发一次合成点击。
+// v1.0.45：用 gClickLockX/Y（长按开始时锁定，拖动球不改变注入点——
+// v1.0.44 实测注入坐标漂移产生 phase=1(moved) 导致 tap 手势失败）。
+// ⚠️ 注入坐标可能正好在球窗口下，注入瞬间关掉球窗口交互（穿透），60ms 后恢复。
 static void FTClickCallback(void *ctx) {
     (void)ctx;
     if (!gBallWindow || !gIsClicking) return;
 
-    CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
-    double cx = f.origin.x + f.size.width * 0.5;
-    double cy = f.origin.y + f.size.height * 0.5;
-    double nx = (gScreenW > 0) ? cx / gScreenW : 0.5;
-    double ny = (gScreenH > 0) ? cy / gScreenH : 0.5;
-    if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
-    if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
-
     // 注入前：球窗口不参与 hitTest → 注入触摸穿透到下层
     ((Msg_SetUserInteractionEnabled)objc_msgSend)(gBallWindow, sel_registerName("setUserInteractionEnabled:"), NO);
 
-    FTSyntheticTap(nx * gScreenW, ny * gScreenH);
+    FTSyntheticTap(gClickLockX * gScreenW, gClickLockY * gScreenH);
     gClickCount++;
 
     char diag[96];
-    snprintf(diag, sizeof(diag), "inject tap nx=%.2f ny=%.2f", nx, ny);
+    snprintf(diag, sizeof(diag), "inject tap nx=%.2f ny=%.2f", gClickLockX, gClickLockY);
     FTLog(diag);
 
     // 60ms 后恢复交互（连点 200ms 间隔，恢复后用户可松手停止）
@@ -287,6 +288,17 @@ static void FTStartClicking(void) {
     }
     gIsClicking = YES;
     gClickCount = 0;
+    gTapIndex = 0;
+    // 锁定点击坐标 = 当前球心（v1.0.45：拖动球不改变注入点，避免 tap 因移动失败）
+    if (gBallWindow) {
+        CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
+        double cx = f.origin.x + f.size.width * 0.5;
+        double cy = f.origin.y + f.size.height * 0.5;
+        gClickLockX = (gScreenW > 0) ? cx / gScreenW : 0.5;
+        gClickLockY = (gScreenH > 0) ? cy / gScreenH : 0.5;
+        if (gClickLockX < 0.001) gClickLockX = 0.001; if (gClickLockX > 0.999) gClickLockX = 0.999;
+        if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
+    }
     double ms = FTIntervalMs();
     // 一碰到球立即点一次（不等第一个 timer tick，短按也有一次点击）
     FTClickCallback(NULL);
@@ -552,10 +564,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.44 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.45 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.44 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.45 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
