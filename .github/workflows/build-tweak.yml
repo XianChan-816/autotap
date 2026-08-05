@@ -14,6 +14,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -112,6 +114,20 @@ jobs:
             FloatingTap/.theos/packages/*.deb
             /tmp/debout/*.deb
           if-no-files-found: warn
+
+      # 调试辅助：构建失败时把 build.log 推到仓库 .debug/build.log，
+      # 便于直接在仓库里查看编译错误（artifact 下载需要认证，这里绕开）
+      - name: Push build log to repo (debug, failure only)
+        if: failure() && steps.build.outcome == 'failure'
+        run: |
+          cd /home/runner/work/autotap/autotap
+          mkdir -p .debug
+          cp FloatingTap/build.log .debug/build.log || echo "no build.log"
+          git config user.email "ci-debug@example.com"
+          git config user.name "CI Debug"
+          git add -f .debug/build.log
+          git commit -m "chore(debug): build.log from failed run" || echo "nothing to commit"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/XianChan-816/autotap.git" HEAD:main || echo "push failed"
 
       - name: Upload build log (on failure or success)
         if: always()
