@@ -139,6 +139,8 @@ static BOOL FTUIReady(void) {
 
 // MARK: - 连点引擎
 
+static unsigned long gClickCount = 0; // 本次连点周期内的点击次数（诊断）
+
 // 读取连点间隔（毫秒）：/var/mobile/Library/Preferences/com.floatingtap.cfg 第一行数字，默认 200
 static double FTIntervalMs(void) {
     FILE *f = fopen("/var/mobile/Library/Preferences/com.floatingtap.cfg", "r");
@@ -168,6 +170,7 @@ static void FTClickCallback(void *ctx) {
     if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
 
     FT_HIDTapAt(nx, ny);
+    gClickCount++;
 }
 
 static void FTStartClicking(void) {
@@ -177,7 +180,10 @@ static void FTStartClicking(void) {
         return;
     }
     gIsClicking = YES;
+    gClickCount = 0;
     double ms = FTIntervalMs();
+    // 一碰到球立即点一次（不等第一个 timer tick，短按也有一次点击）
+    FTClickCallback(NULL);
     gClickTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     if (gClickTimer) {
         dispatch_source_set_timer(gClickTimer,
@@ -197,6 +203,7 @@ static void FTStopClicking(void) {
         gClickTimer = NULL;
     }
     FTLog("clicking stopped");
+    syslog(LOG_ERR, "FloatingTap clicks in this period: %lu", gClickCount);
 }
 
 // MARK: - 动态 GR target（运行时创建类，零静态 ObjC 元数据）

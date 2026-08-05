@@ -80,6 +80,7 @@ static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerFingerEvent)(CFAllocatorRef
 
 static FT_IOHIDEventSystemClientRef (*p_IOHIDEventSystemClientCreate)(CFAllocatorRef);
 static FT_IOReturn (*p_IOHIDEventSystemClientDispatchEvent)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef);
+static void (*p_IOHIDEventSystemClientScheduleWithRunLoop)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef);
 static void (*p_IOHIDEventAppendEvent)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits);
 static void (*p_IOHIDEventSetSenderID)(FT_IOHIDEventRef, uint64_t);
 
@@ -113,6 +114,8 @@ static bool FT_HIDLoadSymbols(void) {
         (FT_IOHIDEventSystemClientRef (*)(CFAllocatorRef))dlsym(handle, "IOHIDEventSystemClientCreate");
     p_IOHIDEventSystemClientDispatchEvent =
         (FT_IOReturn (*)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef))dlsym(handle, "IOHIDEventSystemClientDispatchEvent");
+    p_IOHIDEventSystemClientScheduleWithRunLoop =
+        (void (*)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef))dlsym(handle, "IOHIDEventSystemClientScheduleWithRunLoop");
     p_IOHIDEventAppendEvent =
         (void (*)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits))dlsym(handle, "IOHIDEventAppendEvent");
     p_IOHIDEventSetSenderID =
@@ -139,6 +142,10 @@ bool FT_HIDConnect(void) {
     if (!g_hidClient) {
         syslog(LOG_ERR, "FloatingTap HID client create failed");
         return false;
+    }
+    // 部分 iOS 版本需要把 client 挂到 runloop 才会真正派发事件（符号存在则挂，失败无害）
+    if (p_IOHIDEventSystemClientScheduleWithRunLoop) {
+        p_IOHIDEventSystemClientScheduleWithRunLoop(g_hidClient, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
     }
     syslog(LOG_ERR, "FloatingTap HID connected");
     return true;
