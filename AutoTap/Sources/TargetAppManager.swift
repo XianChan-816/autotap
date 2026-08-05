@@ -96,7 +96,7 @@ enum TargetAppManager {
     static func writeConfigDict(_ dict: NSDictionary, candidates: [String]) -> String? {
         for p in candidates {
             do {
-                try dict.write(toFile: p)
+                try dict.write(toFile: p, atomically: false)
                 return p
             } catch {
                 continue
@@ -178,7 +178,7 @@ enum TargetAppManager {
     private static func writeConfigDictAny(_ dict: NSDictionary) -> String? {
         for p in configCandidates {
             do {
-                try dict.write(toFile: p)
+                try dict.write(toFile: p, atomically: false)
                 return p
             } catch {
                 continue
@@ -359,7 +359,7 @@ enum TargetAppManager {
             let d = NSMutableDictionary()
             d["_probe_ts"] = NSNumber(value: Date().timeIntervalSince1970 * 1000.0)
             d["_probe_src"] = "autotap"
-            try d.write(toFile: probe)
+            try d.write(toFile: probe, atomically: false)
             canWrite = true
             try? fm.removeItem(atPath: probe)
         } catch {
