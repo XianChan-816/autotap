@@ -10,6 +10,12 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+// 这些是 C 链接符号：Tweak.xm 编译为 ObjC++(.mm)，若不包 extern "C"，
+// 调用会生成 C++ mangled 符号（__Z17...），而 .m 定义的是 C 符号（_F...），链接必挂。
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /// 共享配置文件路径（运行时由 FTSetAppCachesDir 设置为 App 沙盒 Caches 路径）
 extern NSString *kFloatingTapConfigPath;
 
@@ -21,6 +27,10 @@ extern NSString *const kFTKeyIntervalMs;// NSNumber：连点间隔（毫秒）
 /// 之后所有跨进程 plist 读写都走此路径（App 100% 可读自己沙盒）
 extern void FTSetAppCachesDir(NSString *dir);
 extern NSString *FTGetAppCachesDir(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 @interface FloatingBallView : UIView
 
