@@ -1,6 +1,6 @@
 # FloatingTap — 全局悬浮球自动点击器（越狱 tweak）
-# Theos / Logos 工程，注入 SpringBoard，悬浮球在任意 App 上显示。
-# 构建：make clean package（rootless + arm64e，Dopamine 越狱环境）
+# ⚠️ v1.0.9 超级空壳诊断版：只编译空的 Tweak.xm，不包含任何业务代码。
+# 二分定位「装 deb 重启卡屏」：若此版仍卡 = deb 打包/注入/环境问题。
 
 export THEOS_PACKAGE_SCHEME = rootless
 export TARGET := iphone:clang:latest:15.0
@@ -10,10 +10,10 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = FloatingTap
 
-FloatingTap_FILES = Tweak.xm FloatingBallView.m HIDInject.m
+# 只编译空壳 Tweak.xm（排除 FloatingBallView.m / HIDInject.m 的加载时初始化）
+FloatingTap_FILES = Tweak.xm
 FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 FloatingTap_FRAMEWORKS = UIKit CoreGraphics
-# sandbox_container_path_for_pid 用 dlsym 动态解析（libSystem 自带，无需 -lsandbox）
 FloatingTap_LDFLAGS = -lz
 
 include $(THEOS_MAKE_PATH)/tweak.mk
