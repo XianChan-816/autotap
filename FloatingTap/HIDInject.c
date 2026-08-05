@@ -147,23 +147,23 @@ static uint64_t FT_SenderID(void) {
 
 // 经典单事件写法（zxtouch/autotouch 在 iOS 13-16 验证有效）：
 // - type 参数必须是转换器类型 kIOHIDDigitizerTransducerTypeHand(3)，不是事件类型(11)；
-// - 坐标直接放事件本体（归一化 0~1）；
-// - 时间戳用 mach_absolute_time() 原始值；
-// - 关键：必须 IOHIDEventSetIntegerValue(event, 0x0B0014, 1)
-//   （kIOHIDEventFieldDigitizerIsDisplayIntegrated），否则系统不把事件当屏幕触摸，直接丢弃。
+// - index=1（zxtouch 用 1 不是 0），identity=1；
+// - down eventMask 用 Range|Touch|Position（zxtouch 不加 Tip|Identity）；
+// - 坐标直传事件本体（归一化 0~1）；时间戳 mach_absolute_time() 原始值；
+// - 关键：IOHIDEventSetIntegerValue(isDisplayIntegrated=1, index=1, identity=1)，
+//   否则系统可能丢弃合成触摸。
 static FT_IOHIDEventRef FT_DigitizerEvent(bool down, double x, double y) {
     uint32_t mask = down
         ? (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventTouch |
-           FT_kIOHIDDigitizerEventPosition | FT_kIOHIDDigitizerEventTip |
-           FT_kIOHIDDigitizerEventIdentity)
-        : (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventIdentity);
+           FT_kIOHIDDigitizerEventPosition)
+        : (FT_kIOHIDDigitizerEventRange);
 
     FT_IOHIDEventRef event = p_IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault,
         mach_absolute_time(),          // 原始 tick，不做纳秒换算
         3,                             // kIOHIDDigitizerTransducerTypeHand
         0,                             // options
-        0,                             // index
+        1,                             // index（zxtouch 用 1）
         1,                             // identity
         mask,                          // eventMask
         0,                             // buttonMask
@@ -175,7 +175,11 @@ static FT_IOHIDEventRef FT_DigitizerEvent(bool down, double x, double y) {
         0);                            // optionsBits
 
     if (event && p_IOHIDEventSetIntegerValue) {
-        // kIOHIDEventFieldDigitizerIsDisplayIntegrated —— 标记为屏幕集成触摸，否则被系统丢弃
+        // kIOHIDEventFieldDigitizerIndex = 0x0B0002
+        p_IOHIDEventSetIntegerValue(event, 0x0B0002, 1);
+        // kIOHIDEventFieldDigitizerIdentity = 0x0B0003
+        p_IOHIDEventSetIntegerValue(event, 0x0B0003, 1);
+        // kIOHIDEventFieldDigitizerIsDisplayIntegrated = 0x0B0014 —— 屏幕集成触摸标记
         p_IOHIDEventSetIntegerValue(event, 0x0B0014, 1);
     }
     return event;

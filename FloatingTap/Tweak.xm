@@ -1,11 +1,9 @@
 //
-//  Tweak.xm — FloatingTap v1.0.25
+//  Tweak.xm — FloatingTap v1.0.26
 //
-//  v1.0.24 实测：点击计数与按住时长完美对应（7.3s→37 次），连点引擎正常，
-//  但屏幕无反应 → HID 事件被系统静默丢弃。根因：合成触摸事件缺少
-//  kIOHIDEventFieldDigitizerIsDisplayIntegrated(0x0B0014)=1 标记，
-//  系统不把它当屏幕触摸。v1.0.25 补：IOHIDEventSetIntegerValue(event,0x0B0014,1)
-//  + client SetDispatchQueue（zxtouch/autotouch iOS 15 兼容写法）。
+//  v1.0.24/25 实测：点击计数正常但屏幕无反应 → v1.0.26 按 zxtouch（iOS 15 验证可用的
+//  触摸注入器）完整对齐事件参数：index=1、down mask 简化为 Range|Touch|Position、
+//  up mask 为 Range、显式 SetIntegerValue(Index=1, Identity=1, IsDisplayIntegrated=1)。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
@@ -412,7 +410,7 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.25 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.26 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
     syslog(LOG_ERR, "FloatingTap v1.0.25 loaded (pure C ctor, zero static ObjC metadata)");
