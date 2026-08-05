@@ -1,23 +1,23 @@
 //
-//  Tweak.xm — FloatingTap v1.0.17
+//  Tweak.xm — FloatingTap v1.0.18
 //
-//  v1.0.16 问题：tweak 加载了（不再 Safe Mode，arm64 单架构生效），
-//  但悬浮窗不显示。根因：iOS 13+ 起，未绑定 UIWindowScene 的 UIWindow
-//  不会参与渲染（系统按 UIScene 管理窗口）。SpringBoard 的窗口属于某个
-//  UIWindowScene，我们新建的游离窗口没挂场景 → 不显示。
+//  v1.0.17 实测：绑了 UIWindowScene 仍不显示蓝球。两个问题待区分：
+//    (A) tweak 没真正注入 SpringBoard（不弹 Safe Mode 也可能只是没加载）
+//    (B) 窗口渲染方式在 SB 上不工作（VC + rootViewController 路径不可靠）
 //
-//  v1.0.17 变更：
-//    1. 新增 FTGetActiveWindowScene：从 UIApplication.connectedScenes 取
-//       当前 foreground-active 的 UIWindowScene（无则退回第一个 window scene）。
-//    2. FTSetupBall 创建窗口后立即 setWindowScene:，确保参与渲染。
-//    3. FTEnsureBall 的 UI 就绪判断放宽：只要能拿到 scene 或 SB 有 window 即建。
+//  v1.0.18 变更：
+//    1. 【决定性诊断】%ctor 最开头写 /tmp/floatingtap_ctor.log 标记文件。
+//       装完重启后该文件存在 = tweak 确实加载；不存在 = 没注入（查 plist/安装）。
+//    2. 窗口改更可靠路径：windowScene + 直接 addSubview（去掉 VC 中间层）
+//       + makeKeyAndVisible（强制参与渲染并显示）。
 //
-//  仍保持：零 @implementation 零 %hook，纯 C + objc_msgSend。
+//  仍保持：零 @implementation 零 %hook，纯 C + objc_msgSend，仅 arm64。
 //
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <stdio.h>
 
 // MARK: - objc_msgSend 类型化函数指针
 
@@ -26,15 +26,14 @@ typedef id         (*Msg_Init)(id, SEL);
 typedef id         (*Msg_AllocInitWithFrame)(id, SEL, CGRect);
 typedef void       (*Msg_SetFrame)(id, SEL, CGRect);
 typedef void       (*Msg_SetBackgroundColor)(id, SEL, id);
+typedef void       (*Msg_SetCGFloat)(id, SEL, CGFloat);
+typedef void       (*Msg_SetBorderColor)(id, SEL, CGColorRef);
 typedef void       (*Msg_SetWindowLevel)(id, SEL, CGFloat);
 typedef void       (*Msg_SetHidden)(id, SEL, BOOL);
-typedef void       (*Msg_SetRootVC)(id, SEL, id);
-typedef void       (*Msg_SetView)(id, SEL, id);
 typedef void       (*Msg_SetUserInteractionEnabled)(id, SEL, BOOL);
 typedef void       (*Msg_AddGestureRecognizer)(id, SEL, id);
-typedef void       (*Msg_SetCornerRadius)(id, SEL, CGFloat);
-typedef void       (*Msg_SetBorderWidth)(id, SEL, CGFloat);
-typedef void       (*Msg_SetBorderColor)(id, SEL, CGColorRef);
+typedef void       (*Msg_AddSubview)(id, SEL, id);
+typedef void       (*Msg_MakeKeyAndVisible)(id, SEL);
 typedef void       (*Msg_SetNumberOfTapsRequired)(id, SEL, NSUInteger);
 typedef void       (*Msg_SetDelaysTouchesBegan)(id, SEL, BOOL);
 typedef void       (*Msg_SetDelaysTouchesEnded)(id, SEL, BOOL);
@@ -81,7 +80,6 @@ static id FTGetActiveWindowScene(void) {
     if (!ClsApp) return nil;
     id app = ((Msg_Send)objc_msgSend)((id)ClsApp, @selector(sharedApplication));
     if (!app) return nil;
-    // 无 connectedScenes（< iOS 13）直接返回 nil，由调用方跳过场景绑定
     id scenes = ((Msg_Send)objc_msgSend)(app, @selector(connectedScenes));
     if (!scenes) return nil;
     id arr = ((Msg_Send)objc_msgSend)(scenes, @selector(allObjects));
@@ -94,25 +92,11 @@ static id FTGetActiveWindowScene(void) {
         if (!s) continue;
         if (ClsWScene && ((Msg_IsKindOf)objc_msgSend)(s, @selector(isKindOfClass:), ClsWScene)) {
             if (firstWS == nil) firstWS = s;
-            // UISceneActivationStateForegroundActive = 1
             NSInteger act = ((Msg_Int)objc_msgSend)(s, @selector(activationState));
-            if (act == 1) return s;
+            if (act == 1) return s; // UISceneActivationStateForegroundActive = 1
         }
     }
-    return firstWS; // 退回第一个 window scene
-}
-
-// SB UI 是否就绪：能拿到 windowScene，或 UIApplication 至少有一个 window
-static BOOL FTUIReady(void) {
-    if (FTGetActiveWindowScene()) return YES;
-    Class ClsApp = NSClassFromString(@"UIApplication");
-    if (!ClsApp) return NO;
-    id app = ((Msg_Send)objc_msgSend)((id)ClsApp, @selector(sharedApplication));
-    if (!app) return NO;
-    id wins = ((Msg_Send)objc_msgSend)(app, @selector(windows));
-    if (!wins) return NO;
-    NSUInteger n = ((Msg_Count)objc_msgSend)(wins, @selector(count));
-    return n > 0;
+    return firstWS;
 }
 
 // MARK: - 触摸轮询（GR target=nil，只能读 state）
@@ -153,6 +137,19 @@ static void FTOnTapTick(void) {
     }
 }
 
+// SB UI 是否就绪：能拿到 windowScene，或 UIApplication 至少有一个 window
+static BOOL FTUIReady(void) {
+    if (FTGetActiveWindowScene()) return YES;
+    Class ClsApp = NSClassFromString(@"UIApplication");
+    if (!ClsApp) return NO;
+    id app = ((Msg_Send)objc_msgSend)((id)ClsApp, @selector(sharedApplication));
+    if (!app) return NO;
+    id wins = ((Msg_Send)objc_msgSend)(app, @selector(windows));
+    if (!wins) return NO;
+    NSUInteger n = ((Msg_Count)objc_msgSend)(wins, @selector(count));
+    return n > 0;
+}
+
 // MARK: - 创建小球
 
 static void FTSetupBall(void) {
@@ -160,12 +157,11 @@ static void FTSetupBall(void) {
 
     Class ClsWindow = NSClassFromString(@"UIWindow");
     Class ClsView   = NSClassFromString(@"UIView");
-    Class ClsVC     = NSClassFromString(@"UIViewController");
     Class ClsScreen = NSClassFromString(@"UIScreen");
     Class ClsColor  = NSClassFromString(@"UIColor");
     Class ClsPanGR  = NSClassFromString(@"UIPanGestureRecognizer");
     Class ClsTapGR  = NSClassFromString(@"UITapGestureRecognizer");
-    if (!ClsWindow || !ClsView || !ClsVC || !ClsScreen || !ClsColor || !ClsPanGR || !ClsTapGR) {
+    if (!ClsWindow || !ClsView || !ClsScreen || !ClsColor || !ClsPanGR || !ClsTapGR) {
         NSLog(@"[FloatingTap] system classes missing, skip");
         return;
     }
@@ -178,16 +174,13 @@ static void FTSetupBall(void) {
     // 独立小球窗口：只有小球大小 → 区域外触摸天然穿透
     id win = FTAllocInitWithFrame(ClsWindow, ballFrame);
 
-    // ⚠️ iOS 13+ 关键：把窗口挂到当前活跃的 UIWindowScene，否则不渲染
+    // iOS 13+：挂到当前活跃的 UIWindowScene，否则不渲染
     id scene = FTGetActiveWindowScene();
     if (scene) {
         ((Msg_SetWindowScene)objc_msgSend)(win, @selector(setWindowScene:), scene);
     }
 
     ((Msg_SetWindowLevel)objc_msgSend)(win, @selector(setWindowLevel:), (CGFloat)1001.0);
-    ((Msg_SetHidden)objc_msgSend)(win, @selector(setHidden:), NO);
-
-    id vc = ((Msg_Send)objc_msgSend)((id)ClsVC, @selector(new));
 
     id ball = FTAllocInitWithFrame(ClsView, CGRectMake(0, 0, d, d));
     ((Msg_SetUserInteractionEnabled)objc_msgSend)(ball, @selector(setUserInteractionEnabled:), YES);
@@ -196,8 +189,8 @@ static void FTSetupBall(void) {
                                           0.0, 0.478, 1.0, 0.9));
 
     id layer = ((Msg_Layer)objc_msgSend)(ball, @selector(layer));
-    ((Msg_SetCornerRadius)objc_msgSend)(layer, @selector(setCornerRadius:), (CGFloat)(d / 2.0));
-    ((Msg_SetBorderWidth)objc_msgSend)(layer, @selector(setBorderWidth:), (CGFloat)2.5);
+    ((Msg_SetCGFloat)objc_msgSend)(layer, @selector(setCornerRadius:), (CGFloat)(d / 2.0));
+    ((Msg_SetCGFloat)objc_msgSend)(layer, @selector(setBorderWidth:), (CGFloat)2.5);
     id white = ((Msg_ColorWithRGBA)objc_msgSend)((id)ClsColor, @selector(colorWithRed:green:blue:alpha:),
                                                  1.0, 1.0, 1.0, 1.0);
     ((Msg_SetBorderColor)objc_msgSend)(layer, @selector(setBorderColor:),
@@ -216,8 +209,11 @@ static void FTSetupBall(void) {
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, @selector(addGestureRecognizer:), gPanGR);
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, @selector(addGestureRecognizer:), gTapGR);
 
-    ((Msg_SetView)objc_msgSend)(vc, @selector(setView:), ball);
-    ((Msg_SetRootVC)objc_msgSend)(win, @selector(setRootViewController:), vc);
+    // 直接把 ball 加到 window（不走 VC），更可靠
+    ((Msg_AddSubview)objc_msgSend)(win, @selector(addSubview:), ball);
+
+    ((Msg_SetHidden)objc_msgSend)(win, @selector(setHidden:), NO);
+    ((Msg_MakeKeyAndVisible)objc_msgSend)(win, @selector(makeKeyAndVisible));
 
     gBallWindow = win;
     gBallView   = ball;
@@ -232,7 +228,8 @@ static void FTSetupBall(void) {
     });
     dispatch_resume(timer);
 
-    NSLog(@"[FloatingTap] v1.0.17 ball shown at (%.0f,%.0f) scene=%@", ballFrame.origin.x, ballFrame.origin.y, (scene?@"yes":@"no"));
+    NSLog(@"[FloatingTap] v1.0.18 ball created, scene=%@ win=%p",
+          (scene ? @"yes" : @"no"), (void*)win);
 }
 
 // 确保 SB UI 就绪后再创建（每 2s 重试，最多 10 次）
@@ -252,7 +249,13 @@ static void FTEnsureBall(int attempt) {
 }
 
 %ctor {
-    NSLog(@"[FloatingTap] v1.0.17 loaded");
+    // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
+    FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
+    if (mk) {
+        fprintf(mk, "FloatingTap v1.0.18 ctor run\n");
+        fclose(mk);
+    }
+    NSLog(@"[FloatingTap] v1.0.18 loaded");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         FTEnsureBall(0);
