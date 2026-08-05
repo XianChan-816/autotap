@@ -87,10 +87,12 @@ final class TargetPickerViewController: UIViewController {
             let apps = TargetAppManager.installedApps()
             DispatchQueue.main.async {
                 self?.allApps = apps
+                // statusLabel 顶部状态条：始终显示 message
                 self?.statusLabel.text = diag.message
                 self?.tableView.reloadData()
                 if apps.isEmpty {
-                    self?.toast(diag.message)
+                    // 弹出更详细的 pathSummary（含每条路径的 stat/read/write 结果），方便诊断
+                    self?.toast(diag.pathSummary)
                 }
             }
         }

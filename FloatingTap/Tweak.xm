@@ -1,5 +1,5 @@
 //
-//  Tweak.xm — FloatingTap v1.0.50
+//  Tweak.xm — FloatingTap v1.0.50-fix3
 //
 //  架构（用户原设计）：AutoTap App = 启动器（选目标 App / 拖动十字线定位置 / 间隔），
 //  FloatingTap tweak = 执行器。App 端协议（TargetAppManager.swift）早已定义，
@@ -197,15 +197,29 @@ static double FTIntervalMs(void) {
 //  - Darwin 通知：com.floatingtap.autotap.appStarted / configUpdated / tweakDataUpdated
 // ⚠️ v1.0.50-fix：原方案用 sandbox_container_path_for_pid 反查 App 沙盒，dlsym 私有函数
 // 在 arm64e 下调用崩溃（Safe Mode，日志停在 notifications registered 后）。App 有
-// no-sandbox entitlement，可直接读写系统全局路径 → 删掉反查，用固定路径，零私有函数。
+// no-sandbox entitlement，理论上可直接读写系统全局路径 → 删掉反查，用固定路径。
+// ⚠️ v1.0.50-fix3 实测：fix2 写 /var/mobile/Library/Preferences/ 心跳成功（tweak log
+// 「heartbeat written」30+ 次），但 App 的 FileManager.fileExists 返回 false → App 看到的
+// 不是真实 /var/mobile/ 而是 sandbox 容器根。改多路径探针：4 个候选按顺序试，写第一个能写的。
 
 typedef id         (*Msg_StringWithUTF8String)(id, SEL, const char *);
 typedef id         (*Msg_DictWithFile)(id, SEL, id);
 typedef id         (*Msg_ObjectForKey)(id, SEL, id);
 typedef double     (*Msg_DoubleValue)(id, SEL);
 
-#define FT_CFG_PATH   "/var/mobile/Library/Preferences/com.floatingtap.config.plist"
-#define FT_HB_PATH    "/var/mobile/Library/Preferences/com.floatingtap.tweak.plist"
+// 候选路径（按「tweak + App 两边都能读写」概率从高到低；Logs/CrashReporter 全部进程
+// 都有写权限是公认的稳定共享点，/var/mobile/ 直挂跳过 /Library/ 保护）
+#define FT_HB_CAND_0 "/var/mobile/Library/Logs/CrashReporter/com.floatingtap.tweak.plist"
+#define FT_HB_CAND_1 "/var/mobile/com.floatingtap.tweak.plist"
+#define FT_HB_CAND_2 "/var/mobile/Library/Preferences/com.floatingtap.tweak.plist"
+#define FT_HB_CAND_3 "/tmp/com.floatingtap.tweak.plist"
+static const char *FT_HB_PATHS[] = { FT_HB_CAND_0, FT_HB_CAND_1, FT_HB_CAND_2, FT_HB_CAND_3 };
+static int FT_HB_COUNT = sizeof(FT_HB_PATHS) / sizeof(FT_HB_PATHS[0]);
+static int FT_HB_USED = -1; // 上次写成功的路径索引，-1=全部失败
+
+// 暂保持宏兼容（FTApplyConfig / FTReadConfigDict 内部用），但 FTReadConfigDict 改多路径
+#define FT_CFG_PATH "/var/mobile/Library/Preferences/com.floatingtap.config.plist"
+#define FT_HB_PATH  FT_HB_CAND_2  // 默认指向 Preferences，探针会重定向到第一个能写的
 
 // 运行时创建 NSString（禁止 @"..."：arm64e PAC 元数据雷区）
 static id FTStr(const char *s) {
@@ -214,29 +228,91 @@ static id FTStr(const char *s) {
     return ((Msg_StringWithUTF8String)objc_msgSend)((id)ClsStr, sel_registerName("stringWithUTF8String:"), s);
 }
 
-// 写心跳（com.floatingtap.tweak.plist，固定全局路径，手动生成 XML plist，零 ObjC 元数据）
+// 写心跳（v1.0.50-fix3：多路径探针，写第一个能写的 → 记录成功路径 → 下次直接写该路径；
+// 全部失败则记录，留 /tmp/floatingtap_ctor.log 让人查）
 static void FTWriteHeartbeat(void) {
-    FILE *f = fopen(FT_HB_PATH, "w");
-    if (!f) { FTLog("heartbeat write failed"); return; }
-    double now = (double)time(NULL) * 1000.0; // App 端 _time 为毫秒
-    fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-               "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
-               "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-               "<plist version=\"1.0\">\n<dict>\n"
-               "\t<key>_loaded</key>\n\t<true/>\n"
-               "\t<key>_time</key>\n\t<real>%.0f</real>\n"
-               "</dict>\n</plist>\n", now);
-    fclose(f);
-    FTLog("heartbeat written");
+    double now = (double)time(NULL) * 1000.0;
+    int useIdx = FT_HB_USED;
+    int tried = 0;
+
+    // 优先上次成功路径（已确认能写）
+    if (useIdx >= 0 && useIdx < FT_HB_COUNT) {
+        FILE *f = fopen(FT_HB_PATHS[useIdx], "w");
+        if (f) {
+            fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                       "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+                       "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+                       "<plist version=\"1.0\">\n<dict>\n"
+                       "\t<key>_loaded</key>\n\t<true/>\n"
+                       "\t<key>_time</key>\n\t<real>%.0f</real>\n"
+                       "\t<key>_path</key>\n\t<string>%s</string>\n"
+                       "</dict>\n</plist>\n", now, FT_HB_PATHS[useIdx]);
+            fflush(f); fclose(f);
+            FTLog("heartbeat written");
+            return;
+        }
+        // 上次成功路径这次反而写不进去（罕见，可能被 App 改了权限）→ 全路径重探
+        FT_HB_USED = -1;
+    }
+
+    // 全路径探针
+    for (int i = 0; i < FT_HB_COUNT; i++) {
+        FILE *f = fopen(FT_HB_PATHS[i], "w");
+        char diag[256];
+        if (!f) {
+            snprintf(diag, sizeof(diag), "hb probe[%d] %s FAIL errno=%d", i, FT_HB_PATHS[i], errno);
+            FTLog(diag);
+            tried++;
+            continue;
+        }
+        fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                   "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+                   "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+                   "<plist version=\"1.0\">\n<dict>\n"
+                   "\t<key>_loaded</key>\n\t<true/>\n"
+                   "\t<key>_time</key>\n\t<real>%.0f</real>\n"
+                   "\t<key>_path</key>\n\t<string>%s</string>\n"
+                   "</dict>\n</plist>\n", now, FT_HB_PATHS[i]);
+        fflush(f); fclose(f);
+        FT_HB_USED = i;
+        snprintf(diag, sizeof(diag), "hb probe[%d] %s OK", i, FT_HB_PATHS[i]);
+        FTLog(diag);
+        return;
+    }
+    if (tried == FT_HB_COUNT) {
+        FTLog("heartbeat: ALL candidates failed");
+    }
 }
 
-// 读配置（dictionaryWithContentsOfFile: 动态调用，固定全局路径）
+// 读配置（dictionaryWithContentsOfFile: 动态调用，多路径探针——同心跳）
 static id FTReadConfigDict(void) {
-    id fstr = FTStr(FT_CFG_PATH);
-    if (!fstr) return nil;
+    static const char *CFG_PATHS[] = {
+        "/var/mobile/Library/Preferences/com.floatingtap.config.plist",
+        "/var/mobile/Library/Logs/CrashReporter/com.floatingtap.config.plist",
+        "/var/mobile/com.floatingtap.config.plist",
+        "/tmp/com.floatingtap.config.plist",
+    };
+    static int CFG_COUNT = sizeof(CFG_PATHS) / sizeof(CFG_PATHS[0]);
     Class ClsDict = objc_getClass("NSDictionary");
     if (!ClsDict) return nil;
-    return ((Msg_DictWithFile)objc_msgSend)((id)ClsDict, sel_registerName("dictionaryWithContentsOfFile:"), fstr);
+    Class ClsStr = objc_getClass("NSString");
+    if (!ClsStr) return nil;
+    for (int i = 0; i < CFG_COUNT; i++) {
+        id fstr = ((Msg_StringWithUTF8String)objc_msgSend)((id)ClsStr,
+                                                          sel_registerName("stringWithUTF8String:"),
+                                                          CFG_PATHS[i]);
+        if (!fstr) continue;
+        id d = ((Msg_DictWithFile)objc_msgSend)((id)ClsDict,
+                                                sel_registerName("dictionaryWithContentsOfFile:"),
+                                                fstr);
+        if (d) {
+            char diag[256];
+            snprintf(diag, sizeof(diag), "config read ok from %s", CFG_PATHS[i]);
+            FTLog(diag);
+            return d;
+        }
+    }
+    return nil;
 }
 
 static double FTConfigDouble(id dict, const char *key, double def) {
@@ -749,14 +825,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.50 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.50-fix3 loaded (pure C ctor, zero static ObjC metadata, multi-path probe)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.50 ctor run (arm64e, pure C)\n");
+            fprintf(mk, "FloatingTap v1.0.50-fix3 ctor run (arm64e, pure C, multi-path hb probe)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
