@@ -99,6 +99,10 @@ static double  gClickLockX = 0;             // 连点锁定坐标（长按开始
 static double  gClickLockY = 0;
 static dispatch_source_t gClickTimer = NULL; // 连点定时器（SB 端直接注入用）
 
+// v1.0.50：AutoTap App 配置（位置/间隔）——定义在 FTIntervalMs 之前（它要读）
+static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 400.0;
+static int  gCfgLoaded = 0;
+
 // MARK: - 诊断日志（append 到标记文件，Filza 可见；带单调时间戳）
 
 static void FTLog(const char *msg) {
@@ -201,8 +205,6 @@ typedef double     (*Msg_DoubleValue)(id, SEL);
 
 static char gAutoTapSandbox[1024] = "";  // AutoTap App 沙盒路径（缓存）
 static int  gAutoTapSandboxReady = 0;
-static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 400.0;  // App 配置（位置/间隔）
-static int  gCfgLoaded = 0;
 
 // 运行时创建 NSString（禁止 @"..."：arm64e PAC 元数据雷区）
 static id FTStr(const char *s) {
