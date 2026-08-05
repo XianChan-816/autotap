@@ -58,15 +58,21 @@ enum TargetAppManager {
         CFNotificationCenterPostNotification(center, name, nil, nil, true)
     }
 
+    /// Box 类：把 Swift 闭包包装成 NSObject，让 Darwin notification 的 C callback 能安全持有
+    private final class TweakUpdateBox: NSObject {
+        let handler: () -> Void
+        init(_ h: @escaping () -> Void) { self.handler = h }
+        @objc func invoke() { handler() }
+    }
+
     /// App 监听 tweak 数据更新（心跳、App 列表）。收到后回调 handler，由 UI reload。
     static func startListeningForTweakUpdates(handler: @escaping () -> Void) {
-        let observer = Unmanaged.passUnretained(handler as AnyObject).toOpaque()
+        let box = TweakUpdateBox(handler)
+        let observer = Unmanaged.passUnretained(box).toOpaque()
         let cb: CFNotificationCallback = { (_, obs, _, _, _) in
             guard let obs = obs else { return }
-            let h = Unmanaged<AnyObject>.fromOpaque(obs).takeUnretainedValue()
-            DispatchQueue.main.async {
-                (h as? () -> Void)?()
-            }
+            let b = Unmanaged<TweakUpdateBox>.fromOpaque(obs).takeUnretainedValue()
+            DispatchQueue.main.async { b.invoke() }
         }
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(),
