@@ -1,10 +1,13 @@
 //
-//  Tweak.xm — FloatingTap v1.0.33
+//  Tweak.xm — FloatingTap v1.0.34
 //
-//  v1.0.32 异常详情实锤：UIEvent 不响应 KVC _touches（setValue:forUndefinedKey:）——
-//  iOS 15.5 的 UIEvent 字段变了；UITouch 全部正常。触摸因 event 无 touches 而无效。
-//  v1.0.33：UIEvent 改用运行时 C API object_setIvar 直接写 _touches ivar（绕过 KVC），
-//  其余字段暂不设；init 时 dump UIEvent ivar 列表（诊断，若 _touches 不存在可找正确 key）。
+//  v1.0.33 ivar dump 实锤：iOS 15.5 的 UIEvent 没有 _touches ivar——
+//  ivars: _gsEvent _hidEvent _hasValidModifiers _mzModifierFlags _mzClickCount
+//  _buttonMask _cachedScreen _eventObservers _timestamp _eventEnvironment
+//  _trackpadFingerDownCount __initialTouchTimestamp —— 触摸数据存在 _hidEvent/_gsEvent。
+//  v1.0.34：构造 IOHIDEvent（FT_HIDCreateDigitizerEvent）→ object_setInstanceVariable
+//  直写 UIEvent._hidEvent（C 指针 ivar 无 retain）→ [app sendEvent:] —— UIKit 从
+//  _hidEvent 自提取触摸并 hitTest 分发，完全绕开被丢弃的 IOKit 分发层。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  （KVC key 用 FTString 运行时创建 NSString）
@@ -15,6 +18,7 @@
 #import <objc/message.h>
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>   // 仅类型声明（UIWindow/UIEvent），不产生运行时元数据；%hook 需要
+#import <CoreFoundation/CoreFoundation.h>
 #import <stdio.h>
 #import <syslog.h>
 #import <time.h>
@@ -158,22 +162,14 @@ static double FTIntervalMs(void) {
 // 恢复球窗口交互（注入后 60ms 回调）
 static void FTRestoreBallInteractionCallback(void *ctx);
 
-// MARK: - 合成触摸（KVC 方案，v1.0.30 起替代 HID 注入）
-// v1.0.29 诊断证实：IOHIDEventSystemClientDispatchEvent 在 Dopamine+iOS15.5+M1 环境
-// 事件被 IOKit/BackBoard 层丢弃（从未到达 UIWindow sendEvent）。改在 SB 进程内
-// 用 KVC 直接合成 UITouch/UIEvent，调 [UIApplication sendEvent:] —— 等价程序化手指。
+// MARK: - 合成触摸（v1.0.34：IOHIDEvent 塞入 UIEvent._hidEvent，绕开 IOKit 分发层）
+// v1.0.29 证实 HID 注入被 IOKit/BackBoard 层丢弃；v1.0.32/33 证实 iOS 15.5 的 UIEvent
+// 没有 _touches ivar（触摸数据存在 _hidEvent/_gsEvent）。v1.0.34：构造 IOHIDEvent
+// 直接塞 UIEvent._hidEvent（object_setInstanceVariable 写 C 指针 ivar）→ sendEvent，
+// UIKit 从 _hidEvent 自提取触摸坐标并 hitTest 分发 —— 完全绕开失效的 IOKit 分发。
 
-typedef void (*Msg_SetValueForKey)(id, SEL, id, id);
-typedef id   (*Msg_ValueWithCGPoint)(id, SEL, CGPoint);
-typedef id   (*Msg_SetWithObject)(id, SEL, id);
-typedef id   (*Msg_HitTest)(id, SEL, CGPoint, id);
 typedef void (*Msg_SendEvent)(id, SEL, id);
 typedef id   (*Msg_StringWithUTF8String)(id, SEL, const char *);
-typedef id   (*Msg_NumberWithDouble)(id, SEL, double);
-typedef id   (*Msg_NumberWithInt)(id, SEL, int);
-typedef id   (*Msg_NumberWithUnsignedInt)(id, SEL, unsigned int);
-typedef void (*Msg_SetLocationReset)(id, SEL, CGPoint, BOOL);
-typedef BOOL (*Msg_RespondsToSelector)(id, SEL, SEL);
 typedef const char * (*Msg_UTF8String)(id, SEL);
 
 // 运行时创建 NSString（禁止 @"" 字面量：arm64e PAC 元数据雷区）
@@ -183,57 +179,25 @@ static id FTString(const char *s) {
     return ((Msg_StringWithUTF8String)objc_msgSend)((id)ClsStr, sel_registerName("stringWithUTF8String:"), s);
 }
 
-// 构造完整 UITouch（社区 TouchSimulator iOS15 字段集；位置双保险：私有方法优先，KVC 兜底）
-static id FTMakeTouch(int phase, CGPoint pt, id win, double ts) {
-    Class ClsTouch  = objc_getClass("UITouch");
-    Class ClsNumber = objc_getClass("NSNumber");
-    Class ClsValue  = objc_getClass("NSValue");
-    if (!ClsTouch || !ClsNumber) return nil;
-    id touch = FTAlloc(ClsTouch);
-    if (!touch) return nil;
-    touch = ((Msg_Init)objc_msgSend)(touch, sel_registerName("init"));
-    SEL selSetLoc = sel_registerName("_setLocation:resetPrevious:");
-    if (ClsValue && ((Msg_RespondsToSelector)objc_msgSend)(touch, sel_registerName("respondsToSelector:"), selSetLoc)) {
-        ((Msg_SetLocationReset)objc_msgSend)(touch, selSetLoc, pt, YES);
-    } else {
-        // 降级：KVC _locationInWindow（NSValue 包装 CGPoint）
-        ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-            ((Msg_ValueWithCGPoint)objc_msgSend)((id)ClsValue, sel_registerName("valueWithCGPoint:"), pt), FTString("_locationInWindow"));
-    }
-    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"), win, FTString("_window"));
-    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_NumberWithDouble)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithDouble:"), ts), FTString("_timestamp"));
-    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), phase), FTString("_phase"));
-    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_NumberWithUnsignedInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithUnsignedInt:"), 1), FTString("_tapCount"));
-    return touch;
-}
-
-// 构造完整 UIEvent 并 sendEvent。
-// v1.0.32 诊断：UIEvent 不响应 KVC _touches（setValue:forUndefinedKey: 异常）。
-// v1.0.33：用运行时 C API object_setIvar 直接写 _touches ivar（绕过 KVC），
-// 其余字段暂不设（先最小化验证）；ivar 不存在则打日志并跳过。
-static void FTSendEvent(id app, id touch, double ts) {
-    (void)ts;
+// 构造 UIEvent 携带 hid 事件并 sendEvent（_hidEvent 用 object_setInstanceVariable 直写）
+static void FTSendHIDEvent(id app, bool down, double nx, double ny) {
     Class ClsEvent = objc_getClass("UIEvent");
-    Class ClsSet   = objc_getClass("NSSet");
-    if (!ClsEvent || !ClsSet || !app || !touch) return;
-    id set = ((Msg_SetWithObject)objc_msgSend)((id)ClsSet, sel_registerName("setWithObject:"), touch);
-    if (!set) return;
-    id event = FTAlloc(ClsEvent);
-    if (!event) return;
-    event = ((Msg_Init)objc_msgSend)(event, sel_registerName("init"));
-    Ivar ivarTouches = class_getInstanceVariable(ClsEvent, "_touches");
-    if (!ivarTouches) {
-        FTLog("UIEvent no _touches ivar");
+    if (!ClsEvent || !app) return;
+    FT_IOHIDEventRef hid = FT_HIDCreateDigitizerEvent(down, nx, ny);
+    if (!hid) {
+        FTLog("hid event create failed");
         return;
     }
-    object_setIvar(event, ivarTouches, set);
+    id event = FTAlloc(ClsEvent);
+    if (!event) { CFRelease(hid); return; }
+    event = ((Msg_Init)objc_msgSend)(event, sel_registerName("init"));
+    // _hidEvent 是 void* 指针 ivar：object_setInstanceVariable 直写（无 retain/release）
+    object_setInstanceVariable(event, "_hidEvent", hid);
     ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
+    CFRelease(hid);
 }
 
-// 诊断：dump UIEvent 的 ivar 名（若 _touches 不存在，从日志找正确 key）
+// 诊断：dump UIEvent 的 ivar 名（已确认有 _hidEvent/_gsEvent）
 static void FTDumpEventIvars(void) {
     Class ClsEvent = objc_getClass("UIEvent");
     if (!ClsEvent) return;
@@ -255,40 +219,19 @@ static void FTDumpEventIvars(void) {
     FTLog(buf);
 }
 
-// 在屏幕像素点 (px,py) 发一次合成点击（down + up 独立对象；@try 兜底防 SB 崩溃）
+// 在屏幕像素点 (px,py) 发一次合成点击（down + up 两个 hid 事件；@try 兜底防 SB 崩溃）
 static void FTSyntheticTap(double px, double py) {
     @try {
         Class ClsApp = objc_getClass("UIApplication");
         if (!ClsApp) return;
         id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
         if (!app) return;
-        id wins = ((Msg_Send)objc_msgSend)(app, sel_registerName("windows"));
-        if (!wins) return;
-        NSUInteger n = ((Msg_Count)objc_msgSend)(wins, sel_registerName("count"));
-
-        // 1. 找触摸点命中的窗口（跳过球窗口，球窗口交互已由调用方关闭）
-        CGPoint pt = CGPointMake(px, py);
-        id targetWin = nil;
-        for (NSUInteger i = 0; i < n; i++) {
-            id w = ((Msg_ObjectAtIndex)objc_msgSend)(wins, sel_registerName("objectAtIndex:"), i);
-            if (!w || w == gBallWindow) continue;
-            id hit = ((Msg_HitTest)objc_msgSend)(w, sel_registerName("hitTest:withEvent:"), pt, nil);
-            if (hit) { targetWin = w; break; }
-        }
-        if (!targetWin) {
-            FTLog("synthetic tap: no target window at point");
-            return;
-        }
-
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-
-        // 2. down（独立对象，phase=Began）→ up（独立对象，phase=Ended）
-        id touchDown = FTMakeTouch(0, pt, targetWin, now);
-        if (touchDown) FTSendEvent(app, touchDown, now);
-        id touchUp = FTMakeTouch(3, pt, targetWin, now);
-        if (touchUp) FTSendEvent(app, touchUp, now);
+        double nx = (gScreenW > 0) ? px / gScreenW : 0.5;
+        double ny = (gScreenH > 0) ? py / gScreenH : 0.5;
+        if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
+        if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
+        FTSendHIDEvent(app, true, nx, ny);   // down
+        FTSendHIDEvent(app, false, nx, ny);  // up
     } @catch (NSException *ex) {
         (void)ex;
         const char *detail = "?";
@@ -592,10 +535,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.33 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.34 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.33 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.34 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),

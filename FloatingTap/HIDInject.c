@@ -152,7 +152,9 @@ static uint64_t FT_SenderID(void) {
 // - 坐标直传事件本体（归一化 0~1）；时间戳 mach_absolute_time() 原始值；
 // - 关键：IOHIDEventSetIntegerValue(isDisplayIntegrated=1, index=1, identity=1)，
 //   否则系统可能丢弃合成触摸。
-static FT_IOHIDEventRef FT_DigitizerEvent(bool down, double x, double y) {
+// 导出供 Tweak.xm 塞入 UIEvent._hidEvent（绕开 IOKit 分发层）。
+FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y) {
+    if (!p_IOHIDEventCreateDigitizerEvent) return NULL;
     uint32_t mask = down
         ? (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventTouch |
            FT_kIOHIDDigitizerEventPosition)
@@ -199,6 +201,6 @@ static void FT_DispatchEvent(FT_IOHIDEventRef event) {
 
 void FT_HIDTapAt(double normalizedX, double normalizedY) {
     if (!g_hidClient) return;
-    FT_DispatchEvent(FT_DigitizerEvent(true, normalizedX, normalizedY));
-    FT_DispatchEvent(FT_DigitizerEvent(false, normalizedX, normalizedY));
+    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(true, normalizedX, normalizedY));
+    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(false, normalizedX, normalizedY));
 }
