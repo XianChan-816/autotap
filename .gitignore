@@ -11,3 +11,4 @@ DerivedData/
 # WorkBuddy 本地工作数据（不入库）
 .workbuddy/
 runs.json
+wf.json
