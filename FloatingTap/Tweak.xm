@@ -541,6 +541,8 @@ static void FTEnsureBallCallback(void *ctx) {
 static void FTTweakInitCallback(void *ctx) {
     (void)ctx;
     FTLog("init callback, calling FTEnsureBall");
+    // 启动 senderID 捕获（zxtouch 机制：用户下次真实触摸时提取设备专属 senderID）
+    FT_HIDStartSenderIDCapture();
     FTDumpEventIvars();
     FTEnsureBall(0);
 }

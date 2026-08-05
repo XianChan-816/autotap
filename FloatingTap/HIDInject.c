@@ -68,9 +68,11 @@ static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerEvent)(CFAllocatorRef,
 static FT_IOHIDEventSystemClientRef (*p_IOHIDEventSystemClientCreate)(CFAllocatorRef);
 static FT_IOReturn (*p_IOHIDEventSystemClientDispatchEvent)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef);
 static void (*p_IOHIDEventSystemClientScheduleWithRunLoop)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef);
-static void (*p_IOHIDEventSystemClientSetDispatchQueue)(FT_IOHIDEventSystemClientRef, dispatch_queue_t);
+static void (*p_IOHIDEventSystemClientUnscheduleWithRunLoop)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef);
+static void (*p_IOHIDEventSystemClientRegisterEventCallback)(FT_IOHIDEventSystemClientRef, FT_IOHIDSystemCallback, void *, void *);
 static void (*p_IOHIDEventSetSenderID)(FT_IOHIDEventRef, uint64_t);
 static void (*p_IOHIDEventSetIntegerValue)(FT_IOHIDEventRef, uint32_t, int64_t);
+static uint64_t (*p_IOHIDEventGetSenderID)(FT_IOHIDEventRef);
 
 // MARK: - 状态
 
@@ -100,12 +102,16 @@ static bool FT_HIDLoadSymbols(void) {
         (FT_IOReturn (*)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef))dlsym(handle, "IOHIDEventSystemClientDispatchEvent");
     p_IOHIDEventSystemClientScheduleWithRunLoop =
         (void (*)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef))dlsym(handle, "IOHIDEventSystemClientScheduleWithRunLoop");
-    p_IOHIDEventSystemClientSetDispatchQueue =
-        (void (*)(FT_IOHIDEventSystemClientRef, dispatch_queue_t))dlsym(handle, "IOHIDEventSystemClientSetDispatchQueue");
+    p_IOHIDEventSystemClientUnscheduleWithRunLoop =
+        (void (*)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef))dlsym(handle, "IOHIDEventSystemClientUnscheduleWithRunLoop");
+    p_IOHIDEventSystemClientRegisterEventCallback =
+        (void (*)(FT_IOHIDEventSystemClientRef, FT_IOHIDSystemCallback, void *, void *))dlsym(handle, "IOHIDEventSystemClientRegisterEventCallback");
     p_IOHIDEventSetSenderID =
         (void (*)(FT_IOHIDEventRef, uint64_t))dlsym(handle, "IOHIDEventSetSenderID");
     p_IOHIDEventSetIntegerValue =
         (void (*)(FT_IOHIDEventRef, uint32_t, int64_t))dlsym(handle, "IOHIDEventSetIntegerValue");
+    p_IOHIDEventGetSenderID =
+        (uint64_t (*)(FT_IOHIDEventRef))dlsym(handle, "IOHIDEventGetSenderID");
 
     g_hidLoaded = (p_IOHIDEventCreateDigitizerEvent &&
                    p_IOHIDEventSystemClientCreate &&
@@ -127,12 +133,9 @@ bool FT_HIDConnect(void) {
         syslog(LOG_ERR, "FloatingTap HID client create failed");
         return false;
     }
-    // 部分 iOS 版本需要 client 挂 runloop/dispatch queue 才会真正派发事件（符号存在则挂，失败无害）
+    // 部分 iOS 版本需要 client 挂 runloop 才会真正派发事件（符号存在则挂，失败无害）
     if (p_IOHIDEventSystemClientScheduleWithRunLoop) {
         p_IOHIDEventSystemClientScheduleWithRunLoop(g_hidClient, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
-    }
-    if (p_IOHIDEventSystemClientSetDispatchQueue) {
-        p_IOHIDEventSystemClientSetDispatchQueue(g_hidClient, dispatch_get_main_queue());
     }
     syslog(LOG_ERR, "FloatingTap HID connected");
     return true;
@@ -142,11 +145,52 @@ bool FT_HIDIsConnected(void) {
     return g_hidClient != NULL;
 }
 
-// MARK: - 事件构造
+// MARK: - senderID 捕获（zxtouch 机制：从真实触摸提取设备专属 senderID）
 
-static uint64_t FT_SenderID(void) {
-    return 0x8000000817371935ULL;
+static uint64_t g_deviceSenderID = 0;
+static FT_IOHIDEventSystemClientRef g_sidClient = NULL;
+
+static void FT_SIDCallback(void *target, void *refcon, FT_IOHIDServiceRef service, FT_IOHIDEventRef event) {
+    (void)target; (void)refcon; (void)service;
+    if (!event || g_deviceSenderID) return;
+    if (p_IOHIDEventGetSenderID) {
+        uint64_t sid = p_IOHIDEventGetSenderID(event);
+        if (sid) {
+            g_deviceSenderID = sid;
+            syslog(LOG_ERR, "FloatingTap captured senderID: 0x%llx", (unsigned long long)sid);
+            // 提取到后注销捕获 client
+            if (g_sidClient) {
+                if (p_IOHIDEventSystemClientUnscheduleWithRunLoop) {
+                    p_IOHIDEventSystemClientUnscheduleWithRunLoop(g_sidClient, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+                }
+                CFRelease(g_sidClient);
+                g_sidClient = NULL;
+            }
+        }
+    }
 }
+
+void FT_HIDStartSenderIDCapture(void) {
+    if (g_sidClient || g_deviceSenderID) return;
+    if (!FT_HIDLoadSymbols()) return;
+    if (!p_IOHIDEventSystemClientRegisterEventCallback) {
+        syslog(LOG_ERR, "FloatingTap no register callback symbol");
+        return;
+    }
+    g_sidClient = p_IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+    if (!g_sidClient) return;
+    p_IOHIDEventSystemClientRegisterEventCallback(g_sidClient, FT_SIDCallback, NULL, NULL);
+    if (p_IOHIDEventSystemClientScheduleWithRunLoop) {
+        p_IOHIDEventSystemClientScheduleWithRunLoop(g_sidClient, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
+    }
+    syslog(LOG_ERR, "FloatingTap senderID capture started");
+}
+
+uint64_t FT_HIDSenderID(void) {
+    return g_deviceSenderID ? g_deviceSenderID : 0x8000000817371935ULL;
+}
+
+// MARK: - 事件构造
 
 // 经典单事件写法（zxtouch/autotouch 在 iOS 13-16 验证有效）：
 // - type 参数必须是转换器类型 kIOHIDDigitizerTransducerTypeHand(3)，不是事件类型(11)；
@@ -189,12 +233,16 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y) {
         // kIOHIDEventFieldDigitizerIsDisplayIntegrated = 0x0B0014 —— 屏幕集成触摸标记
         p_IOHIDEventSetIntegerValue(event, 0x0B0014, 1);
     }
+    // senderID：优先用捕获的设备专属值（zxtouch 机制），兜底硬编码
+    if (event && p_IOHIDEventSetSenderID) {
+        p_IOHIDEventSetSenderID(event, FT_HIDSenderID());
+    }
     return event;
 }
 
 static void FT_DispatchEvent(FT_IOHIDEventRef event) {
     if (!event || !g_hidClient) return;
-    p_IOHIDEventSetSenderID(event, FT_SenderID());
+    p_IOHIDEventSetSenderID(event, FT_HIDSenderID());
     FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, event);
     if (ret != FT_kIOReturnSuccess) {
         syslog(LOG_ERR, "FloatingTap DispatchEvent failed 0x%x", (unsigned)ret);

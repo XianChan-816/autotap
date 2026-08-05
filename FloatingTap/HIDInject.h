@@ -34,6 +34,14 @@ void FT_HIDTapAt(double normalizedX, double normalizedY);
 // 供 Tweak.xm 塞入 UIEvent._hidEvent 使用（绕开 IOKit 分发层）。
 FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double normalizedX, double normalizedY);
 
+// 启动 senderID 捕获（zxtouch 机制：从真实触摸提取设备专属 senderID，
+// 硬编码 0x8000000817371935 可能被 iOS 拒绝）。注册 IOHIDEventSystemClient 回调，
+// 首次真实触摸后提取并缓存，然后自动注销。
+void FT_HIDStartSenderIDCapture(void);
+
+// 返回已捕获的 senderID（未捕获到则回退硬编码值）
+uint64_t FT_HIDSenderID(void);
+
 #ifdef __cplusplus
 }
 #endif
