@@ -24,6 +24,14 @@ import UIKit
 import CoreFoundation
 import Darwin
 
+// CFMessagePort 回调：@convention(c) 函数指针要求闭包**零捕获**，必须放文件顶层；
+// 内部引用类型成员一律用全限定名 TargetAppManager.xxx（静态访问不算捕获）。
+private let kAutoTapMsgPortCallback: CFMessagePortCallBack = { _, msgid, data, _ in
+    guard let d = data else { return nil }
+    TargetAppManager.handleMessage(msgid: msgid, data: d)
+    return nil
+}
+
 enum TargetAppManager {
 
     // MARK: - IPC 基础设施（v1.0.52）
@@ -76,13 +84,8 @@ enum TargetAppManager {
         if serverPort != nil { return }
         loadRocketBootstrap()
         let name = "com.floatingtap.autotap" as CFString
-        let callback: CFMessagePortCallBack = { _, msgid, data, _ in
-            guard let data = data else { return nil }
-            handleMessage(msgid: msgid, data: data)
-            return nil
-        }
         var ctx = CFMessagePortContext(version: 0, info: nil, retain: nil, release: nil, copyDescription: nil)
-        guard let port = CFMessagePortCreateLocal(nil, name, callback, &ctx, nil) else {
+        guard let port = CFMessagePortCreateLocal(nil, name, kAutoTapMsgPortCallback, &ctx, nil) else {
             ipcReady = false
             return
         }
@@ -94,8 +97,8 @@ enum TargetAppManager {
         ipcReady = true
     }
 
-    /// 解析 tweak 推来的消息
-    private static func handleMessage(msgid: Int32, data: CFData) {
+    /// 解析 tweak 推来的消息（fileprivate：供文件顶层 kAutoTapMsgPortCallback 调用）
+    fileprivate static func handleMessage(msgid: Int32, data: CFData) {
         guard let plist = CFPropertyListCreateWithData(nil, data, 0, nil, nil),
               let dict = plist.takeRetainedValue() as? [String: Any] else { return }
         if msgid == 1 {   // heartbeat
