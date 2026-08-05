@@ -17,8 +17,10 @@
 
 #import "FloatingBallView.h"
 #import <notify.h>
-#import <libproc.h>
 #import <dlfcn.h>
+#import <sys/types.h>
+#import <sys/sysctl.h>
+#import <sys/param.h>
 
 // Darwin notification 名（与 AutoTap/Sources/TargetAppManager.swift 严格一致）
 static NSString *const kFTNotifyAppStarted = @"com.floatingtap.autotap.appStarted";
@@ -41,23 +43,26 @@ static void FTSandboxLoad(void) {
 static pid_t gAppPID = 0;  // 0 = 未发现
 
 // 通过进程名查找 PID（找所有同名进程的最新一个）
+// 用 sysctl KERN_PROC_ALL 枚举（公开 POSIX API，iOS SDK 头文件齐全；
+// proc_listpids/proc_name 是 macOS 专用头文件 libproc.h，iOS SDK 没有）
 static pid_t FTFindAppPID(void) {
-    int nb = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
-    if (nb <= 0) return 0;
-    pid_t *pids = (pid_t *)malloc(nb * sizeof(pid_t));
-    if (!pids) return 0;
-    int count = proc_listpids(PROC_ALL_PIDS, 0, pids, nb * sizeof(pid_t));
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t size = 0;
+    if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0 || size == 0) return 0;
+    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(size);
+    if (!procs) return 0;
     pid_t found = 0;
-    for (int i = 0; i < count; i++) {
-        if (pids[i] == 0) continue;
-        char name[PATH_MAX] = {0};
-        if (proc_name(pids[i], name, sizeof(name)) > 0) {
-            if (strcmp(name, "AutoTap") == 0) {
-                found = pids[i];  // 取最后一个（一般是前台）
+    if (sysctl(mib, 4, procs, &size, NULL, 0) == 0) {
+        int count = (int)(size / sizeof(struct kinfo_proc));
+        for (int i = 0; i < count; i++) {
+            const char *comm = procs[i].kp_proc.p_comm;
+            if (comm[0] == '\0') continue;
+            if (strncmp(comm, "AutoTap", strlen("AutoTap")) == 0) {
+                found = procs[i].kp_proc.p_pid;  // 取最后一个（一般是前台）
             }
         }
     }
-    free(pids);
+    free(procs);
     return found;
 }
 
