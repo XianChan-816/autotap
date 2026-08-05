@@ -247,7 +247,7 @@ static int              gIPCAvailable = 0;    // RocketBootstrap 加载且 serve
 
 // 前向声明（定义在文件后段）
 static void FTMoveBallToConfig(void);
-static void FTMessagePortCallback(CFMessagePortRef local, SInt32 msgid, CFDataRef data, void *info);
+static CFDataRef FTMessagePortCallback(CFMessagePortRef local, SInt32 msgid, CFDataRef data, void *info);
 
 // 应用 App 推来的 config（CoreFoundation CFDictionary，纯 C，无 ObjC）
 static void FTApplyConfigFromIPC(CFDictionaryRef dict) {
@@ -256,12 +256,12 @@ static void FTApplyConfigFromIPC(CFDictionaryRef dict) {
     CFStringRef kX = FTCreateCFStr("ClickX");
     CFStringRef kY = FTCreateCFStr("ClickY");
     CFStringRef kMs = FTCreateCFStr("IntervalMs");
-    CFNumberRef v;
-    if (kX && (v = CFDictionaryGetValue(dict, kX)) && CFGetTypeID(v) == CFNumberGetTypeID())
+    CFNumberRef v = NULL;
+    if (kX && (v = (CFNumberRef)CFDictionaryGetValue(dict, kX)) && CFGetTypeID(v) == CFNumberGetTypeID())
         CFNumberGetValue(v, kCFNumberDoubleType, &nx);
-    if (kY && (v = CFDictionaryGetValue(dict, kY)) && CFGetTypeID(v) == CFNumberGetTypeID())
+    if (kY && (v = (CFNumberRef)CFDictionaryGetValue(dict, kY)) && CFGetTypeID(v) == CFNumberGetTypeID())
         CFNumberGetValue(v, kCFNumberDoubleType, &ny);
-    if (kMs && (v = CFDictionaryGetValue(dict, kMs)) && CFGetTypeID(v) == CFNumberGetTypeID())
+    if (kMs && (v = (CFNumberRef)CFDictionaryGetValue(dict, kMs)) && CFGetTypeID(v) == CFNumberGetTypeID())
         CFNumberGetValue(v, kCFNumberDoubleType, &ms);
     if (kX) CFRelease(kX); if (kY) CFRelease(kY); if (kMs) CFRelease(kMs);
     if (nx < 0) nx = 0; if (nx > 1) nx = 1;
@@ -389,7 +389,8 @@ static void FTSetupIPCServer(void) {
 }
 
 // server 回调（App→tweak）：msgid 0=config, 2=request apps
-static void FTMessagePortCallback(CFMessagePortRef local, SInt32 msgid, CFDataRef data, void *info) {
+// CFMessagePortCallBack 签名要求返回 CFDataRef（回复数据，无回复返回 NULL）
+static CFDataRef FTMessagePortCallback(CFMessagePortRef local, SInt32 msgid, CFDataRef data, void *info) {
     (void)local; (void)info;
     if (msgid == 0 && data) {
         CFErrorRef err = NULL;
@@ -405,6 +406,7 @@ static void FTMessagePortCallback(CFMessagePortRef local, SInt32 msgid, CFDataRe
     } else if (msgid == 2) {
         FTSendAppsListIPC();
     }
+    return NULL;
 }
 
 // Darwin 通知回调（纯 C；observer=静态占位，靠 name 区分）——只作唤醒信号，数据走 IPC

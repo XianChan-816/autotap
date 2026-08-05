@@ -77,12 +77,12 @@ enum TargetAppManager {
         loadRocketBootstrap()
         let name = "com.floatingtap.autotap" as CFString
         let callback: CFMessagePortCallBack = { _, msgid, data, _ in
-            guard let data = data?.takeUnretainedValue() else { return nil }
+            guard let data = data else { return nil }
             handleMessage(msgid: msgid, data: data)
             return nil
         }
         var ctx = CFMessagePortContext(version: 0, info: nil, retain: nil, release: nil, copyDescription: nil)
-        guard let port = CFMessagePortCreateLocal(nil, name, callback, &ctx) else {
+        guard let port = CFMessagePortCreateLocal(nil, name, callback, &ctx, nil) else {
             ipcReady = false
             return
         }
@@ -96,7 +96,7 @@ enum TargetAppManager {
 
     /// 解析 tweak 推来的消息
     private static func handleMessage(msgid: Int32, data: CFData) {
-        guard let plist = CFPropertyListCreateWithData(nil, data, .mutableContainersAndLeaves, nil, nil),
+        guard let plist = CFPropertyListCreateWithData(nil, data, 0, nil, nil),
               let dict = plist.takeRetainedValue() as? [String: Any] else { return }
         if msgid == 1 {   // heartbeat
             if let t = dict["_time"] as? NSNumber {
@@ -117,14 +117,12 @@ enum TargetAppManager {
         guard let data = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0) else { return }
         guard let remote = CFMessagePortCreateRemote(nil, "com.floatingtap.tweak" as CFString) else { return }
         _ = CFMessagePortSendRequest(remote, 0, data as CFData, 5.0, 0.0, nil, nil)
-        CFRelease(remote)
     }
 
     /// 请求 tweak 重新推送 App 列表（msgid=2）
     static func requestAppsList() {
         guard let remote = CFMessagePortCreateRemote(nil, "com.floatingtap.tweak" as CFString) else { return }
         _ = CFMessagePortSendRequest(remote, 2, nil, 5.0, 0.0, nil, nil)
-        CFRelease(remote)
     }
 
     // MARK: - Darwin 通知名（跨进程 ABI，与 tweak 一字不差）
