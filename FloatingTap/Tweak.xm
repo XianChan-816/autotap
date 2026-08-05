@@ -169,17 +169,9 @@ static void FTRestoreBallInteractionCallback(void *ctx);
 // UIKit 从 _hidEvent 自提取触摸坐标并 hitTest 分发 —— 完全绕开失效的 IOKit 分发。
 
 typedef void (*Msg_SendEvent)(id, SEL, id);
-typedef id   (*Msg_StringWithUTF8String)(id, SEL, const char *);
 typedef const char * (*Msg_UTF8String)(id, SEL);
 
-// 运行时创建 NSString（禁止 @"" 字面量：arm64e PAC 元数据雷区）
-static id FTString(const char *s) {
-    Class ClsStr = objc_getClass("NSString");
-    if (!ClsStr) return nil;
-    return ((Msg_StringWithUTF8String)objc_msgSend)((id)ClsStr, sel_registerName("stringWithUTF8String:"), s);
-}
-
-// 构造 UIEvent 携带 hid 事件并 sendEvent（_hidEvent 用 object_setInstanceVariable 直写）
+// 构造 UIEvent 携带 hid 事件并 sendEvent（_hidEvent 用 ivar offset 直接内存写）
 static void FTSendHIDEvent(id app, bool down, double nx, double ny) {
     Class ClsEvent = objc_getClass("UIEvent");
     if (!ClsEvent || !app) return;
