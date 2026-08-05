@@ -63,7 +63,7 @@ enum TargetAppManager {
     /// App 启动时调用：通知 tweak 通过 sysctl 找 App PID 后开始写数据
     /// 用 notify_post（纯 C 机制，不经 CFNotificationCenter，避免初始化成本）
     static func notifyAppStarted() {
-        notify_post(notifyAppStartedName)
+        notifyAppStartedName.withCString { notify_post($0) }
     }
 
     /// App 端轮询心跳文件变化（每 2s 检查 tweak.plist 的 _time 字段，变化就 reload）
@@ -137,7 +137,7 @@ enum TargetAppManager {
     /// 写配置 + 通知 tweak（Darwin notification 无 payload，tweak 收到后从 App 沙盒反查读 config）
     private static func writeConfig(_ dict: NSDictionary) {
         dict.write(toFile: configPath, atomically: true)
-        notify_post(notifyConfigUpdatedName)
+        notifyConfigUpdatedName.withCString { notify_post($0) }
     }
 
     // MARK: - 已安装 App 枚举
