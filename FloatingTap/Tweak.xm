@@ -1,10 +1,11 @@
 //
-//  Tweak.xm — FloatingTap v1.0.27
+//  Tweak.xm — FloatingTap v1.0.28
 //
-//  v1.0.26 用户问「25 版本能拖动？」：日志从 v1.0.21 起从未出现 pan began——
-//  Pan 手势被 Long（minimumPressDuration=0 抢先 Began）压制，拖动从未生效。
-//  v1.0.27：删除 Pan GR，拖动并入 Long GR 的 Changed 状态（按住=连点，
-//  按住移动=拖动球，松手=停），彻底消除手势冲突。
+//  v1.0.27 实测：拖动 ✅（Long GR Changed 状态修复成功）；连点 ❌ 屏幕无反应。
+//  重大推断：注入坐标=球心，球窗口(windowLevel 1001)恰好挡在球心，注入的 HID 触摸
+//  先命中自家球窗口被拦截 → 下层图标/按钮永远收不到 → "日志一切正常但屏幕没反应"。
+//  v1.0.28：注入瞬间 setUserInteractionEnabled:NO（窗口不参与 hitTest → 注入触摸
+//  穿透到下层），60ms 后恢复。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
@@ -152,7 +153,13 @@ static double FTIntervalMs(void) {
     return 200.0;
 }
 
-// 连点回调：在球心发一次 HID 点击
+// 恢复球窗口交互（注入后 60ms 回调）
+static void FTRestoreBallInteractionCallback(void *ctx);
+
+// 连点回调：在球心发一次 HID 点击。
+// ⚠️ 关键：注入坐标=球心，球窗口(windowLevel 1001)正好在球心，注入触摸会先命中
+// 球窗口被吃掉 → 下层永远收不到 → "屏幕没反应"。因此注入瞬间关掉球窗口交互
+// （userInteractionEnabled=NO，窗口不参与 hitTest，注入触摸穿透），60ms 后恢复。
 static void FTClickCallback(void *ctx) {
     (void)ctx;
     if (!gBallWindow || !gIsClicking) return;
@@ -166,8 +173,22 @@ static void FTClickCallback(void *ctx) {
     if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
     if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
 
+    // 注入前：球窗口不参与 hitTest → 注入触摸穿透到下层
+    ((Msg_SetUserInteractionEnabled)objc_msgSend)(gBallWindow, sel_registerName("setUserInteractionEnabled:"), NO);
+
     FT_HIDTapAt(nx, ny);
     gClickCount++;
+
+    // 60ms 后恢复交互（连点 200ms 间隔，恢复后用户可松手停止）
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), NULL, FTRestoreBallInteractionCallback);
+}
+
+static void FTRestoreBallInteractionCallback(void *ctx) {
+    (void)ctx;
+    if (gBallWindow) {
+        ((Msg_SetUserInteractionEnabled)objc_msgSend)(gBallWindow, sel_registerName("setUserInteractionEnabled:"), YES);
+    }
 }
 
 static void FTStartClicking(void) {
@@ -389,10 +410,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.27 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.28 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.25 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.28 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
