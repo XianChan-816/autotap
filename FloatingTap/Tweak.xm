@@ -726,6 +726,9 @@ static void FTEnsureBallCallback(void *ctx) {
 static void FTTweakInitCallback(void *ctx) {
     (void)ctx;
     FTLog("init callback, calling FTEnsureBall");
+    // v1.0.50：App 通信（注册通知 + 反查沙盒 + 心跳 + 读配置）——必须在 SB 完全启动后
+    // （ctor 阶段任何 ObjC 调用在 arm64e 下 PAC 崩，v1.0.50 实测 Safe Mode）
+    FTRegisterNotifications();
     // 启动 senderID 捕获（zxtouch 机制：用户下次真实触摸时提取设备专属 senderID）
     FT_HIDStartSenderIDCapture();
     FTDumpEventIvars();
@@ -806,8 +809,9 @@ static void FTTweakCtor(void) {
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
 
-        // v1.0.50：注册 Darwin 通知监听（appStarted/configUpdated）+ 立即尝试反查沙盒/心跳/读配置
-        FTRegisterNotifications();
+        // ⚠️ v1.0.50 教训：FTRegisterNotifications 不能放 ctor——它内部有 ObjC 动态调用
+        // （FTStr/NSDictionary），%ctor 阶段 ObjC 调用在 arm64e 下 PAC 崩 → Safe Mode。
+        // 已移到 FTTweakInitCallback（SB 完全启动 30s 后）。
 
         // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
         dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
