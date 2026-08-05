@@ -160,69 +160,25 @@ static double FTIntervalMs(void) {
 // 恢复球窗口交互（注入后 60ms 回调）
 static void FTRestoreBallInteractionCallback(void *ctx);
 
-// MARK: - 合成触摸（v1.0.34：IOHIDEvent 塞入 UIEvent._hidEvent，绕开 IOKit 分发层）
-// v1.0.29 证实 HID 注入被 IOKit/BackBoard 层丢弃；v1.0.32/33 证实 iOS 15.5 的 UIEvent
-// 没有 _touches ivar（触摸数据存在 _hidEvent/_gsEvent）。v1.0.34：构造 IOHIDEvent
-// 直接塞 UIEvent._hidEvent（object_setInstanceVariable 写 C 指针 ivar）→ sendEvent，
-// UIKit 从 _hidEvent 自提取触摸坐标并 hitTest 分发 —— 完全绕开失效的 IOKit 分发。
+// MARK: - 连点注入（v1.0.39：IOHIDEventSystemClientDispatchEvent 直接派发 = zxtouch 全套）
+// v1.0.38 实测：senderID 捕获成功（0x1000006dc，证实硬编码 0x8000000817371935 是错的）；
+// GSEventCreateTouchEvent 符号在 iOS 15.5 不存在（gs event create unavailable）。
+// v1.0.37 已修 15 参数 → 重新走 DispatchEvent 直接派发（zxtouch 原版路径：
+// 15参构造 + 真实 senderID + IOHIDEventSystemClientDispatchEvent）。
+// 注入前关球窗口交互（穿透），60ms 后恢复（FTClickCallback 处理）。
 
-typedef void (*Msg_SendEvent)(id, SEL, id);
-typedef const char * (*Msg_UTF8String)(id, SEL);
-
-// MARK: - GSEvent（老 UIKit 触摸路径，iOS 15 的 GraphicsServices 仍加载在进程里）
-
-typedef struct __GSEvent *FT_GSEventRef;
-static FT_GSEventRef (*p_GSEventCreateTouchEvent)(CGPoint, CGPoint, NSTimeInterval, unsigned int);
-static bool g_gsLoaded = false;
-
-static void FTLoadGSEvent(void) {
-    if (g_gsLoaded) return;
-    p_GSEventCreateTouchEvent = (FT_GSEventRef (*)(CGPoint, CGPoint, NSTimeInterval, unsigned int))
-        dlsym(RTLD_DEFAULT, "GSEventCreateTouchEvent");
-    g_gsLoaded = true;
-}
-
-// 构造 UIEvent 携带 GSEvent 并 sendEvent（v1.0.38：只走 _gsEvent 单通道验证，
-// 排除 _hidEvent 干扰；GSEventCreateTouchEvent 是 iOS 15 GraphicsServices 老触摸路径）
-static void FTSendHIDEvent(id app, bool down, double nx, double ny) {
-    Class ClsEvent = objc_getClass("UIEvent");
-    if (!ClsEvent || !app) return;
-    FTLoadGSEvent();
-    if (!p_GSEventCreateTouchEvent) {
-        FTLog("gs event create unavailable");
-        return;
+// 在屏幕像素点 (px,py) 发一次合成点击（HID DispatchEvent 派发，@try 兜底防崩）
+static void FTSyntheticTap(double px, double py) {
+    @try {
+        double nx = (gScreenW > 0) ? px / gScreenW : 0.5;
+        double ny = (gScreenH > 0) ? py / gScreenH : 0.5;
+        if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
+        if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
+        FT_HIDTapAt(nx, ny);
+    } @catch (NSException *ex) {
+        (void)ex;
+        FTLog("inject exception");
     }
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-
-    FT_GSEventRef gs = p_GSEventCreateTouchEvent(CGPointMake(nx * gScreenW, ny * gScreenH),
-                                                 CGPointZero, now, 0);
-    if (!gs) {
-        FTLog("gs event create failed");
-        return;
-    }
-    id event = FTAlloc(ClsEvent);
-    if (!event) { CFRelease(gs); return; }
-    event = ((Msg_Init)objc_msgSend)(event, sel_registerName("init"));
-    char *base = (char *)(__bridge void *)event;
-
-    Ivar ivarGs = class_getInstanceVariable(ClsEvent, "_gsEvent");
-    if (!ivarGs) {
-        FTLog("UIEvent no _gsEvent ivar");
-        CFRelease(gs);
-        return;
-    }
-    *(void **)(base + ivar_getOffset(ivarGs)) = gs;
-
-    Ivar ivarTs = class_getInstanceVariable(ClsEvent, "_timestamp");
-    if (ivarTs) {
-        *(double *)(base + ivar_getOffset(ivarTs)) = now;
-    }
-
-    ((Msg_SendEvent)objc_msgSend)(app, sel_registerName("sendEvent:"), event);
-    CFRelease(gs);
-}
 
 // 诊断：dump UIEvent 的 ivar 名（已确认有 _hidEvent/_gsEvent）
 static void FTDumpEventIvars(void) {
@@ -244,38 +200,6 @@ static void FTDumpEventIvars(void) {
     }
     free(ivars);
     FTLog(buf);
-}
-
-// 在屏幕像素点 (px,py) 发一次合成点击（down + up 两个 hid 事件；@try 兜底防 SB 崩溃）
-static void FTSyntheticTap(double px, double py) {
-    @try {
-        Class ClsApp = objc_getClass("UIApplication");
-        if (!ClsApp) return;
-        id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
-        if (!app) return;
-        double nx = (gScreenW > 0) ? px / gScreenW : 0.5;
-        double ny = (gScreenH > 0) ? py / gScreenH : 0.5;
-        if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
-        if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
-        FTSendHIDEvent(app, true, nx, ny);   // down
-        FTSendHIDEvent(app, false, nx, ny);  // up
-    } @catch (NSException *ex) {
-        (void)ex;
-        const char *detail = "?";
-        id desc = nil;
-        @try {
-            desc = ((Msg_Send)objc_msgSend)(ex, sel_registerName("description"));
-            if (desc) {
-                const char *u = ((Msg_UTF8String)objc_msgSend)(desc, sel_registerName("UTF8String"));
-                if (u) detail = u;
-            }
-        } @catch (NSException *e2) {
-            (void)e2;
-        }
-        char buf[256];
-        snprintf(buf, sizeof(buf), "synthetic tap exception: %.200s", detail);
-        FTLog(buf);
-    }
 }
 
 // 连点回调：在球心发一次合成点击。
@@ -318,6 +242,10 @@ static void FTRestoreBallInteractionCallback(void *ctx) {
 
 static void FTStartClicking(void) {
     if (gIsClicking) return;
+    if (!FT_HIDConnect()) {
+        FTLog("clicking failed: HID connect failed");
+        return;
+    }
     gIsClicking = YES;
     gClickCount = 0;
     double ms = FTIntervalMs();
@@ -564,10 +492,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.38 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.39 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.38 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.39 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
