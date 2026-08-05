@@ -29,8 +29,8 @@ targets:
       path: Resources/Info.plist
       properties:
         CFBundleDisplayName: AutoTap
-        CFBundleShortVersionString: "1.0.50-fix3"
-        CFBundleVersion: "50"
+        CFBundleShortVersionString: "1.0.51-ent"
+        CFBundleVersion: "51"
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
@@ -53,6 +53,6 @@ targets:
         PRODUCT_NAME: AutoTap
         CODE_SIGN_ENTITLEMENTS: Resources/AutoTap.entitlements
         SWIFT_OBJC_BRIDGING_HEADER: HIDBridge/AutoTap-Bridging-Header.h
-        CURRENT_PROJECT_VERSION: "50"
-        MARKETING_VERSION: "1.0.50-fix3"
+        CURRENT_PROJECT_VERSION: "51"
+        MARKETING_VERSION: "1.0.51-ent"
         ENABLE_USER_SCRIPT_SANDBOXING: NO

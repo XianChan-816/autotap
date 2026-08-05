@@ -59,6 +59,22 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build
 
+      # ⚠️ 关键：必须把 AutoTap.entitlements 注入 binary，否则 App 是默认 sandbox 进程，
+      # 所有 /var/mobile/Library/Preferences、/tmp 都被重定向到容器，tweak 与 App 永远跨不了进程。
+      # TrollStore 安装时会保留 binary 内嵌的 entitlements（no-sandbox / HID / 枚举权限）。
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Inject entitlements into binary
+        run: |
+          APP=build/DerivedData/Build/Products/Debug-iphoneos/AutoTap.app
+          BIN="$APP/AutoTap"
+          ENT=AutoTap/Resources/AutoTap.entitlements
+          ls -la "$ENT"
+          ldid -S"$ENT" "$BIN"
+          echo "--- 验证 entitlements 已注入 ---"
+          ldid -e "$BIN" | grep -E "no-sandbox|platform-application|hid.system|mobileinstall|lsapplicationworkspace" || true
+
       - name: Package IPA
         run: |
           mkdir -p build/Payload
