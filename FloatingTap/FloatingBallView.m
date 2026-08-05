@@ -403,7 +403,7 @@ static NSString *const kPrefsIntervalMs = @"FloatingTap.intervalMs";
         if (!path) return;  // 还没拿到 App 沙盒路径，跳过；Tweak.xm 拿到后会自动调一次
         NSMutableDictionary *hb = [NSMutableDictionary dictionary];
         [hb setObject:@(YES) forKey:@"_loaded"];
-        [hb setObject:@"1.0.4" forKey:@"_version"];
+        [hb setObject:@"1.0.7" forKey:@"_version"];
         [hb setObject:@((long long)([[NSDate date] timeIntervalSince1970] * 1000)) forKey:@"_time"];
         [hb writeToFile:path atomically:YES];
     } @catch (NSException *ex) {

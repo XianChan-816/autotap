@@ -49,25 +49,23 @@ enum TargetAppManager {
     // MARK: - Darwin notification 名（跨进程 ABI，tweak 端必须一字不差）
 
     /// App 启动后发送，tweak 收到后用 proc 找到 App 反查沙盒路径
-    static let notifyAppStartedName = "com.floatingtap.autotap.appStarted" as CFString
+    static let notifyAppStartedName = "com.floatingtap.autotap.appStarted"
 
     /// App 写完 config 后发送，tweak 收到后重新读取目标 App / 间隔 / 点击位置
-    static let notifyConfigUpdatedName = "com.floatingtap.autotap.configUpdated" as CFString
+    static let notifyConfigUpdatedName = "com.floatingtap.autotap.configUpdated"
 
     /// tweak 写完心跳/枚举后发送，App 收到后重新读取 tweak status / apps
-    static let notifyTweakDataUpdatedName = "com.floatingtap.autotap.tweakDataUpdated" as CFString
+    static let notifyTweakDataUpdatedName = "com.floatingtap.autotap.tweakDataUpdated"
 
     // MARK: - 启动与监听
 
-    /// App 启动时调用：通知 tweak 通过 proc_listpids 找 App PID 后开始写数据
+    /// App 启动时调用：通知 tweak 通过 sysctl 找 App PID 后开始写数据
+    /// 用 notify_post（纯 C 机制，不经 CFNotificationCenter，避免初始化成本）
     static func notifyAppStarted() {
-        let center = CFNotificationCenterGetDarwinNotifyCenter()
-        let name = CFNotificationName(rawValue: notifyAppStartedName)
-        CFNotificationCenterPostNotification(center, name, nil, nil, true)
+        notify_post(notifyAppStartedName)
     }
 
-    /// App 端轮询心跳文件变化（替代 CFNotification AddObserver，避开 Swift closure→@convention(c) 转换问题）
-    /// 每 2s 检查 tweak.plist 的 _time 字段，变化就回调 handler（由 UI reload）
+    /// App 端轮询心跳文件变化（每 2s 检查 tweak.plist 的 _time 字段，变化就 reload）
     private static var lastSeenTweakTime: TimeInterval = 0
     private static var pollingTimer: Timer?
 
@@ -138,9 +136,7 @@ enum TargetAppManager {
     /// 写配置 + 通知 tweak（Darwin notification 无 payload，tweak 收到后从 App 沙盒反查读 config）
     private static func writeConfig(_ dict: NSDictionary) {
         dict.write(toFile: configPath, atomically: true)
-        let center = CFNotificationCenterGetDarwinNotifyCenter()
-        let name = CFNotificationName(rawValue: notifyConfigUpdatedName)
-        CFNotificationCenterPostNotification(center, name, nil, nil, true)
+        notify_post(notifyConfigUpdatedName)
     }
 
     // MARK: - 已安装 App 枚举

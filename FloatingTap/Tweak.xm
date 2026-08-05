@@ -132,29 +132,17 @@ static void FTOnConfigUpdated(void) {
     }
 }
 
-// Darwin notification 回调
-static void FTNotificationCallback(CFNotificationCenterRef center, void *observer,
-                                    CFStringRef name, const void *object, CFDictionaryRef userInfo) {
-    NSString *n = (__bridge NSString *)name;
-    if ([n isEqualToString:kFTNotifyAppStarted]) {
-        FTOnAppStarted();
-    } else if ([n isEqualToString:kFTNotifyConfigUpdated]) {
-        FTOnConfigUpdated();
-    }
-}
-
-// 注册 Darwin notification 监听
+// 注册 Darwin notification 监听（notify_register_dispatch：纯 C 机制，不经 CFNotificationCenter，
+// 无 CF 初始化成本，规避 SpringBoard 里 CFNotificationCenter 阻塞主线程的卡屏问题）
+static int gNotifyTokenAppStarted = 0;
+static int gNotifyTokenConfigUpdated = 0;
 static void FTRegisterNotifications(void) {
-    CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
-    CFNotificationCenterAddObserver(center, NULL,
-                                    FTNotificationCallback,
-                                    (__bridge CFStringRef)kFTNotifyAppStarted,
-                                    NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-    CFNotificationCenterAddObserver(center, NULL,
-                                    FTNotificationCallback,
-                                    (__bridge CFStringRef)kFTNotifyConfigUpdated,
-                                    NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-    NSLog(@"[FloatingTap] Darwin notification 监听已注册");
+    dispatch_queue_t q = dispatch_get_main_queue();
+    notify_register_dispatch([kFTNotifyAppStarted UTF8String], &gNotifyTokenAppStarted, q,
+                             ^(int t) { (void)t; FTOnAppStarted(); });
+    notify_register_dispatch([kFTNotifyConfigUpdated UTF8String], &gNotifyTokenConfigUpdated, q,
+                             ^(int t) { (void)t; FTOnConfigUpdated(); });
+    NSLog(@"[FloatingTap] notify_register_dispatch 监听已注册");
 }
 
 %ctor {
