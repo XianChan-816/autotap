@@ -1,13 +1,13 @@
 //
-//  Tweak.xm — FloatingTap v1.0.31
+//  Tweak.xm — FloatingTap v1.0.32
 //
-//  v1.0.30 实测：拖动触发连点 → 合成触摸 sendEvent → SB 崩溃（自动注销/SafeMode）。
-//  原因：KVC 构造的 UITouch/UIEvent 字段不完整（缺 _coalescedTouches/_type 等，
-//  UIKit 内部访问崩）；位置用 KVC _locationInWindow 解包风险大。
-//  v1.0.31：完整字段集（社区 TouchSimulator iOS15）：位置改私有方法
-//  _setLocation:resetPrevious:，touch 补 _isTap/_index/_digitizer/_edge，
-//  event 补 _coalescedTouches/_predictedTouches/_timestamp/_type/_subtype，
-//  down/up 用独立对象，整个 FTSyntheticTap 包 @try/@catch 兜底防崩。
+//  v1.0.31 实测：不崩了，但每次注入打 synthetic tap exception（@try 兜住），
+//  触摸没发出去 → 图标无反应。定位方向：位置私有方法 _setLocation:resetPrevious:
+//  可能不存在（unrecognized selector）或某 KVC key 不匹配。
+//  v1.0.32：@catch 打印异常详情（description UTF8String）；位置双保险
+//  （respondsToSelector 检查私有方法，不存在则 KVC _locationInWindow 降级）；
+//  touch 字段精简为 _window/_timestamp/_phase/_tapCount（去掉可疑的
+//  _isTap/_index/_digitizer/_edge，减少 KVC key 不匹配源）。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  （KVC key 用 FTString 运行时创建 NSString）
@@ -176,6 +176,8 @@ typedef id   (*Msg_NumberWithDouble)(id, SEL, double);
 typedef id   (*Msg_NumberWithInt)(id, SEL, int);
 typedef id   (*Msg_NumberWithUnsignedInt)(id, SEL, unsigned int);
 typedef void (*Msg_SetLocationReset)(id, SEL, CGPoint, BOOL);
+typedef BOOL (*Msg_RespondsToSelector)(id, SEL, SEL);
+typedef const char * (*Msg_UTF8String)(id, SEL);
 
 // 运行时创建 NSString（禁止 @"" 字面量：arm64e PAC 元数据雷区）
 static id FTString(const char *s) {
@@ -184,15 +186,23 @@ static id FTString(const char *s) {
     return ((Msg_StringWithUTF8String)objc_msgSend)((id)ClsStr, sel_registerName("stringWithUTF8String:"), s);
 }
 
-// 构造完整 UITouch（社区 TouchSimulator iOS15 字段集；位置用私有方法 _setLocation:resetPrevious:）
+// 构造完整 UITouch（社区 TouchSimulator iOS15 字段集；位置双保险：私有方法优先，KVC 兜底）
 static id FTMakeTouch(int phase, CGPoint pt, id win, double ts) {
     Class ClsTouch  = objc_getClass("UITouch");
     Class ClsNumber = objc_getClass("NSNumber");
+    Class ClsValue  = objc_getClass("NSValue");
     if (!ClsTouch || !ClsNumber) return nil;
     id touch = FTAlloc(ClsTouch);
     if (!touch) return nil;
     touch = ((Msg_Init)objc_msgSend)(touch, sel_registerName("init"));
-    ((Msg_SetLocationReset)objc_msgSend)(touch, sel_registerName("_setLocation:resetPrevious:"), pt, YES);
+    SEL selSetLoc = sel_registerName("_setLocation:resetPrevious:");
+    if (ClsValue && ((Msg_RespondsToSelector)objc_msgSend)(touch, sel_registerName("respondsToSelector:"), selSetLoc)) {
+        ((Msg_SetLocationReset)objc_msgSend)(touch, selSetLoc, pt, YES);
+    } else {
+        // 降级：KVC _locationInWindow（NSValue 包装 CGPoint）
+        ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
+            ((Msg_ValueWithCGPoint)objc_msgSend)((id)ClsValue, sel_registerName("valueWithCGPoint:"), pt), FTString("_locationInWindow"));
+    }
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"), win, FTString("_window"));
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
         ((Msg_NumberWithDouble)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithDouble:"), ts), FTString("_timestamp"));
@@ -200,14 +210,6 @@ static id FTMakeTouch(int phase, CGPoint pt, id win, double ts) {
         ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), phase), FTString("_phase"));
     ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
         ((Msg_NumberWithUnsignedInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithUnsignedInt:"), 1), FTString("_tapCount"));
-    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 1), FTString("_isTap"));
-    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 0), FTString("_index"));
-    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 0), FTString("_digitizer"));
-    ((Msg_SetValueForKey)objc_msgSend)(touch, sel_registerName("setValue:forKey:"),
-        ((Msg_NumberWithInt)objc_msgSend)((id)ClsNumber, sel_registerName("numberWithInt:"), 0), FTString("_edge"));
     return touch;
 }
 
@@ -270,7 +272,20 @@ static void FTSyntheticTap(double px, double py) {
         if (touchUp) FTSendEvent(app, touchUp, now);
     } @catch (NSException *ex) {
         (void)ex;
-        FTLog("synthetic tap exception");
+        const char *detail = "?";
+        id desc = nil;
+        @try {
+            desc = ((Msg_Send)objc_msgSend)(ex, sel_registerName("description"));
+            if (desc) {
+                const char *u = ((Msg_UTF8String)objc_msgSend)(desc, sel_registerName("UTF8String"));
+                if (u) detail = u;
+            }
+        } @catch (NSException *e2) {
+            (void)e2;
+        }
+        char buf[256];
+        snprintf(buf, sizeof(buf), "synthetic tap exception: %.200s", detail);
+        FTLog(buf);
     }
 }
 
@@ -557,10 +572,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.31 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.32 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.31 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.32 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
