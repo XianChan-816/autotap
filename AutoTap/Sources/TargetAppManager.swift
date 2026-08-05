@@ -53,27 +53,26 @@ enum TargetAppManager {
 
     /// App 启动时调用：通知 tweak 反查沙盒路径开始写数据
     static func notifyAppStarted() {
-        CFNotificationCenterPostNotification(
-            CFNotificationCenterGetDarwinNotifyCenter(),
-            CFNotificationName(notifyAppStarted),
-            nil, nil, true
-        )
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let name = CFNotificationName(rawValue: notifyAppStarted)
+        CFNotificationCenterPostNotification(center, name, nil, nil, true)
     }
 
     /// App 监听 tweak 数据更新（心跳、App 列表）。收到后回调 handler，由 UI reload。
     static func startListeningForTweakUpdates(handler: @escaping () -> Void) {
         let observer = Unmanaged.passUnretained(handler as AnyObject).toOpaque()
+        let cb: CFNotificationCallback = { (_, obs, _, _, _) in
+            guard let obs = obs else { return }
+            let h = Unmanaged<AnyObject>.fromOpaque(obs).takeUnretainedValue()
+            DispatchQueue.main.async {
+                (h as? () -> Void)?()
+            }
+        }
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(),
             observer,
-            { _, observer, _, _, _ in
-                guard let observer = observer else { return }
-                let h = Unmanaged<AnyObject>.fromOpaque(observer).takeUnretainedValue()
-                DispatchQueue.main.async {
-                    (h as? () -> Void)?()
-                }
-            },
-            notifyTweakDataUpdated,
+            cb,
+            CFNotificationName(rawValue: notifyTweakDataUpdated),
             nil,
             .deliverImmediately
         )
@@ -128,11 +127,9 @@ enum TargetAppManager {
     /// 写配置 + 通知 tweak（Darwin notification 无 payload，tweak 收到后从 App 沙盒反查读 config）
     private static func writeConfig(_ dict: NSDictionary) {
         dict.write(toFile: configPath, atomically: true)
-        CFNotificationCenterPostNotification(
-            CFNotificationCenterGetDarwinNotifyCenter(),
-            CFNotificationName(notifyConfigUpdated),
-            nil, nil, true
-        )
+        let center = CFNotificationCenterGetDarwinNotifyCenter()
+        let name = CFNotificationName(rawValue: notifyConfigUpdated)
+        CFNotificationCenterPostNotification(center, name, nil, nil, true)
     }
 
     // MARK: - 已安装 App 枚举
