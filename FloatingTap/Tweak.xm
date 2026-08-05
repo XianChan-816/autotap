@@ -1,17 +1,15 @@
 //
-//  Tweak.xm — FloatingTap v1.0.21
+//  Tweak.xm — FloatingTap v1.0.23
 //
-//  v1.0.20 实测：球正常显示，但长按/拖动/双击全部无反应。
-//  根因：GR 用 alloc+init 创建、target=nil——UIKit 手势识别器没有 target 时
-//  状态机不推进（幽灵手势），从 v1.0.15 起这套 GR 轮询就没真正验证过能工作。
-//
-//  v1.0.21 修复：运行时动态创建 ObjC 类（objc_allocateClassPair，不产生静态
-//  __objc_classlist 元数据 → 不触发 arm64e PAC），class_addMethod 挂纯 C IMP，
-//  实例作为 GR 的 target；GR 用正确的 initWithTarget:action: 创建。
-//  触摸逻辑改为事件驱动（GR 回调即处理），删除 20Hz 轮询。
+//  v1.0.21 诊断（floatingtap_ctor.log）：GR 已触发（clicking started/stopped 反复配对），
+//  但每次 started 后立刻 stopped——短按等不到 200ms 首 tick 无点击；长按也可能因
+//  allowableMovement=30 太小被 iPad 手指抖动超限失败。
+//  v1.0.22 修复：一碰到球立即点一次 + 点击计数日志 + HID client 挂 main runloop。
+//  v1.0.23 修复：allowableMovement 30→200（长按不因抖动失败）；FTLog 加单调时间戳
+//  （日志可见每次 started→stopped 按住时长，定位长按是否被中断）。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
-//  日志：syslog + /tmp/floatingtap_ctor.log（append 诊断）。
+//  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
 //
 
 #import <objc/runtime.h>
@@ -77,15 +75,20 @@ static double  gScreenH = 0;
 static BOOL    gIsClicking = NO;            // 连点进行中
 static dispatch_source_t gClickTimer = NULL; // 连点定时器（ARC 管理）
 
-// MARK: - 诊断日志（append 到标记文件，Filza 可见）
+// MARK: - 诊断日志（append 到标记文件，Filza 可见；带单调时间戳）
 
 static void FTLog(const char *msg) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double t = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    char line[256];
+    snprintf(line, sizeof(line), "[%.1f] %s", t, msg);
     FILE *f = fopen("/tmp/floatingtap_ctor.log", "a");
     if (f) {
-        fprintf(f, "%s\n", msg);
+        fprintf(f, "%s\n", line);
         fclose(f);
     }
-    syslog(LOG_ERR, "%s", msg);
+    syslog(LOG_ERR, "%s", line);
 }
 
 // MARK: - 工具
@@ -350,9 +353,10 @@ static void FTSetupBall(void) {
     ((Msg_SetDelaysTouchesBegan)objc_msgSend)(gPanGR, sel_registerName("setDelaysTouchesBegan:"), NO);
     ((Msg_SetDelaysTouchesEnded)objc_msgSend)(gPanGR, sel_registerName("setDelaysTouchesEnded:"), NO);
     ((Msg_SetCancelsTouchesInView)objc_msgSend)(gPanGR, sel_registerName("setCancelsTouchesInView:"), NO);
-    // 长按：minimumPressDuration=0 → 手指一碰立即 Began（开始连点），allowableMovement=30 防抖动误取消
+    // 长按：minimumPressDuration=0 → 手指一碰立即 Began（开始连点）
+    // allowableMovement=200：宽松容差，iPad 上手指自然抖动/微小移动不会误判失败
     ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setMinimumPressDuration:"), 0.0);
-    ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setAllowableMovement:"), 30.0);
+    ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setAllowableMovement:"), 200.0);
 
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gPanGR);
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gTapGR);
@@ -407,10 +411,10 @@ static void FTTweakCtor(void) {
     // 【诊断标记】若重启后 /tmp/floatingtap_ctor.log 存在 → tweak 已注入 SpringBoard
     FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
     if (mk) {
-        fprintf(mk, "FloatingTap v1.0.21 ctor run (arm64e, pure C)\n");
+        fprintf(mk, "FloatingTap v1.0.23 ctor run (arm64e, pure C)\n");
         fclose(mk);
     }
-    syslog(LOG_ERR, "FloatingTap v1.0.21 loaded (pure C ctor, zero static ObjC metadata)");
+    syslog(LOG_ERR, "FloatingTap v1.0.23 loaded (pure C ctor, zero static ObjC metadata)");
 
     // 延迟 30s 等 SB 完全启动，再动态创建悬浮球
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
