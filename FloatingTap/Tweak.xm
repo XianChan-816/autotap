@@ -92,6 +92,7 @@ static BOOL FTIsBundle(const char *bundleID) {
 
 static id gBallContainer = nil;   // 球的父窗口（v1.0.58：优先 _UISystemGestureWindow，始终位于所有 App 之上；兜底 keyWindow）
 static id gBallView      = nil;   // 球 UIView 本身
+static id gGestureWin    = nil;   // v1.0.61：从 sendEvent 事件流直接捕获到的系统手势窗口实例（最可靠的定位方式）
 static id gTapGR      = nil;
 static id gLongGR     = nil;
 static id gPanGR      = nil;   // 拖动手势（仅「红色拖动模式」生效）
@@ -728,19 +729,44 @@ static void FTSetupBallRetry(void *ctx);
 static int gBallSetupTries = 0;
 static const int FT_BALL_MAX_TRIES = 12;
 
-// 枚举含 internal 的全体窗口（尝试两个已知私有类方法名），返回数组或 nil
+// 枚举含 internal 的全体窗口，返回数组或 nil。
+// ⚠️ v1.0.61 修正：iOS 12 用 UIWindow 类方法 `_allWindowsIncludingInternalWindows:`；
+// iOS 13+ 改用 UIWindowScene 实例方法（同一名字、无参数）。旧版只在 UIWindow 上探，
+// 在 iOS 15 上 respondsToSelector 失败 → 返回 nil → 永远找不到手势窗口 → 球兜底挂到
+// SBRecordingIndicatorWindow（非交互窗口，手势全失效）。
+// 另外 sendEvent hook 会直接捕获手势窗口实例到 gGestureWin，作为最可靠来源。
 static id FTInternalWindows(void) {
+    // 1) iOS 12：UIWindow 类方法
     Class ClsWinCls = objc_getClass("UIWindow");
-    if (!ClsWinCls) return nil;
-    SEL sels[2];
-    sels[0] = sel_registerName("_allWindowsIncludingInternalWindows:");
-    sels[1] = sel_registerName("_windowsIncludingInternalWindows:");
-    for (int k = 0; k < 2; k++) {
-        if (sels[k] && class_respondsToSelector(ClsWinCls, sels[k])) {
-            typedef id (*Msg_AllWin)(id, SEL, BOOL);
-            id r = ((Msg_AllWin)objc_msgSend)((id)ClsWinCls, sels[k], YES);
-            if (r) return r;
+    if (ClsWinCls) {
+        SEL sels[2];
+        sels[0] = sel_registerName("_allWindowsIncludingInternalWindows:");
+        sels[1] = sel_registerName("_windowsIncludingInternalWindows:");
+        for (int k = 0; k < 2; k++) {
+            if (sels[k] && class_respondsToSelector(ClsWinCls, sels[k])) {
+                typedef id (*Msg_AllWin)(id, SEL, BOOL);
+                id r = ((Msg_AllWin)objc_msgSend)((id)ClsWinCls, sels[k], YES);
+                if (r) return r;
+            }
         }
+    }
+    // 2) iOS 13+：UIWindowScene 实例方法（internal 窗口枚举在这里）
+    id scene = FTGetActiveWindowScene();
+    if (scene) {
+        SEL selsS[2];
+        selsS[0] = sel_registerName("_allWindowsIncludingInternalWindows");
+        selsS[1] = sel_registerName("allWindowsIncludingInternalWindows");
+        Class sceneCls = (Class)object_getClass(scene);
+        for (int k = 0; k < 2; k++) {
+            if (selsS[k] && class_respondsToSelector(sceneCls, selsS[k])) {
+                typedef id (*Msg_SceneAllWin)(id, SEL);
+                id r = ((Msg_SceneAllWin)objc_msgSend)(scene, selsS[k]);
+                if (r) return r;
+            }
+        }
+        // 兜底：scene 公开 windows（不全含 internal，但至少保证有窗口可枚举）
+        id sw = ((Msg_Send)objc_msgSend)(scene, sel_registerName("windows"));
+        if (sw) return sw;
     }
     return nil;
 }
@@ -845,7 +871,24 @@ static void FTSetupBall(void) {
     // 修复：先找系统手势窗口；找不到就延迟重试（最多 ~12s）等它就绪；
     //       重试耗尽才退化挂到「最高非 Alert 窗口 / keyWindow」（稳定、不会凭空消失）。
     int isGesture = 0;
-    id targetWin = FTFindOverlayWindow(&isGesture);
+    id targetWin = nil;
+    // v1.0.61：优先用从 sendEvent 捕获到的真实系统手势窗口（最可靠），
+    // 否则退化到枚举 + 兜底（最高非 Alert / keyWindow）。
+    if (gGestureWin) {
+        targetWin = gGestureWin;
+        isGesture = 1;
+        FTLog("ball: using gesture window captured from sendEvent");
+    } else {
+        targetWin = FTFindOverlayWindow(&isGesture);
+    }
+    {
+        char diagSel[160];
+        snprintf(diagSel, sizeof(diagSel), "ball select: gestureCaptured=%d target=%s isGesture=%d",
+            gGestureWin ? 1 : 0,
+            targetWin ? object_getClassName(targetWin) : "nil",
+            isGesture);
+        FTLog(diagSel);
+    }
     if ((!targetWin || !isGesture) && gBallSetupTries < FT_BALL_MAX_TRIES) {
         gBallSetupTries++;
         FTLog("ball: system gesture window not ready, retry later");
@@ -996,6 +1039,17 @@ static void FTTweakInitCallback(void *ctx) {
 %hook UIWindow
 - (void)sendEvent:(UIEvent *)event {
     %orig;
+    // v1.0.61：从事件流直接捕获系统手势窗口实例。
+    // 已知真实触摸始终流经 _UISystemGestureWindow（日志 win= 字段印证），
+    // 而 [UIApplication windows] 与部分 iOS 版本的枚举类方法都枚举不到它。
+    // 捕获一次即可作为球的挂载容器，彻底绕开枚举盲区。
+    if (!gGestureWin) {
+        const char *cn = object_getClassName(self);
+        if (cn && (strstr(cn, "SystemGesture") || strstr(cn, "GestureWindow") || strstr(cn, "FBSystemGesture"))) {
+            gGestureWin = self;
+            FTLog("captured system gesture window from sendEvent");
+        }
+    }
     static double sLastDiag = 0;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1060,14 +1114,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.60 loaded (pure C ctor, ball on _UISystemGestureWindow with retry; in-game overlay)");
+    syslog(LOG_ERR, "FloatingTap v1.0.61 loaded (pure C ctor, ball on _UISystemGestureWindow; captured from sendEvent; in-game overlay)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.60 ctor run (arm64e, pure C, ball on _UISystemGestureWindow with retry; in-game overlay)\n");
+            fprintf(mk, "FloatingTap v1.0.61 ctor run (arm64e, pure C, ball on _UISystemGestureWindow captured from sendEvent; in-game overlay)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
