@@ -1,5 +1,9 @@
 # 云端构建无签名 IPA（无需本地 Mac）
 #
+# ⚠️ 默认【不】在 push 时自动构建（macos-14 runner 占用贵、且 Dopamine rootless 下
+# App↔tweak 跨进程通道全封死，AutoTap app 暂无法给 tweak 下发配置，IPA 暂无用）。
+# 需要 IPA 时在 Actions 页面手动触发 "Build IPA"（workflow_dispatch）。
+#
 # 把本仓库推到 GitHub，在 Actions 页面手动触发 "Build IPA"，
 # 几分钟后在 Artifacts 里下载 AutoTap.ipa，用 TrollStore 安装。
 #
@@ -8,10 +12,9 @@
 
 name: Build IPA
 
+# 仅手动触发，避免每次 push 都白跑 macos-14 构建（IPA 当前暂不可用）
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
 
 jobs:
   build:
