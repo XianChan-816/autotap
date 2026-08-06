@@ -53,6 +53,7 @@ typedef void       (*Msg_SetHidden)(id, SEL, BOOL);
 typedef void       (*Msg_SetUserInteractionEnabled)(id, SEL, BOOL);
 typedef void       (*Msg_AddGestureRecognizer)(id, SEL, id);
 typedef void       (*Msg_SetEnabled)(id, SEL, BOOL);
+typedef void       (*Msg_RequireToFail)(id, SEL, id);
 typedef void       (*Msg_AddSubview)(id, SEL, id);
 typedef void       (*Msg_MakeKeyAndVisible)(id, SEL);
 typedef void       (*Msg_SetNumberOfTapsRequired)(id, SEL, NSUInteger);
@@ -781,11 +782,15 @@ static void FTSetupBall(void) {
         FTLog("setup failed: make GR");
     }
     ((Msg_SetNumberOfTapsRequired)objc_msgSend)(gTapGR, sel_registerName("setNumberOfTapsRequired:"), (NSUInteger)2);
-    // 长按：minimumPressDuration=0 → 手指一碰立即 Began（开始连点）。
-    // 仅「连击模式」启用（拖动模式下 setEnabled:NO，由 Pan GR 负责拖动）。
+    // 长按：minimumPressDuration=0.4 → 真正的「长按」才触发连点（duration=0 会在手指一碰就
+    // Began，抢走触摸导致双击手势被迫失败，v1.0.55 实测双击切换永不触发）。
     // allowableMovement=200：宽松容差，iPad 上手指自然抖动/微小移动不会误判失败
-    ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setMinimumPressDuration:"), 0.0);
+    ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setMinimumPressDuration:"), 0.4);
     ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setAllowableMovement:"), 200.0);
+    // 让「双击」手势优先：长按/拖动都 require 双击失败后才识别。
+    // 这样双击必然触发模式切换，长按/拖动只在「不是双击」时才生效，二者不再抢触摸。
+    ((Msg_RequireToFail)objc_msgSend)(gLongGR, sel_registerName("requireGestureRecognizerToFail:"), gTapGR);
+    ((Msg_RequireToFail)objc_msgSend)(gPanGR,  sel_registerName("requireGestureRecognizerToFail:"), gTapGR);
     // 模式初始化：蓝色连击模式 → 启用长按、禁用拖动
     ((Msg_SetEnabled)objc_msgSend)(gLongGR, sel_registerName("setEnabled:"), YES);
     ((Msg_SetEnabled)objc_msgSend)(gPanGR,  sel_registerName("setEnabled:"), NO);
@@ -902,8 +907,16 @@ static void FTTweakInitCallback(void *ctx) {
     // v1.0.44 诊断：加 UITouch phase/tapCount（判断 down/up 是否关联成完整 tap）
     // v1.0.49 诊断：加 locationInWindow 像素坐标——判断坐标单位是否被 UIKit 误解
     //  （注入传归一化 0~1，若 UIKit 期望像素 → 触摸落在屏幕角落 → hitTest 命中不了图标）
-    // v1.0.55：self 是 UIWindow；命中 keyWindow 即视为「球所在窗口」（球的 superview 就是 keyWindow）
+    // v1.0.55+：球现在是 keyWindow 的 subview（非独立 window），self==gBallContainer 恒不成立。
+    // 改为直接判断触摸坐标是否落在球 frame 内——这样碰到球时 ball=1，否则 0。
     BOOL isBall = (self == gBallContainer);
+    if (!isBall && gBallView && lx >= 0 && ly >= 0) {
+        CGRect bf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
+        if (lx >= bf.origin.x && lx <= bf.origin.x + bf.size.width &&
+            ly >= bf.origin.y && ly <= bf.origin.y + bf.size.height) {
+            isBall = YES;
+        }
+    }
     const char *cls = "?";
     const char *winCls = object_getClassName(self);
     if (!winCls) winCls = "?";
@@ -943,14 +956,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.55 loaded (pure C ctor, ball on keyWindow to bypass _UISystemGestureWindow)");
+    syslog(LOG_ERR, "FloatingTap v1.0.56 loaded (pure C ctor, drag-mode toggle fixed: long-press vs double-tap conflict resolved)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.55 ctor run (arm64e, pure C, ball-on-keyWindow, drag-mode toggle)\n");
+            fprintf(mk, "FloatingTap v1.0.56 ctor run (arm64e, pure C, drag-mode toggle fixed)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
