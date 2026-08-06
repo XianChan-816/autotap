@@ -753,34 +753,48 @@ static void FTSetupBall(void) {
     CGFloat d = 56.0;
     CGRect ballFrame = CGRectMake(sb.size.width / 2 - d / 2, sb.size.height / 2 - d / 2, d, d);
 
-    // v1.0.58：球必须挂到 _UISystemGestureWindow（系统手势层，始终位于所有 App 之上），
+    // v1.0.58→v1.0.59：球必须挂到 _UISystemGestureWindow（系统手势层，始终位于所有 App 之上），
     // 这样在游戏 / 前台 App 内也可见、可触摸。keyWindow 是 SpringBoard 窗口，会被前台 App 盖住。
+    // ⚠️ 关键坑：_UISystemGestureWindow 是 internal window，不在 [UIApplication windows] 里
+    // （v1.0.58 首版因此 fallback 到当时弹出的 SBAlertItemWindow，alert 消失球也跟着没了 → “没有悬浮窗”）。
+    // 必须用 UIWindow 私有类方法 _allWindowsIncludingInternalWindows: 才能枚举到它。
     id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
     id keyWin = app ? ((Msg_Send)objc_msgSend)(app, sel_registerName("keyWindow")) : nil;
 
-    // 优先找系统手势窗口（类名含 SystemGesture / GestureWindow / FBSystemGesture）；
-    // 兜底：取 windowLevel 最高的窗口；再兜底：退化用 keyWindow（主屏可用，游戏内会被盖——但不崩）。
-    id targetWin = nil;
-    if (app) {
-        id wins = ((Msg_Send)objc_msgSend)(app, sel_registerName("windows"));
-        if (wins) {
-            NSUInteger cnt = ((Msg_Count)objc_msgSend)(wins, sel_registerName("count"));
-            CGFloat bestLevel = -1.0;
-            id bestWin = nil;
-            for (NSUInteger i = 0; i < cnt; i++) {
-                id w = ((Msg_ObjectAtIndex)objc_msgSend)(wins, sel_registerName("objectAtIndex:"), i);
-                if (!w) continue;
-                const char *cn = object_getClassName(w);
-                if (cn && (strstr(cn, "SystemGesture") || strstr(cn, "GestureWindow") || strstr(cn, "FBSystemGesture"))) {
-                    targetWin = w;
-                    break;
-                }
-                CGFloat lvl = ((Msg_CGFloatReturn)objc_msgSend)(w, sel_registerName("windowLevel"));
-                if (lvl > bestLevel) { bestLevel = lvl; bestWin = w; }
-            }
-            if (!targetWin && bestWin) targetWin = bestWin;
-        }
+    // 1) 优先枚举含 internal 的全体窗口 → 能拿到 _UISystemGestureWindow
+    id allWins = nil;
+    Class ClsWinCls = objc_getClass("UIWindow");
+    SEL selAll = sel_registerName("_allWindowsIncludingInternalWindows:");
+    if (ClsWinCls && selAll && class_respondsToSelector(ClsWinCls, selAll)) {
+        typedef id (*Msg_AllWin)(id, SEL, BOOL);
+        allWins = ((Msg_AllWin)objc_msgSend)((id)ClsWinCls, selAll, YES);
     }
+    // 2) [UIApplication windows] 作为补充（某些 iOS 版本它已含手势窗）
+    id appWins = app ? ((Msg_Send)objc_msgSend)(app, sel_registerName("windows")) : nil;
+
+    id targetWin = nil;
+    CGFloat bestLevel = -100000.0;
+    id bestWin = nil;
+    id winSets[2]; winSets[0] = allWins; winSets[1] = appWins;
+    for (int s = 0; s < 2; s++) {
+        id ws = winSets[s];
+        if (!ws) continue;
+        NSUInteger cnt = ((Msg_Count)objc_msgSend)(ws, sel_registerName("count"));
+        for (NSUInteger i = 0; i < cnt; i++) {
+            id w = ((Msg_ObjectAtIndex)objc_msgSend)(ws, sel_registerName("objectAtIndex:"), i);
+            if (!w) continue;
+            const char *cn = object_getClassName(w);
+            if (cn && (strstr(cn, "SystemGesture") || strstr(cn, "GestureWindow") || strstr(cn, "FBSystemGesture"))) {
+                targetWin = w;
+                break;
+            }
+            CGFloat lvl = ((Msg_CGFloatReturn)objc_msgSend)(w, sel_registerName("windowLevel"));
+            if (lvl > bestLevel) { bestLevel = lvl; bestWin = w; }
+        }
+        if (targetWin) break;
+    }
+    // 兜底：取所有窗口里 windowLevel 最高的（正常情况下就是 _UISystemGestureWindow 本身）
+    if (!targetWin && bestWin) targetWin = bestWin;
     if (!targetWin) targetWin = keyWin;
     if (!targetWin) {
         FTLog("setup failed: no overlay window");
@@ -987,14 +1001,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.58 loaded (pure C ctor, ball on _UISystemGestureWindow for in-game overlay; click-loop fixed via alpha passthrough)");
+    syslog(LOG_ERR, "FloatingTap v1.0.59 loaded (pure C ctor, ball on _UISystemGestureWindow via _allWindowsIncludingInternalWindows; in-game overlay)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.58 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; in-game overlay)\n");
+            fprintf(mk, "FloatingTap v1.0.59 ctor run (arm64e, pure C, ball on _UISystemGestureWindow via internal-windows enum; in-game overlay)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
