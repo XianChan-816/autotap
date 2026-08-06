@@ -226,7 +226,7 @@ static void FTWritePref(const char *key, CFPropertyListRef value) {
         CFPreferencesSetValue(k, value, appID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
         CFRelease(k);
     }
-    CFPreferencesSynchronize(appID);
+    CFPreferencesSynchronize(appID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
     CFRelease(appID);
 }
 

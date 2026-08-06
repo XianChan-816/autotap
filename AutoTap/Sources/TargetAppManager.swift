@@ -38,11 +38,10 @@ enum TargetAppManager {
     /// 最近一次从 tweak 读到的 App 列表（bundleID -> displayName）
     private static var prefsApps: [String: String] = [:]
 
-    /// 读一条共享偏好（current user / any host）
+    /// 读一条共享偏好（current user / any host；SDK 导入为 CFPropertyList?，ARC 管理）
     private static func readPref(_ key: String) -> CFPropertyList? {
-        guard let v = CFPreferencesCopyValue(key as CFString, sharedAppID,
-                                             kCFPreferencesCurrentUser, kCFPreferencesAnyHost) else { return nil }
-        return v.takeRetainedValue()
+        return CFPreferencesCopyValue(key as CFString, sharedAppID,
+                                      kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
     }
 
     /// 写一条共享偏好（App 侧）
