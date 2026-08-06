@@ -87,8 +87,8 @@ static BOOL FTIsBundle(const char *bundleID) {
 
 // MARK: - 全局状态（纯 C）
 
-static id gBallWindow = nil;
-static id gBallView   = nil;
+static id gBallContainer = nil;   // 球的父窗口（v1.0.55：app.keyWindow，_UISystemGestureWindow 不再拦截）
+static id gBallView      = nil;   // 球 UIView 本身
 static id gTapGR      = nil;
 static id gLongGR     = nil;
 static id gPanGR      = nil;   // 拖动手势（仅「红色拖动模式」生效）
@@ -510,14 +510,15 @@ static void FTSyntheticTap(double px, double py) {
 static void FTRestoreBallInteractionCallback(void *ctx);
 
 // 连点回调：在锁定坐标发一次合成点击。
-// ⚠️ 注入坐标=球心，球窗口(windowLevel 1001)正好在球心，注入触摸会先命中球窗口被吃掉。
-// 注入瞬间关掉球窗口交互（userInteractionEnabled=NO → 不参与 hitTest → 穿透），60ms 后恢复。
+// ⚠️ 球是 keyWindow 的 subview，注入点（球心）正好命中球。注入瞬间关掉球 view 交互
+// （userInteractionEnabled=NO → 球不参与 hitTest → 注入触摸穿透到下层 app），60ms 后恢复。
+// 关键：必须只关 gBallView，不能关 gBallContainer（keyWindow），否则整个 SB 都失效。
 static void FTClickCallback(void *ctx) {
     (void)ctx;
-    if (!gBallWindow || !gIsClicking) return;
+    if (!gBallView || !gIsClicking) return;
 
-    // 注入前：球窗口不参与 hitTest → 注入触摸穿透到下层
-    ((Msg_SetUserInteractionEnabled)objc_msgSend)(gBallWindow, sel_registerName("setUserInteractionEnabled:"), NO);
+    // 注入前：球 view 不参与 hitTest → 注入触摸穿透到下层
+    ((Msg_SetUserInteractionEnabled)objc_msgSend)(gBallView, sel_registerName("setUserInteractionEnabled:"), NO);
 
     FTSyntheticTap(gClickLockX * gScreenW, gClickLockY * gScreenH);
     gClickCount++;
@@ -533,8 +534,8 @@ static void FTClickCallback(void *ctx) {
 
 static void FTRestoreBallInteractionCallback(void *ctx) {
     (void)ctx;
-    if (gBallWindow) {
-        ((Msg_SetUserInteractionEnabled)objc_msgSend)(gBallWindow, sel_registerName("setUserInteractionEnabled:"), YES);
+    if (gBallView) {
+        ((Msg_SetUserInteractionEnabled)objc_msgSend)(gBallView, sel_registerName("setUserInteractionEnabled:"), YES);
     }
 }
 
@@ -572,8 +573,8 @@ static void FTStartClicking(void) {
     gClickCount = 0;
     gTapIndex = 0;
     // 点击点 = 当前球心（拖动模式移动球后此处自动跟随；App 配置经 FTMoveBallToConfig 已先把球移到该位置）
-    if (gBallWindow) {
-        CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
+    if (gBallView) {
+        CGRect f = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
         double cx = f.origin.x + f.size.width * 0.5;
         double cy = f.origin.y + f.size.height * 0.5;
         gClickLockX = (gScreenW > 0) ? cx / gScreenW : 0.5;
@@ -619,7 +620,7 @@ static id    gGRTarget      = nil;
 // 「红色拖动模式」下长按无效（拖动由 Pan GR 负责），避免双击切换与连点冲突。
 static void FTGRLongHandler(id self, SEL _cmd, id gr) {
     (void)self; (void)_cmd;
-    if (!gr || !gBallWindow) return;
+    if (!gr || !gBallView) return;
     if (gDragMode) return; // 拖动模式：长按不触发连点
     NSUInteger st = ((Msg_State)objc_msgSend)(gr, sel_registerName("state"));
     if (st == 1) { // Began → 开始连点（点击点=当前球心）
@@ -633,21 +634,21 @@ static void FTGRLongHandler(id self, SEL _cmd, id gr) {
 // 连击模式下忽略，保证长按只连点、拖动只定位，互不干扰。
 static void FTGRPanHandler(id self, SEL _cmd, id gr) {
     (void)self; (void)_cmd;
-    if (!gr || !gBallWindow) return;
+    if (!gr || !gBallView) return;
     if (!gDragMode) return; // 连击模式：不响应拖动
     NSUInteger st = ((Msg_State)objc_msgSend)(gr, sel_registerName("state"));
     if (st == 1) { // Began
-        gPanStartLoc = ((Msg_LocationInView)objc_msgSend)(gr, sel_registerName("locationInView:"), gBallWindow);
-        gPanOrigin0  = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame")).origin;
+        gPanStartLoc = ((Msg_LocationInView)objc_msgSend)(gr, sel_registerName("locationInView:"), gBallView);
+        gPanOrigin0  = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame")).origin;
     } else if (st == 2) { // Changed → 拖动球
-        CGPoint cur = ((Msg_LocationInView)objc_msgSend)(gr, sel_registerName("locationInView:"), gBallWindow);
-        CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
-        ((Msg_SetFrame)objc_msgSend)(gBallWindow, sel_registerName("setFrame:"),
+        CGPoint cur = ((Msg_LocationInView)objc_msgSend)(gr, sel_registerName("locationInView:"), gBallView);
+        CGRect f = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
+        ((Msg_SetFrame)objc_msgSend)(gBallView, sel_registerName("setFrame:"),
             CGRectMake(gPanOrigin0.x + (cur.x - gPanStartLoc.x),
                        gPanOrigin0.y + (cur.y - gPanStartLoc.y),
                        f.size.width, f.size.height));
         // 同步更新连点锁定坐标（拖动后点击点跟随球心）
-        CGRect nf = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
+        CGRect nf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
         if (gScreenW > 0 && gScreenH > 0) {
             gClickLockX = (nf.origin.x + nf.size.width * 0.5) / gScreenW;
             gClickLockY = (nf.origin.y + nf.size.height * 0.5) / gScreenH;
@@ -674,7 +675,7 @@ static void FTApplyBallAppearance(void) {
 //   蓝色（连击模式）：长按触发连点；红色（拖动模式）：拖动小球重新定位点击点。
 static void FTGRTapHandler(id self, SEL _cmd, id gr) {
     (void)self; (void)_cmd;
-    if (!gr || !gBallWindow) return;
+    if (!gr || !gBallView) return;
     NSUInteger st = ((Msg_State)objc_msgSend)(gr, sel_registerName("state"));
     if (st == 3) { // Ended（双击完成）
         FTStopClicking();
@@ -716,16 +717,20 @@ static id FTMakeGR(Class cls, const char *actionName) {
 // MARK: - 创建小球
 
 static void FTSetupBall(void) {
-    if (gBallWindow) return;
+    // v1.0.55：球已是 keyWindow 的 subview，凭 superview 判断是否已挂载
+    if (gBallView) {
+        id sup = ((Msg_Send)objc_msgSend)(gBallView, sel_registerName("superview"));
+        if (sup) return;
+    }
 
-    Class ClsWindow = objc_getClass("UIWindow");
-    Class ClsView   = objc_getClass("UIView");
+    Class ClsApp   = objc_getClass("UIApplication");
+    Class ClsView  = objc_getClass("UIView");
     Class ClsScreen = objc_getClass("UIScreen");
-    Class ClsColor  = objc_getClass("UIColor");
-    Class ClsTapGR  = objc_getClass("UITapGestureRecognizer");
+    Class ClsColor = objc_getClass("UIColor");
+    Class ClsTapGR = objc_getClass("UITapGestureRecognizer");
     Class ClsLongGR = objc_getClass("UILongPressGestureRecognizer");
-    Class ClsPanGR  = objc_getClass("UIPanGestureRecognizer");
-    if (!ClsWindow || !ClsView || !ClsScreen || !ClsColor || !ClsTapGR || !ClsLongGR || !ClsPanGR) {
+    Class ClsPanGR = objc_getClass("UIPanGestureRecognizer");
+    if (!ClsApp || !ClsView || !ClsScreen || !ClsColor || !ClsTapGR || !ClsLongGR || !ClsPanGR) {
         FTLog("setup failed: system class missing");
         return;
     }
@@ -734,6 +739,7 @@ static void FTSetupBall(void) {
         return;
     }
 
+    // 主屏尺寸
     id mainScreen = ((Msg_Send)objc_msgSend)((id)ClsScreen, sel_registerName("mainScreen"));
     CGRect sb = ((Msg_Bounds)objc_msgSend)(mainScreen, sel_registerName("bounds"));
     gScreenW = sb.size.width;
@@ -741,18 +747,19 @@ static void FTSetupBall(void) {
     CGFloat d = 56.0;
     CGRect ballFrame = CGRectMake(sb.size.width / 2 - d / 2, sb.size.height / 2 - d / 2, d, d);
 
-    // 独立小球窗口：只有小球大小 → 区域外触摸天然穿透
-    id win = FTAllocInitWithFrame(ClsWindow, ballFrame);
-
-    // iOS 13+：挂到当前活跃的 UIWindowScene，否则不渲染
-    id scene = FTGetActiveWindowScene();
-    if (scene) {
-        ((Msg_SetWindowScene)objc_msgSend)(win, sel_registerName("setWindowScene:"), scene);
+    // 拿当前前台 keyWindow（SB 自身的窗口；球的 hitTest 链跟随 SB 主窗口透传触摸）
+    id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
+    id keyWin = app ? ((Msg_Send)objc_msgSend)(app, sel_registerName("keyWindow")) : nil;
+    if (!keyWin) {
+        FTLog("setup failed: no keyWindow");
+        return;
     }
 
-    ((Msg_SetWindowLevel)objc_msgSend)(win, sel_registerName("setWindowLevel:"), (CGFloat)1001.0);
-
-    id ball = FTAllocInitWithFrame(ClsView, CGRectMake(0, 0, d, d));
+    id ball = FTAllocInitWithFrame(ClsView, ballFrame);
+    if (!ball) {
+        FTLog("setup failed: alloc ball");
+        return;
+    }
     ((Msg_SetUserInteractionEnabled)objc_msgSend)(ball, sel_registerName("setUserInteractionEnabled:"), YES);
     ((Msg_SetBackgroundColor)objc_msgSend)(ball, sel_registerName("setBackgroundColor:"),
         ((Msg_ColorWithRGBA)objc_msgSend)((id)ClsColor, sel_registerName("colorWithRed:green:blue:alpha:"),
@@ -787,15 +794,26 @@ static void FTSetupBall(void) {
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gLongGR);
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gPanGR);
 
-    // 直接把 ball 加到 window（不走 VC），更可靠
-    ((Msg_AddSubview)objc_msgSend)(win, sel_registerName("addSubview:"), ball);
+    // v1.0.55：把球作为 subview 直接挂在 keyWindow 上
+    // 这样球的 hitTest 链跟 SB 一致——iOS 15 _UISystemGestureWindow 拦截后事件
+    // 仍会按 SB 自身的 responder 链透传到球（之前独立 UIWindow 被 _UISystemGestureWindow 截胡）。
+    ((Msg_AddSubview)objc_msgSend)(keyWin, sel_registerName("addSubview:"), ball);
 
-    ((Msg_SetHidden)objc_msgSend)(win, sel_registerName("setHidden:"), NO);
-    ((Msg_MakeKeyAndVisible)objc_msgSend)(win, sel_registerName("makeKeyAndVisible"));
-
-    gBallWindow = win;
-    gBallView   = ball;
+    gBallContainer = keyWin;
+    gBallView      = ball;
     FTApplyBallAppearance(); // 初始蓝色=连击模式
+
+    // v1.0.55 诊断：报告球窗口层级（之前 ball 在独立 UIWindow 上行为诡异）
+    CGRect ballFrameDiag = ((Msg_Frame)objc_msgSend)(ball, sel_registerName("frame"));
+    id ballSuper = ((Msg_Send)objc_msgSend)(ball, sel_registerName("superview"));
+    const char *superCls = ballSuper ? object_getClassName(ballSuper) : "?";
+    char diag[256];
+    snprintf(diag, sizeof(diag),
+        "ball attached: super=%s frame=%.0f,%.0f,%.0fx%.0f keyWin=%s",
+        superCls,
+        ballFrameDiag.origin.x, ballFrameDiag.origin.y, ballFrameDiag.size.width, ballFrameDiag.size.height,
+        object_getClassName(keyWin));
+    FTLog(diag);
 
     FTLog("ball created, gesture handlers wired");
 
@@ -805,12 +823,12 @@ static void FTSetupBall(void) {
 
 // v1.0.50：移动球到 App 配置位置（球心 = 配置点击点；未加载配置则居中不动）
 static void FTMoveBallToConfig(void) {
-    if (!gBallWindow || !gCfgLoaded) return;
+    if (!gBallView || !gCfgLoaded) return;
     if (gScreenW <= 0 || gScreenH <= 0) return;
     double px = gCfgX * gScreenW;
     double py = gCfgY * gScreenH;
-    CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
-    ((Msg_SetFrame)objc_msgSend)(gBallWindow, sel_registerName("setFrame:"),
+    CGRect f = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
+    ((Msg_SetFrame)objc_msgSend)(gBallView, sel_registerName("setFrame:"),
         CGRectMake(px - f.size.width * 0.5, py - f.size.height * 0.5,
                    f.size.width, f.size.height));
     // 同步锁定坐标（连点打在配置点）
@@ -884,7 +902,8 @@ static void FTTweakInitCallback(void *ctx) {
     // v1.0.44 诊断：加 UITouch phase/tapCount（判断 down/up 是否关联成完整 tap）
     // v1.0.49 诊断：加 locationInWindow 像素坐标——判断坐标单位是否被 UIKit 误解
     //  （注入传归一化 0~1，若 UIKit 期望像素 → 触摸落在屏幕角落 → hitTest 命中不了图标）
-    BOOL isBall = (self == gBallWindow);
+    // v1.0.55：self 是 UIWindow；命中 keyWindow 即视为「球所在窗口」（球的 superview 就是 keyWindow）
+    BOOL isBall = (self == gBallContainer);
     const char *cls = "?";
     const char *winCls = object_getClassName(self);
     if (!winCls) winCls = "?";
@@ -924,14 +943,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.54 loaded (pure C ctor, CFPreferences comm)");
+    syslog(LOG_ERR, "FloatingTap v1.0.55 loaded (pure C ctor, ball on keyWindow to bypass _UISystemGestureWindow)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.54 ctor run (arm64e, pure C, drag-mode toggle)\n");
+            fprintf(mk, "FloatingTap v1.0.55 ctor run (arm64e, pure C, ball-on-keyWindow, drag-mode toggle)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
