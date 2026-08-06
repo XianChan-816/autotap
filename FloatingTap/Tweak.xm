@@ -909,14 +909,6 @@ static void FTTweakInitCallback(void *ctx) {
     //  （注入传归一化 0~1，若 UIKit 期望像素 → 触摸落在屏幕角落 → hitTest 命中不了图标）
     // v1.0.55+：球现在是 keyWindow 的 subview（非独立 window），self==gBallContainer 恒不成立。
     // 改为直接判断触摸坐标是否落在球 frame 内——这样碰到球时 ball=1，否则 0。
-    BOOL isBall = (self == gBallContainer);
-    if (!isBall && gBallView && lx >= 0 && ly >= 0) {
-        CGRect bf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
-        if (lx >= bf.origin.x && lx <= bf.origin.x + bf.size.width &&
-            ly >= bf.origin.y && ly <= bf.origin.y + bf.size.height) {
-            isBall = YES;
-        }
-    }
     const char *cls = "?";
     const char *winCls = object_getClassName(self);
     if (!winCls) winCls = "?";
@@ -930,6 +922,14 @@ static void FTTweakInitCallback(void *ctx) {
         tapc = (long)((Msg_Int)objc_msgSend)(t, sel_registerName("tapCount"));
         CGPoint loc = ((Msg_LocationInView)objc_msgSend)(t, sel_registerName("locationInView:"), nil);
         lx = loc.x; ly = loc.y;
+    }
+    BOOL isBall = (self == gBallContainer);
+    if (!isBall && gBallView && lx >= 0 && ly >= 0) {
+        CGRect bf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
+        if (lx >= bf.origin.x && lx <= bf.origin.x + bf.size.width &&
+            ly >= bf.origin.y && ly <= bf.origin.y + bf.size.height) {
+            isBall = YES;
+        }
     }
     char buf[240];
     snprintf(buf, sizeof(buf), "SEND touches=%lu view=%s win=%s ball=%d phase=%ld tap=%ld loc=%.1f,%.1f",
