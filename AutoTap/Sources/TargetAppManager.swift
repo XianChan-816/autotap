@@ -54,12 +54,19 @@ enum TargetAppManager {
 
     /// 轮询读 tweak 心跳 + App 列表（App 前台定时调用，如 3s 一次）
     static func pollTweakData() {
-        // 心跳：只看 _hbtimets（epoch 秒；CFNumber ↔ NSNumber toll-free 桥接）
+        // v1.0.53.3 诊断：先尝试 cfprefsd，再用直接文件读三种候选路径
+        let probe = probePathsResult()
+        lastProbe = probe
+
+        // 优先 cfprefsd（如果通就用）
         if let t = readPref("_hbtimets") as? NSNumber {
             let epoch = t.doubleValue
             if epoch > 0 { lastHeartbeatTime = epoch }
+        } else if let t = probe.prefsHeartbeat {
+            // cfprefsd 不通但直接读 /var/mobile/ 通：用直接读结果
+            lastHeartbeatTime = t
         }
-        // App 列表
+        // App 列表：cfprefsd 优先，回退到直接读 prefs 路径
         if let dict = readPref("_apps") as? NSDictionary {
             var mapped: [String: String] = [:]
             for (k, v) in dict {
@@ -69,8 +76,54 @@ enum TargetAppManager {
                 prefsApps = mapped
                 invalidateCache()
             }
+        } else if !probe.prefsApps.isEmpty {
+            prefsApps = probe.prefsApps
+            invalidateCache()
         }
         DispatchQueue.main.async { onTweakData?() }
+    }
+
+    // MARK: - 诊断：直接文件读三种候选路径（v1.0.53.3）
+    struct ProbeResult {
+        var prefsExists: Bool = false        // /var/mobile/Library/Preferences/com.autotap.app.plist
+        var prefsHeartbeat: TimeInterval?     // 读到的 _hbtimets
+        var prefsApps: [String: String] = [:] // 读到的 _apps
+        var crashReporterExists: Bool = false // /var/mobile/Library/Logs/CrashReporter/com.autotap.app.plist
+        var crashReporterHeartbeat: TimeInterval?
+        var tmpExists: Bool = false           // /tmp/com.autotap.app.plist
+        var tmpHeartbeat: TimeInterval?
+    }
+    static private(set) var lastProbe = ProbeResult()
+
+    /// 直接尝试读三个候选路径；用 Foundation Data 而非 cfprefsd，绕过 App 沙盒路由。
+    private static func probePathsResult() -> ProbeResult {
+        var r = ProbeResult()
+        // 候选 1: /var/mobile/Library/Preferences/（cfprefsd 写这里，App 若有 no-sandbox 应能直接读）
+        if let d = directReadPlist("/var/mobile/Library/Preferences/com.autotap.app.plist") {
+            r.prefsExists = true
+            r.prefsHeartbeat = (d["_hbtimets"] as? NSNumber)?.doubleValue
+            if let apps = d["_apps"] as? [String: Any] {
+                for (k, v) in apps { r.prefsApps[k] = "\(v)" }
+            }
+        }
+        // 候选 2: CrashReporter 目录（iOS 沙盒白名单，App 可读写）
+        if let d = directReadPlist("/var/mobile/Library/Logs/CrashReporter/com.autotap.app.plist") {
+            r.crashReporterExists = true
+            r.crashReporterHeartbeat = (d["_hbtimets"] as? NSNumber)?.doubleValue
+        }
+        // 候选 3: /tmp（App 在容器内的 /tmp，但尝试真实路径）
+        if let d = directReadPlist("/tmp/com.autotap.app.plist") {
+            r.tmpExists = true
+            r.tmpHeartbeat = (d["_hbtimets"] as? NSNumber)?.doubleValue
+        }
+        return r
+    }
+
+    private static func directReadPlist(_ path: String) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+              let dict = plist as? [String: Any] else { return nil }
+        return dict
     }
 
     // MARK: - Darwin 通知名（跨进程 ABI，与 tweak 一字不差）
@@ -215,13 +268,14 @@ enum TargetAppManager {
         return result
     }
 
-    // MARK: - tweak 诊断（v1.0.53：CFPreferences 连通性）
+    // MARK: - tweak 诊断（v1.0.53.3：含直接路径探测）
 
     struct TweakDiagnostic {
         let prefsReady: Bool      // 共享偏好可读（tweak 至少写过一条）
         let tweakLoaded: Bool     // 心跳新鲜（<120s）
         let hbAge: TimeInterval   // 心跳年龄（秒；-1 = 从未收到）
         let appsCount: Int        // 共享偏好里 App 数
+        let probe: ProbeResult    // v1.0.53.3 新增：三个候选路径探测结果
 
         /// 诊断详情（通信状态）
         var pathSummary: String {
@@ -233,8 +287,16 @@ enum TargetAppManager {
                 s += String(format: "\n  心跳: %.0fs 前 ✓", hbAge)
             }
             s += "\n  App 列表: \(appsCount) 个"
+            // v1.0.53.3 三路径探测详情
+            s += "\n  ━━ v1.0.53.3 探测 ━━"
+            s += "\n  /var/mobile/Library/Preferences/: \(probe.prefsExists ? "✓可读" : "✗拒绝")" +
+                 (probe.prefsHeartbeat != nil ? " (有数据)" : "")
+            s += "\n  CrashReporter/: \(probe.crashReporterExists ? "✓可读" : "✗拒绝")" +
+                 (probe.crashReporterHeartbeat != nil ? " (有数据)" : "")
+            s += "\n  /tmp/: \(probe.tmpExists ? "✓可读" : "✗拒绝")" +
+                 (probe.tmpHeartbeat != nil ? " (有数据)" : "")
             if !prefsReady {
-                s += "\n  → 共享偏好不可用：确认 tweak 已注入、App 无 sandbox（TrollStore）"
+                s += "\n  → CFPreferences 不通：tweak/App 跨进程沙盒路由隔离"
             }
             return s
         }
@@ -263,7 +325,8 @@ enum TargetAppManager {
         return TweakDiagnostic(prefsReady: prefsReady,
                                tweakLoaded: tweakLoaded,
                                hbAge: age,
-                               appsCount: prefsApps.count)
+                               appsCount: prefsApps.count,
+                               probe: lastProbe)
     }
 
     // MARK: - 打开目标 App

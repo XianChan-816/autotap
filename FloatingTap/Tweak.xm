@@ -31,6 +31,7 @@
 #import <stdint.h>
 #import <stdbool.h>
 #import <unistd.h>
+#import <errno.h>
 #import <sys/sysctl.h>
 #import <dispatch/dispatch.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -302,6 +303,45 @@ static void FTWriteHeartbeat(void) {
     FTWritePref("_hbtimets", t);
     if (t) CFRelease(t);
     FTLog("heartbeat written via CFPreferences");
+    // v1.0.53.3 诊断：探测 cfprefsd 实际写入路径 + tweak 自身能否读回
+    {
+        const char *candidates[] = {
+            "/var/mobile/Library/Preferences/com.autotap.app.plist",
+            "/private/var/mobile/Library/Preferences/com.autotap.app.plist",
+            NULL
+        };
+        for (int i = 0; candidates[i]; i++) {
+            FILE *f = fopen(candidates[i], "r");
+            char diag[200];
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                long sz = ftell(f);
+                fclose(f);
+                snprintf(diag, sizeof(diag), "probe tweak: %s EXISTS sz=%ld", candidates[i], sz);
+            } else {
+                snprintf(diag, sizeof(diag), "probe tweak: %s MISSING (errno=%d)", candidates[i], errno);
+            }
+            FTLog(diag);
+        }
+        // 同进程自读 cfprefsd：验证 tweak 写完自己能不能读回
+        CFStringRef appID = FTSharedAppID();
+        CFStringRef k = FTCreateCFStr("_hbtimets");
+        if (appID && k) {
+            CFPropertyListRef v = CFPreferencesCopyValue(k, appID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+            char diag[160];
+            if (v && CFGetTypeID(v) == CFNumberGetTypeID()) {
+                double back = 0;
+                CFNumberGetValue((CFNumberRef)v, kCFNumberDoubleType, &back);
+                snprintf(diag, sizeof(diag), "probe tweak: cfprefsd self-read OK back=%.0f", back);
+                CFRelease(v);
+            } else {
+                snprintf(diag, sizeof(diag), "probe tweak: cfprefsd self-read NIL");
+            }
+            FTLog(diag);
+            CFRelease(k);
+        }
+        if (appID) CFRelease(appID);
+    }
 }
 
 // tweak→App：枚举已装 App 并写共享偏好（SB 进程 LSApplicationWorkspace 特权枚举）
@@ -848,7 +888,7 @@ static void FTTweakCtor(void) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.53.2 ctor run (arm64e, pure C, CFPreferences)\n");
+            fprintf(mk, "FloatingTap v1.0.53.3 ctor run (arm64e, pure C, CFPreferences+diagnostic)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
