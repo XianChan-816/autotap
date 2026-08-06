@@ -47,6 +47,7 @@ typedef id         (*Msg_AllocInitWithFrame)(id, SEL, CGRect);
 typedef void       (*Msg_SetFrame)(id, SEL, CGRect);
 typedef void       (*Msg_SetBackgroundColor)(id, SEL, id);
 typedef void       (*Msg_SetCGFloat)(id, SEL, CGFloat);
+typedef void       (*Msg_SetAlpha)(id, SEL, CGFloat);
 typedef void       (*Msg_SetBorderColor)(id, SEL, CGColorRef);
 typedef void       (*Msg_SetWindowLevel)(id, SEL, CGFloat);
 typedef void       (*Msg_SetHidden)(id, SEL, BOOL);
@@ -508,18 +509,21 @@ static void FTSyntheticTap(double px, double py) {
 // 现恢复 SB 进程内直接注入（_handleHIDEvent: 路线，v1.0.41~46 已验证能到达 UIKit）。
 // 注意：注入只对 SB 自己的窗口有效（主屏幕/系统 UI）；前台 App 需后续进程方案。
 
-static void FTRestoreBallInteractionCallback(void *ctx);
+static void FTRestoreBallVisibilityCallback(void *ctx);
 
 // 连点回调：在锁定坐标发一次合成点击。
-// ⚠️ 球是 keyWindow 的 subview，注入点（球心）正好命中球。注入瞬间关掉球 view 交互
-// （userInteractionEnabled=NO → 球不参与 hitTest → 注入触摸穿透到下层 app），60ms 后恢复。
-// 关键：必须只关 gBallView，不能关 gBallContainer（keyWindow），否则整个 SB 都失效。
+// ⚠️ 注入点 = 球心（球所在即点击目标）。注入瞬间把球 alpha 设为 0 → hitTest 穿透到下层
+// （图标/按钮），合成点击真正打到目标上。
+// 关键：不能用 setUserInteractionEnabled:NO —— 关交互会让 iOS 把球上的「长按手势」判为
+// Cancelled，导致 FTStopClicking 立即被调、连点只点 1 下就停。alpha 变化不会取消手势，
+// 所以长按能一直活到松手，连点循环持续跑。恢复窗口 50ms（小于连点间隔，且足以让
+// runloop 处理完注入事件）。
 static void FTClickCallback(void *ctx) {
     (void)ctx;
     if (!gBallView || !gIsClicking) return;
 
-    // 注入前：球 view 不参与 hitTest → 注入触摸穿透到下层
-    ((Msg_SetUserInteractionEnabled)objc_msgSend)(gBallView, sel_registerName("setUserInteractionEnabled:"), NO);
+    // 注入前：球变透明 → 注入触摸穿透到下层目标
+    ((Msg_SetAlpha)objc_msgSend)(gBallView, sel_registerName("setAlpha:"), 0.0);
 
     FTSyntheticTap(gClickLockX * gScreenW, gClickLockY * gScreenH);
     gClickCount++;
@@ -528,15 +532,15 @@ static void FTClickCallback(void *ctx) {
     snprintf(diag, sizeof(diag), "inject tap nx=%.2f ny=%.2f", gClickLockX, gClickLockY);
     FTLog(diag);
 
-    // 60ms 后恢复交互（连点 400ms 间隔，恢复后用户可松手停止）
-    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)),
-                     dispatch_get_main_queue(), NULL, FTRestoreBallInteractionCallback);
+    // 50ms 后恢复可见（连点间隔一般 >=100ms，恢复后用户可松手停止）
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), NULL, FTRestoreBallVisibilityCallback);
 }
 
-static void FTRestoreBallInteractionCallback(void *ctx) {
+static void FTRestoreBallVisibilityCallback(void *ctx) {
     (void)ctx;
     if (gBallView) {
-        ((Msg_SetUserInteractionEnabled)objc_msgSend)(gBallView, sel_registerName("setUserInteractionEnabled:"), YES);
+        ((Msg_SetAlpha)objc_msgSend)(gBallView, sel_registerName("setAlpha:"), 1.0);
     }
 }
 
@@ -956,14 +960,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.56 loaded (pure C ctor, drag-mode toggle fixed: long-press vs double-tap conflict resolved)");
+    syslog(LOG_ERR, "FloatingTap v1.0.57 loaded (pure C ctor, drag-mode toggle fixed: long-press vs double-tap conflict resolved; click loop fixed via alpha passthrough)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.56 ctor run (arm64e, pure C, drag-mode toggle fixed)\n");
+            fprintf(mk, "FloatingTap v1.0.57 ctor run (arm64e, pure C, drag-mode toggle fixed; click-loop fixed)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
