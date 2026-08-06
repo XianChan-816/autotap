@@ -213,8 +213,11 @@ static CFStringRef FTCreateCFStr(const char *s) {
 }
 
 // 共享偏好 appID（tweak 与 App 双方约定）
+// v1.0.53.1：必须用 App 自己的 bundleID，否则 cfprefsd 在 iOS 沙盒下
+// 拒绝 App 进程读第三方 appID 的偏好。Tweak 是越狱 root 进程，
+// 写任何 appID 都通；App 只能读自己 bundleID（com.autotap.app）的偏好。
 static CFStringRef FTSharedAppID(void) {
-    return FTCreateCFStr("com.floatingtap.shared");
+    return FTCreateCFStr("com.autotap.app");
 }
 
 // 写一条共享偏好（key:value → appID，current user / any host）
@@ -367,10 +370,24 @@ static void FTRegisterNotifications(void) {
         CFNotificationCenterAddObserver(center, &sNotifyObserver, FTNotificationCallback,
                                         sNameConfig, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     FTLog("darwin notify registered (CFPreferences comm)");
-    // 启动即尝试：读 App 可能已写的配置 + 推一次心跳/App 列表（App 可能已在跑）
+    // 启动即尝试：读 App 可能已写的配置 + 推一次心跳（轻量操作，30s 阶段稳定）
     FTReadConfig();
     FTWriteHeartbeat();
-    FTWriteAppsList();
+    // FTWriteAppsList 用 objc_msgSend 调 LSApplicationWorkspace.allApplications——
+    // 在 SB 启动 30s 阶段仍不稳，挪到独立的 60s 延迟回调，给 SB 更多时间稳定后再枚举。
+    FTLog("defer apps list scan to +60s");
+}
+
+// 60s 后单独尝试枚举 App 列表（不再混入 30s init）；依然包 try/catch 兜底
+static void FTAppsListDeferredCallback(void *ctx) {
+    (void)ctx;
+    FTLog("deferred apps list scan start");
+    @try {
+        FTWriteAppsList();
+    } @catch (NSException *ex) {
+        FTLog("apps list scan exception (swallowed)");
+        (void)ex;
+    }
 }
 
 // 恢复球窗口交互（注入后 60ms 回调）
@@ -751,6 +768,11 @@ static void FTTweakInitCallback(void *ctx) {
     // 是 Safe Mode 元凶（实测两次崩）；senderID 用硬编码兜底值即可。
     FTDumpEventIvars();
     FTEnsureBall(0);
+
+    // v1.0.53.1：延迟 60s 再枚举 App 列表（60s 期间 SB 完全稳定）。
+    // 之前在 30s init 内合并调用，FTWriteAppsList 内 objc_msgSend 触发 Safe Mode。
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60.0 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), NULL, FTAppsListDeferredCallback);
 }
 
 // MARK: - 诊断 hook（v1.0.29 临时）：观察注入触摸是否到达 UIKit 层

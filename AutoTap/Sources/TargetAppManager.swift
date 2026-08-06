@@ -2,12 +2,12 @@
 //  TargetAppManager.swift
 //  AutoTap
 //
-//  v1.0.53：与 FloatingTap tweak 通过 CFPreferences（cfprefsd 守护进程）通信，零第三方依赖。
+//  v1.0.53.1：与 FloatingTap tweak 通过 CFPreferences（cfprefsd 守护进程）通信，零第三方依赖。
 //  Dopamine rootless 官方无内置 rocketbootstrap（release note: "No rocketbootstrap / IPC"），
 //  CFMessagePort + RocketBootstrap 方案实测既崩 SB 又不通（两次 Safe Mode），v1.0.53 废弃。
 //
 //  协议（与 FloatingTap/Tweak.xm 一字不差）：
-//    - 共享 appID = "com.floatingtap.shared"（kCFPreferencesCurrentUser / kCFPreferencesAnyHost）
+//    - 共享 appID = "com.floatingtap.autotap"（App 自己的 bundleID；cfprefsd 跨进程沙盒合规）
 //    - tweak 写：_loaded=true, _hbtimets=epoch秒, _apps=dict(bundleID -> displayName)
 //    - App  写：_config=XML plist data（ClickX/ClickY/IntervalMs）
 //    - Darwin 通知：appStarted / configUpdated（App 启动/改配置时发，tweak 常驻 SB 收）
@@ -20,9 +20,10 @@ import Darwin
 
 enum TargetAppManager {
 
-    // MARK: - CFPreferences 通信（v1.0.53）
-
-    private static let sharedAppID = "com.floatingtap.shared" as CFString
+    // MARK: - CFPreferences 通信（v1.0.53.1）
+    // 必须是 App 自己的 bundleID（com.autotap.app，匹配 project.yml PRODUCT_BUNDLE_IDENTIFIER）：
+    // 沙盒 cfprefsd 拒绝 App 读第三方 appID 的偏好。Tweak 写，App 读同一 appID = 联通。
+    private static let sharedAppID = "com.autotap.app" as CFString
 
     /// 心跳 / App 列表更新后的 UI 刷新回调
     private static var onTweakData: (() -> Void)?
