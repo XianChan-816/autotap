@@ -30,6 +30,14 @@ bool FT_HIDIsConnected(void);
 // 在归一化坐标 (0~1, 0~1) 处发一次完整点击（down + up）
 void FT_HIDTapAt(double normalizedX, double normalizedY);
 
+// v1.0.62：分别派发 down / up 事件到「系统 HID 服务」（IOHIDEventSystemClientDispatchEvent），
+// 由系统路由到前台 App——这是 zxtouch/autotouch 的标准全局注入入口。
+// 注意：绝不能改走 SpringBoard 的 UIApplication._handleHIDEvent:（那只会喂 SB 自己的
+// 事件队列，前台 App 收不到，游戏内点击无效）。保持 down 立即、up 延迟，让系统把
+// 同一触摸关联为完整 tap（down/up 用相同 index）。
+void FT_HIDDispatchDown(double normalizedX, double normalizedY, uint32_t index);
+void FT_HIDDispatchUp(double normalizedX, double normalizedY, uint32_t index);
+
 // 构造一个 digitizer 事件（down=true 按下 / down=false 抬起），坐标归一化，
 // index 用于区分触摸（同一 tap 的 down/up 用相同 index，不同 tap 递增避免被串流）。
 // 返回 +1 的 IOHIDEvent（调用方负责 CFRelease）。

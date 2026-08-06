@@ -443,73 +443,49 @@ static void FTAppsListDeferredCallback(void *ctx) {
 // 恢复球窗口交互（注入后 60ms 回调）
 
 // MARK: - 连点注入
-// v1.0.41：走 [UIApplication _handleHIDEvent:]（UIKit 原生 HID 入口）——注入已确认
-// 到达 UIKit（UIApp handleHIDEvent called 对齐 + SEND ball=0 到下层窗口）。
-// v1.0.43：down 立即发，up 延迟 50ms 发（社区标准做法）——让 UIKit 把 down/up
-// 关联为同一触摸（v1.0.42 实测 down+up 零间隔可能被当作两个独立触摸，tap 手势不触发）。
+// v1.0.62：改用「系统 HID 服务」派发（IOHIDEventSystemClientDispatchEvent，见 HIDInject.c
+// 的 FT_HIDDispatchDown/Up），事件由系统路由到前台 App。
+// ⚠️ 旧版（v1.0.41~61）走 SpringBoard 的 UIApplication._handleHIDEvent:——那只喂 SB 自己的
+// 事件队列，前台 App（游戏）收不到 → 注入日志有、但无任何点击反馈。这是"无点击效果"的真凶。
+// down 立即发，up 延迟 50ms 发（社区标准做法）——让系统把 down/up 关联为同一触摸。
 
 static double gPendingUpX = 0;
 static double gPendingUpY = 0;
 static uint32_t gPendingUpIndex = 0;
 static void FTSendHIDUpCallback(void *ctx);
 
-// 发送一次 up（延迟回调）
+// 发送一次 up（延迟回调）——经系统 HID 服务派发
 static void FTSendHIDUpCallback(void *ctx) {
     (void)ctx;
-    @try {
-        Class ClsApp = objc_getClass("UIApplication");
-        if (!ClsApp) return;
-        id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
-        if (!app) return;
-        FT_IOHIDEventRef up = FT_HIDCreateDigitizerEvent(false, gPendingUpX, gPendingUpY, gPendingUpIndex);
-        if (up) {
-            ((Msg_SendID)objc_msgSend)(app, sel_registerName("_handleHIDEvent:"), up);
-            CFRelease(up);
-        }
-    } @catch (NSException *ex) {
-        (void)ex;
-    }
+    FT_HIDDispatchUp(gPendingUpX, gPendingUpY, gPendingUpIndex);
 }
 
 // 在屏幕像素点 (px,py) 发一次合成点击（down 立即 + up 延迟 50ms；每次 tap index 递增）
 static void FTSyntheticTap(double px, double py) {
-    @try {
-        double nx = (gScreenW > 0) ? px / gScreenW : 0.5;
-        double ny = (gScreenH > 0) ? py / gScreenH : 0.5;
-        if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
-        if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
+    double nx = (gScreenW > 0) ? px / gScreenW : 0.5;
+    double ny = (gScreenH > 0) ? py / gScreenH : 0.5;
+    if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
+    if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
 
-        Class ClsApp = objc_getClass("UIApplication");
-        if (!ClsApp) return;
-        id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
-        if (!app) return;
+    // 每次 tap 递增 index（v1.0.45：避免系统把连续注入事件串成同一触摸流）
+    gTapIndex = (gTapIndex % 19) + 1;
+    uint32_t idx = gTapIndex;
 
-        // 每次 tap 递增 index（v1.0.45：避免 UIKit 把连续注入事件串成同一触摸流）
-        gTapIndex = (gTapIndex % 19) + 1;
-        uint32_t idx = gTapIndex;
-
-        // down 立即
-        FT_IOHIDEventRef down = FT_HIDCreateDigitizerEvent(true, nx, ny, idx);
-        if (down) {
-            ((Msg_SendID)objc_msgSend)(app, sel_registerName("_handleHIDEvent:"), down);
-            CFRelease(down);
-        }
-        // up 延迟 50ms（关联同一触摸）
-        gPendingUpX = nx;
-        gPendingUpY = ny;
-        gPendingUpIndex = idx;
-        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                         dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
-    } @catch (NSException *ex) {
-        (void)ex;
-        FTLog("inject exception");
-    }
+    // down 立即（系统级派发）
+    FT_HIDDispatchDown(nx, ny, idx);
+    // up 延迟 50ms（关联同一触摸）
+    gPendingUpX = nx;
+    gPendingUpY = ny;
+    gPendingUpIndex = idx;
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
 }
 
-// MARK: - SB 端直接注入（v1.0.48 恢复：抖音双进程方案暂停，先把基本连点修好）
-// v1.0.47 曾把 SB 端注入改为写任务文件交给抖音进程，但抖音沙盒 /tmp 隔离导致通信失败。
-// 现恢复 SB 进程内直接注入（_handleHIDEvent: 路线，v1.0.41~46 已验证能到达 UIKit）。
-// 注意：注入只对 SB 自己的窗口有效（主屏幕/系统 UI）；前台 App 需后续进程方案。
+// MARK: - SB 端注入（v1.0.62 起走系统 HID 服务，可命中前台 App）
+// v1.0.62：改为 IOHIDEventSystemClientDispatchEvent 系统级派发（HIDInject.c 的
+// FT_HIDDispatchDown/Up），事件由系统路由到前台 App——游戏内点击也有效。
+// 旧版（v1.0.41~61）用 SpringBoard 的 UIApplication._handleHIDEvent: 只喂 SB 自身 UI 队列，
+// 前台 App 收不到 → 注入日志有、但无点击反馈。
 
 static void FTRestoreBallVisibilityCallback(void *ctx);
 
@@ -1114,14 +1090,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.61 loaded (pure C ctor, ball on _UISystemGestureWindow; captured from sendEvent; in-game overlay)");
+    syslog(LOG_ERR, "FloatingTap v1.0.62 loaded (pure C ctor, ball on _UISystemGestureWindow; system HID dispatch for in-app clicks)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.61 ctor run (arm64e, pure C, ball on _UISystemGestureWindow captured from sendEvent; in-game overlay)\n");
+            fprintf(mk, "FloatingTap v1.0.62 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; system HID dispatch for in-app clicks)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

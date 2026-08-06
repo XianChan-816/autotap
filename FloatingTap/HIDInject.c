@@ -254,3 +254,22 @@ void FT_HIDTapAt(double normalizedX, double normalizedY) {
     FT_DispatchEvent(FT_HIDCreateDigitizerEvent(true, normalizedX, normalizedY, 1));
     FT_DispatchEvent(FT_HIDCreateDigitizerEvent(false, normalizedX, normalizedY, 1));
 }
+
+// v1.0.62：down/up 单独派发到系统 HID 服务（供 Tweak.xm 的 down-now/up-延迟 模式复用）。
+// 关键：走 IOHIDEventSystemClientDispatchEvent，事件由系统路由到前台 App，
+// 而不是 SpringBoard 的 _handleHIDEvent:（那只能喂 SB 自身 UI，App 收不到）。
+void FT_HIDDispatchDown(double normalizedX, double normalizedY, uint32_t index) {
+    if (!FT_HIDConnect()) {
+        syslog(LOG_ERR, "FloatingTap HID dispatch down: not connected");
+        return;
+    }
+    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(true, normalizedX, normalizedY, index));
+}
+
+void FT_HIDDispatchUp(double normalizedX, double normalizedY, uint32_t index) {
+    if (!FT_HIDConnect()) {
+        syslog(LOG_ERR, "FloatingTap HID dispatch up: not connected");
+        return;
+    }
+    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(false, normalizedX, normalizedY, index));
+}
