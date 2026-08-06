@@ -47,6 +47,7 @@ typedef id         (*Msg_AllocInitWithFrame)(id, SEL, CGRect);
 typedef void       (*Msg_SetFrame)(id, SEL, CGRect);
 typedef void       (*Msg_SetBackgroundColor)(id, SEL, id);
 typedef void       (*Msg_SetCGFloat)(id, SEL, CGFloat);
+typedef CGFloat    (*Msg_CGFloatReturn)(id, SEL);
 typedef void       (*Msg_SetAlpha)(id, SEL, CGFloat);
 typedef void       (*Msg_SetBorderColor)(id, SEL, CGColorRef);
 typedef void       (*Msg_SetWindowLevel)(id, SEL, CGFloat);
@@ -89,7 +90,7 @@ static BOOL FTIsBundle(const char *bundleID) {
 
 // MARK: - 全局状态（纯 C）
 
-static id gBallContainer = nil;   // 球的父窗口（v1.0.55：app.keyWindow，_UISystemGestureWindow 不再拦截）
+static id gBallContainer = nil;   // 球的父窗口（v1.0.58：优先 _UISystemGestureWindow，始终位于所有 App 之上；兜底 keyWindow）
 static id gBallView      = nil;   // 球 UIView 本身
 static id gTapGR      = nil;
 static id gLongGR     = nil;
@@ -722,7 +723,7 @@ static id FTMakeGR(Class cls, const char *actionName) {
 // MARK: - 创建小球
 
 static void FTSetupBall(void) {
-    // v1.0.55：球已是 keyWindow 的 subview，凭 superview 判断是否已挂载
+    // v1.0.58：球挂在 _UISystemGestureWindow（或兜底 keyWindow）的 subview，凭 superview 判断是否已挂载
     if (gBallView) {
         id sup = ((Msg_Send)objc_msgSend)(gBallView, sel_registerName("superview"));
         if (sup) return;
@@ -752,11 +753,37 @@ static void FTSetupBall(void) {
     CGFloat d = 56.0;
     CGRect ballFrame = CGRectMake(sb.size.width / 2 - d / 2, sb.size.height / 2 - d / 2, d, d);
 
-    // 拿当前前台 keyWindow（SB 自身的窗口；球的 hitTest 链跟随 SB 主窗口透传触摸）
+    // v1.0.58：球必须挂到 _UISystemGestureWindow（系统手势层，始终位于所有 App 之上），
+    // 这样在游戏 / 前台 App 内也可见、可触摸。keyWindow 是 SpringBoard 窗口，会被前台 App 盖住。
     id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
     id keyWin = app ? ((Msg_Send)objc_msgSend)(app, sel_registerName("keyWindow")) : nil;
-    if (!keyWin) {
-        FTLog("setup failed: no keyWindow");
+
+    // 优先找系统手势窗口（类名含 SystemGesture / GestureWindow / FBSystemGesture）；
+    // 兜底：取 windowLevel 最高的窗口；再兜底：退化用 keyWindow（主屏可用，游戏内会被盖——但不崩）。
+    id targetWin = nil;
+    if (app) {
+        id wins = ((Msg_Send)objc_msgSend)(app, sel_registerName("windows"));
+        if (wins) {
+            NSUInteger cnt = ((Msg_Count)objc_msgSend)(wins, sel_registerName("count"));
+            CGFloat bestLevel = -1.0;
+            id bestWin = nil;
+            for (NSUInteger i = 0; i < cnt; i++) {
+                id w = ((Msg_ObjectAtIndex)objc_msgSend)(wins, sel_registerName("objectAtIndex:"), i);
+                if (!w) continue;
+                const char *cn = object_getClassName(w);
+                if (cn && (strstr(cn, "SystemGesture") || strstr(cn, "GestureWindow") || strstr(cn, "FBSystemGesture"))) {
+                    targetWin = w;
+                    break;
+                }
+                CGFloat lvl = ((Msg_CGFloatReturn)objc_msgSend)(w, sel_registerName("windowLevel"));
+                if (lvl > bestLevel) { bestLevel = lvl; bestWin = w; }
+            }
+            if (!targetWin && bestWin) targetWin = bestWin;
+        }
+    }
+    if (!targetWin) targetWin = keyWin;
+    if (!targetWin) {
+        FTLog("setup failed: no overlay window");
         return;
     }
 
@@ -803,12 +830,11 @@ static void FTSetupBall(void) {
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gLongGR);
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gPanGR);
 
-    // v1.0.55：把球作为 subview 直接挂在 keyWindow 上
-    // 这样球的 hitTest 链跟 SB 一致——iOS 15 _UISystemGestureWindow 拦截后事件
-    // 仍会按 SB 自身的 responder 链透传到球（之前独立 UIWindow 被 _UISystemGestureWindow 截胡）。
-    ((Msg_AddSubview)objc_msgSend)(keyWin, sel_registerName("addSubview:"), ball);
+    // v1.0.58：把球作为 subview 挂到 targetWin（优先 _UISystemGestureWindow，始终位于所有 App 之上）。
+    // 这样球在游戏 / 前台 App 内也可见、可触摸；点击注入本身是绝对坐标，跟前台 App 无关。
+    ((Msg_AddSubview)objc_msgSend)(targetWin, sel_registerName("addSubview:"), ball);
 
-    gBallContainer = keyWin;
+    gBallContainer = targetWin;
     gBallView      = ball;
     FTApplyBallAppearance(); // 初始蓝色=连击模式
 
@@ -911,8 +937,9 @@ static void FTTweakInitCallback(void *ctx) {
     // v1.0.44 诊断：加 UITouch phase/tapCount（判断 down/up 是否关联成完整 tap）
     // v1.0.49 诊断：加 locationInWindow 像素坐标——判断坐标单位是否被 UIKit 误解
     //  （注入传归一化 0~1，若 UIKit 期望像素 → 触摸落在屏幕角落 → hitTest 命中不了图标）
-    // v1.0.55+：球现在是 keyWindow 的 subview（非独立 window），self==gBallContainer 恒不成立。
-    // 改为直接判断触摸坐标是否落在球 frame 内——这样碰到球时 ball=1，否则 0。
+    // v1.0.55+：球现在是 window 的 subview（非独立 window），self==gBallContainer 不可靠。
+    // v1.0.58：gBallContainer 改为 _UISystemGestureWindow（接收所有触摸），self==gBallContainer 恒真。
+    // 因此 isBall 只判触摸坐标是否落在球 frame 内——命中球时 ball=1，否则 0。
     const char *cls = "?";
     const char *winCls = object_getClassName(self);
     if (!winCls) winCls = "?";
@@ -927,8 +954,8 @@ static void FTTweakInitCallback(void *ctx) {
         CGPoint loc = ((Msg_LocationInView)objc_msgSend)(t, sel_registerName("locationInView:"), nil);
         lx = loc.x; ly = loc.y;
     }
-    BOOL isBall = (self == gBallContainer);
-    if (!isBall && gBallView && lx >= 0 && ly >= 0) {
+    BOOL isBall = NO;
+    if (gBallView && lx >= 0 && ly >= 0) {
         CGRect bf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
         if (lx >= bf.origin.x && lx <= bf.origin.x + bf.size.width &&
             ly >= bf.origin.y && ly <= bf.origin.y + bf.size.height) {
@@ -960,14 +987,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.57 loaded (pure C ctor, drag-mode toggle fixed: long-press vs double-tap conflict resolved; click loop fixed via alpha passthrough)");
+    syslog(LOG_ERR, "FloatingTap v1.0.58 loaded (pure C ctor, ball on _UISystemGestureWindow for in-game overlay; click-loop fixed via alpha passthrough)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.57 ctor run (arm64e, pure C, drag-mode toggle fixed; click-loop fixed)\n");
+            fprintf(mk, "FloatingTap v1.0.58 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; in-game overlay)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
