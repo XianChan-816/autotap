@@ -236,6 +236,7 @@ static void FTWritePref(const char *key, CFPropertyListRef value) {
 // 前向声明（定义在文件后段）
 static void FTMoveBallToConfig(void);
 static void FTWriteAppsList(void);
+static void FTAppsListDeferredCallback(void *ctx);
 
 // 应用共享偏好里的 config（CoreFoundation CFDictionary，纯 C，无 ObjC）
 static void FTApplyConfigFromPrefs(CFDictionaryRef dict) {
@@ -344,9 +345,12 @@ static void FTNotificationCallback(CFNotificationCenterRef center, void *observe
     char buf[256];
     if (!name || !CFStringGetCString(name, buf, sizeof(buf), kCFStringEncodingUTF8)) return;
     if (strcmp(buf, "com.floatingtap.autotap.appStarted") == 0) {
-        FTLog("got appStarted -> write hb + apps via CFPreferences");
+        FTLog("got appStarted -> write hb via CFPreferences");
         FTWriteHeartbeat();
-        FTWriteAppsList();
+        // v1.0.53.2：绝不在通知线程同步枚举 App（LSApplicationWorkspace 在通知回调里仍会崩 SB）。
+        // 改派发 3s 延迟到主队列，复用已 @try 包裹的延迟回调；与 60s 那次枚举互不冲突。
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                         dispatch_get_main_queue(), NULL, FTAppsListDeferredCallback);
     } else if (strcmp(buf, "com.floatingtap.autotap.configUpdated") == 0) {
         FTLog("got configUpdated -> read config from CFPreferences");
         FTReadConfig();
@@ -844,7 +848,7 @@ static void FTTweakCtor(void) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.53 ctor run (arm64e, pure C, CFPreferences)\n");
+            fprintf(mk, "FloatingTap v1.0.53.2 ctor run (arm64e, pure C, CFPreferences)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
