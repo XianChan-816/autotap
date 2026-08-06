@@ -2,46 +2,29 @@
 //  TargetAppManager.swift
 //  AutoTap
 //
-//  v1.0.52：与 FloatingTap tweak 通过 CFMessagePort（CoreFoundation C API）通信，
-//  RocketBootstrap 打通 iOS 沙盒 bootstrap namespace 隔离。
-//  文件系统跨进程在 iOS 15.5 + Dopamine rootless 下彻底不通（App 被 sandbox 重定向，
-//  /var/mobile/ 等系统路径 App 全部 stat 不到——v1.0.50-fix3 多路径探针实测 ✗stat），
-//  故弃用文件方案，全部数据走 mach port。
+//  v1.0.53：与 FloatingTap tweak 通过 CFPreferences（cfprefsd 守护进程）通信，零第三方依赖。
+//  Dopamine rootless 官方无内置 rocketbootstrap（release note: "No rocketbootstrap / IPC"），
+//  CFMessagePort + RocketBootstrap 方案实测既崩 SB 又不通（两次 Safe Mode），v1.0.53 废弃。
 //
 //  协议（与 FloatingTap/Tweak.xm 一字不差）：
-//    - App 端 server：com.floatingtap.autotap
-//        msgid 1 = tweak→App 心跳 plist（_loaded/_time，_time 为毫秒）
-//        msgid 3 = tweak→App 已装 App 列表 plist（dict: bundleID -> displayName）
-//    - tweak 端 server：com.floatingtap.tweak
-//        msgid 0 = App→tweak 配置 plist（Targets/IntervalMs/ClickX/ClickY）
-//        msgid 2 = App→tweak 请求重新推送 App 列表
-//    - Darwin 通知（appStarted / configUpdated）仅作唤醒信号，不承载数据
-//
-//  依赖：设备需装有 librocketbootstrap.dylib（Sileo 搜 com.rpetrich.rocketbootstrap）。
+//    - 共享 appID = "com.floatingtap.shared"（kCFPreferencesCurrentUser / kCFPreferencesAnyHost）
+//    - tweak 写：_loaded=true, _hbtimets=epoch秒, _apps=dict(bundleID -> displayName)
+//    - App  写：_config=XML plist data（ClickX/ClickY/IntervalMs）
+//    - Darwin 通知：appStarted / configUpdated（App 启动/改配置时发，tweak 常驻 SB 收）
+//  App 前台定时 pollTweakData() 读共享偏好（心跳/App 列表），无需常驻回调。
 //
 
 import UIKit
 import CoreFoundation
 import Darwin
 
-// CFMessagePort 回调：@convention(c) 函数指针要求闭包**零捕获**，必须放文件顶层；
-// 内部引用类型成员一律用全限定名 TargetAppManager.xxx（静态访问不算捕获）。
-private let kAutoTapMsgPortCallback: CFMessagePortCallBack = { _, msgid, data, _ in
-    guard let d = data else { return nil }
-    TargetAppManager.handleMessage(msgid: msgid, data: d)
-    return nil
-}
-
 enum TargetAppManager {
 
-    // MARK: - IPC 基础设施（v1.0.52）
+    // MARK: - CFPreferences 通信（v1.0.53）
 
-    private static var rbHandle: UnsafeMutableRawPointer?
-    private static var rbExposeSym: UnsafeMutableRawPointer?
-    private static var serverPort: CFMessagePort?
-    private static var ipcReady = false            // RocketBootstrap 加载 + server 创建成功
+    private static let sharedAppID = "com.floatingtap.shared" as CFString
 
-    /// 心跳 / App 列表到达时的 UI 刷新回调
+    /// 心跳 / App 列表更新后的 UI 刷新回调
     private static var onTweakData: (() -> Void)?
 
     /// 最后一次收到 tweak 心跳的 epoch 秒
@@ -52,80 +35,42 @@ enum TargetAppManager {
         return lastHeartbeatTime > 0 && (Date().timeIntervalSince1970 - lastHeartbeatTime) < 120
     }
 
-    /// 最近一次从 tweak 收到的 App 列表（bundleID -> displayName）
-    private static var ipcApps: [String: String] = [:]
+    /// 最近一次从 tweak 读到的 App 列表（bundleID -> displayName）
+    private static var prefsApps: [String: String] = [:]
 
-    /// dlopen librocketbootstrap（多路径，Dopamine rootless 下可能在不同位置）
-    private static func loadRocketBootstrap() {
-        if rbHandle != nil { return }
-        let paths = [
-            "/usr/lib/librocketbootstrap.dylib",
-            "/var/jb/usr/lib/librocketbootstrap.dylib",
-            "/Library/MobileSubstrate/DynamicLibraries/librocketbootstrap.dylib",
-        ]
-        for p in paths {
-            if let h = dlopen(p, RTLD_LAZY) { rbHandle = h; break }
-        }
-        if let h = rbHandle {
-            rbExposeSym = dlsym(h, "rocketbootstrap_cfmessageportexposelocal")
-        }
+    /// 读一条共享偏好（current user / any host）
+    private static func readPref(_ key: String) -> CFPropertyList? {
+        guard let v = CFPreferencesCopyValue(key as CFString, sharedAppID,
+                                             kCFPreferencesCurrentUser, kCFPreferencesAnyHost) else { return nil }
+        return v.takeRetainedValue()
     }
 
-    /// 把 local port 暴露到全局 bootstrap（否则跨进程查不到）
-    private static func exposeToGlobalBootstrap(_ port: CFMessagePort?) {
-        guard let sym = rbExposeSym, let port else { return }
-        typealias ExposeFn = @convention(c) (CFMessagePort?) -> Void
-        let fn = unsafeBitCast(sym, to: ExposeFn.self)
-        fn(port)
+    /// 写一条共享偏好（App 侧）
+    private static func writePref(_ key: String, _ value: CFPropertyList) {
+        CFPreferencesSetValue(key as CFString, value, sharedAppID,
+                              kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+        CFPreferencesAppSynchronize(sharedAppID)
     }
 
-    /// 创建 App 端 IPC server（com.floatingtap.autotap），tweak 通过它推心跳 / App 列表
-    static func setupIPCServer() {
-        if serverPort != nil { return }
-        loadRocketBootstrap()
-        let name = "com.floatingtap.autotap" as CFString
-        var ctx = CFMessagePortContext(version: 0, info: nil, retain: nil, release: nil, copyDescription: nil)
-        guard let port = CFMessagePortCreateLocal(nil, name, kAutoTapMsgPortCallback, &ctx, nil) else {
-            ipcReady = false
-            return
+    /// 轮询读 tweak 心跳 + App 列表（App 前台定时调用，如 3s 一次）
+    static func pollTweakData() {
+        // 心跳：只看 _hbtimets（epoch 秒；CFNumber ↔ NSNumber toll-free 桥接）
+        if let t = readPref("_hbtimets") as? NSNumber {
+            let epoch = t.doubleValue
+            if epoch > 0 { lastHeartbeatTime = epoch }
         }
-        serverPort = port
-        exposeToGlobalBootstrap(port)
-        if let src = CFMessagePortCreateRunLoopSource(nil, port, 0) {
-            CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
-        }
-        ipcReady = true
-    }
-
-    /// 解析 tweak 推来的消息（fileprivate：供文件顶层 kAutoTapMsgPortCallback 调用）
-    fileprivate static func handleMessage(msgid: Int32, data: CFData) {
-        guard let plist = CFPropertyListCreateWithData(nil, data, 0, nil, nil),
-              let dict = plist.takeRetainedValue() as? [String: Any] else { return }
-        if msgid == 1 {   // heartbeat
-            if let t = dict["_time"] as? NSNumber {
-                lastHeartbeatTime = t.doubleValue / 1000.0   // tweak 存毫秒
-                DispatchQueue.main.async { onTweakData?() }
+        // App 列表
+        if let dict = readPref("_apps") as? NSDictionary {
+            var mapped: [String: String] = [:]
+            for (k, v) in dict {
+                if let key = k as? String { mapped[key] = "\(v)" }
             }
-        } else if msgid == 3 {   // apps list
-            var apps: [String: String] = [:]
-            for (k, v) in dict { apps[k] = "\(v)" }
-            ipcApps = apps
-            invalidateCache()
-            DispatchQueue.main.async { onTweakData?() }
+            if !mapped.isEmpty {
+                prefsApps = mapped
+                invalidateCache()
+            }
         }
-    }
-
-    /// 把配置推给 tweak（msgid=0，plist payload）
-    private static func sendConfig(_ dict: [String: Any]) {
-        guard let data = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0) else { return }
-        guard let remote = CFMessagePortCreateRemote(nil, "com.floatingtap.tweak" as CFString) else { return }
-        _ = CFMessagePortSendRequest(remote, 0, data as CFData, 5.0, 0.0, nil, nil)
-    }
-
-    /// 请求 tweak 重新推送 App 列表（msgid=2）
-    static func requestAppsList() {
-        guard let remote = CFMessagePortCreateRemote(nil, "com.floatingtap.tweak" as CFString) else { return }
-        _ = CFMessagePortSendRequest(remote, 2, nil, 5.0, 0.0, nil, nil)
+        DispatchQueue.main.async { onTweakData?() }
     }
 
     // MARK: - Darwin 通知名（跨进程 ABI，与 tweak 一字不差）
@@ -135,27 +80,31 @@ enum TargetAppManager {
 
     // MARK: - 启动与监听
 
-    /// App 启动：注册 IPC server + 发 Darwin 唤醒（tweak 收到后推心跳 + App 列表）
+    /// App 启动：发 Darwin 唤醒（tweak 收到后写心跳 + App 列表到共享偏好），并立即轮询一次
     static func notifyAppStarted() {
-        setupIPCServer()
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         CFNotificationCenterPostNotification(center,
             CFNotificationName(rawValue: notifyAppStartedName as CFString), nil, nil, true)
-        // 立即主动请求一次（tweak 在跑的话会回推心跳 + 列表）
-        requestAppsList()
+        pollTweakData()
     }
 
-    /// 监听 tweak 数据更新（心跳 / App 列表到达时回调）
+    /// 监听 tweak 数据更新（每次 pollTweakData 读到新数据后回调）
     static func startListeningForTweakUpdates(handler: @escaping () -> Void) {
         onTweakData = handler
     }
 
-    // MARK: - 配置（内存缓存 + IPC 推送）
+    // MARK: - 配置（内存缓存 + CFPreferences 推送 + Darwin 唤醒）
 
     private static var configCache: [String: Any] = [:]
 
     private static func pushConfig() {
-        sendConfig(configCache)
+        var dict: [String: Any] = [:]
+        dict["ClickX"] = configCache["ClickX"] ?? 0.5
+        dict["ClickY"] = configCache["ClickY"] ?? 0.5
+        dict["IntervalMs"] = configCache["IntervalMs"] ?? 200
+        if let data = try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0) {
+            writePref("_config", data as CFData)
+        }
         let center = CFNotificationCenterGetDarwinNotifyCenter()
         CFNotificationCenterPostNotification(center,
             CFNotificationName(rawValue: notifyConfigUpdatedName as CFString), nil, nil, true)
@@ -215,15 +164,15 @@ enum TargetAppManager {
     }
 
     /// 枚举所有已安装 App（含系统 App，可按需过滤），按显示名排序。
-    /// 主方案：tweak（SB 特权进程）通过 IPC 枚举回传的清单。
+    /// 主方案：tweak（SB 特权进程）写共享偏好的清单（pollTweakData 已读入 prefsApps）。
     /// 兜底：文件系统扫描安装目录（越狱环境可读）。
     static func installedApps(includeSystem: Bool = false) -> [AppInfo] {
         if let cached = cachedApps { return cached }
         var found: [String: AppInfo] = [:]
 
-        // 方式 1（主）：IPC 收到的 tweak 枚举清单
-        if !ipcApps.isEmpty {
-            for (bid, name) in ipcApps {
+        // 方式 1（主）：tweak 枚举写进共享偏好的清单
+        if !prefsApps.isEmpty {
+            for (bid, name) in prefsApps {
                 if !includeSystem && bid.hasPrefix("com.apple.") { continue }
                 found[bid] = AppInfo(bundleID: bid, name: name.isEmpty ? bid : name)
             }
@@ -266,49 +215,43 @@ enum TargetAppManager {
         return result
     }
 
-    // MARK: - tweak 诊断（v1.0.52：IPC 连通性）
+    // MARK: - tweak 诊断（v1.0.53：CFPreferences 连通性）
 
     struct TweakDiagnostic {
-        let ipcReady: Bool          // RocketBootstrap 加载 + App server 创建成功
-        let rbLoaded: Bool          // dlopen librocketbootstrap 成功
-        let tweakLoaded: Bool       // 心跳新鲜（<120s）
-        let hbAge: TimeInterval     // 心跳年龄（秒；-1 = 从未收到）
-        let appsCount: Int          // IPC 收到 App 数
-        let serverName: String
+        let prefsReady: Bool      // 共享偏好可读（tweak 至少写过一条）
+        let tweakLoaded: Bool     // 心跳新鲜（<120s）
+        let hbAge: TimeInterval   // 心跳年龄（秒；-1 = 从未收到）
+        let appsCount: Int        // 共享偏好里 App 数
 
-        /// 诊断详情（替代旧版路径探针矩阵；现为 IPC 状态）
+        /// 诊断详情（通信状态）
         var pathSummary: String {
-            var s = "IPC 诊断："
-            s += "\n  RocketBootstrap: \(rbLoaded ? "已加载 ✓" : "未加载 ✗")"
-            s += "\n  App server \(serverName): \(ipcReady ? "已创建 ✓" : "失败 ✗")"
+            var s = "通信诊断："
+            s += "\n  CFPreferences: \(prefsReady ? "已连接 ✓" : "不可用 ✗")"
             if hbAge < 0 {
                 s += "\n  心跳: 从未收到 ✗"
             } else {
                 s += String(format: "\n  心跳: %.0fs 前 ✓", hbAge)
             }
             s += "\n  App 列表: \(appsCount) 个"
-            if !rbLoaded {
-                s += "\n  → Sileo 安装 com.rpetrich.rocketbootstrap 后重启"
+            if !prefsReady {
+                s += "\n  → 共享偏好不可用：确认 tweak 已注入、App 无 sandbox（TrollStore）"
             }
             return s
         }
 
         /// 供 UI 展示的一行状态描述
         var message: String {
-            if !rbLoaded {
-                return "IPC 未就绪：设备缺 librocketbootstrap.dylib（Sileo 装 com.rpetrich.rocketbootstrap）。"
-            }
-            if !ipcReady {
-                return "IPC server 创建失败（CFMessagePortCreateLocal 返回 nil）。"
+            if !prefsReady {
+                return "通信未就绪：CFPreferences 共享偏好不可用（确认 FloatingTap.deb 已装并重启）。"
             }
             if !tweakLoaded {
                 if hbAge < 0 {
-                    return "tweak 未加载：尚未收到心跳（server \(serverName) 已就绪，请确认 FloatingTap.deb 已装并完整重启）。"
+                    return "tweak 未加载：尚未收到心跳（确认 FloatingTap.deb 已装并重启）。"
                 }
                 return "tweak 心跳过期：\(Int(hbAge))s 前最后一次，请确认 tweak 在运行。"
             }
             if appsCount == 0 {
-                return "tweak 已加载（心跳正常），但 App 列表为空，请求中…"
+                return "tweak 已加载 ✓ 心跳正常，但 App 列表为空，等待推送…"
             }
             return "tweak 已加载 ✓ 心跳正常，已收到 \(appsCount) 个 App。"
         }
@@ -316,12 +259,11 @@ enum TargetAppManager {
 
     static func tweakDiagnostic() -> TweakDiagnostic {
         let age = lastHeartbeatTime > 0 ? Date().timeIntervalSince1970 - lastHeartbeatTime : -1
-        return TweakDiagnostic(ipcReady: ipcReady && serverPort != nil,
-                               rbLoaded: rbHandle != nil,
+        let prefsReady = readPref("_loaded") != nil || readPref("_hbtimets") != nil
+        return TweakDiagnostic(prefsReady: prefsReady,
                                tweakLoaded: tweakLoaded,
                                hbAge: age,
-                               appsCount: ipcApps.count,
-                               serverName: "com.floatingtap.autotap")
+                               appsCount: prefsApps.count)
     }
 
     // MARK: - 打开目标 App

@@ -33,10 +33,6 @@ typedef int32_t FT_IOReturn;
 typedef uint32_t FT_IOOptionBits;
 static const FT_IOReturn FT_kIOReturnSuccess = 0;
 
-typedef void (*FT_IOHIDSystemCallback)(void *target, void *refcon,
-                                       FT_IOHIDServiceRef service,
-                                       FT_IOHIDEventRef event);
-
 enum {
     FT_kIOHIDDigitizerEventRange    = 0x00000001,
     FT_kIOHIDDigitizerEventTouch    = 0x00000002,
@@ -68,11 +64,8 @@ static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerEvent)(CFAllocatorRef,
 static FT_IOHIDEventSystemClientRef (*p_IOHIDEventSystemClientCreate)(CFAllocatorRef);
 static FT_IOReturn (*p_IOHIDEventSystemClientDispatchEvent)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef);
 static void (*p_IOHIDEventSystemClientScheduleWithRunLoop)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef);
-static void (*p_IOHIDEventSystemClientUnscheduleWithRunLoop)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef);
-static void (*p_IOHIDEventSystemClientRegisterEventCallback)(FT_IOHIDEventSystemClientRef, FT_IOHIDSystemCallback, void *, void *);
 static void (*p_IOHIDEventSetSenderID)(FT_IOHIDEventRef, uint64_t);
 static void (*p_IOHIDEventSetIntegerValue)(FT_IOHIDEventRef, uint32_t, int64_t);
-static uint64_t (*p_IOHIDEventGetSenderID)(FT_IOHIDEventRef);
 static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerFingerEvent)(CFAllocatorRef,
                                                                   uint64_t timeStamp,
                                                                   uint32_t index,
@@ -115,16 +108,10 @@ static bool FT_HIDLoadSymbols(void) {
         (FT_IOReturn (*)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef))dlsym(handle, "IOHIDEventSystemClientDispatchEvent");
     p_IOHIDEventSystemClientScheduleWithRunLoop =
         (void (*)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef))dlsym(handle, "IOHIDEventSystemClientScheduleWithRunLoop");
-    p_IOHIDEventSystemClientUnscheduleWithRunLoop =
-        (void (*)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef))dlsym(handle, "IOHIDEventSystemClientUnscheduleWithRunLoop");
-    p_IOHIDEventSystemClientRegisterEventCallback =
-        (void (*)(FT_IOHIDEventSystemClientRef, FT_IOHIDSystemCallback, void *, void *))dlsym(handle, "IOHIDEventSystemClientRegisterEventCallback");
     p_IOHIDEventSetSenderID =
         (void (*)(FT_IOHIDEventRef, uint64_t))dlsym(handle, "IOHIDEventSetSenderID");
     p_IOHIDEventSetIntegerValue =
         (void (*)(FT_IOHIDEventRef, uint32_t, int64_t))dlsym(handle, "IOHIDEventSetIntegerValue");
-    p_IOHIDEventGetSenderID =
-        (uint64_t (*)(FT_IOHIDEventRef))dlsym(handle, "IOHIDEventGetSenderID");
     p_IOHIDEventCreateDigitizerFingerEvent =
         (FT_IOHIDEventRef (*)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
                               double, double, double, double, double, Boolean, Boolean, FT_IOOptionBits))
@@ -174,54 +161,11 @@ static void FTHIDLog(const char *msg) {
     }
 }
 
-// MARK: - senderID 捕获（zxtouch 机制：从真实触摸提取设备专属 senderID）
-
-static uint64_t g_deviceSenderID = 0;
-static FT_IOHIDEventSystemClientRef g_sidClient = NULL;
-
-static void FT_SIDCallback(void *target, void *refcon, FT_IOHIDServiceRef service, FT_IOHIDEventRef event) {
-    (void)target; (void)refcon; (void)service;
-    if (!event || g_deviceSenderID) return;
-    if (p_IOHIDEventGetSenderID) {
-        uint64_t sid = p_IOHIDEventGetSenderID(event);
-        if (sid) {
-            g_deviceSenderID = sid;
-            char buf[96];
-            snprintf(buf, sizeof(buf), "captured senderID: 0x%llx", (unsigned long long)sid);
-            FTHIDLog(buf);
-            // 提取到后注销捕获 client
-            if (g_sidClient) {
-                if (p_IOHIDEventSystemClientUnscheduleWithRunLoop) {
-                    p_IOHIDEventSystemClientUnscheduleWithRunLoop(g_sidClient, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
-                }
-                CFRelease(g_sidClient);
-                g_sidClient = NULL;
-            }
-        }
-    }
-}
-
-void FT_HIDStartSenderIDCapture(void) {
-    if (g_sidClient || g_deviceSenderID) return;
-    if (!FT_HIDLoadSymbols()) return;
-    if (!p_IOHIDEventSystemClientRegisterEventCallback) {
-        FTHIDLog("senderID: no register callback symbol");
-        return;
-    }
-    g_sidClient = p_IOHIDEventSystemClientCreate(kCFAllocatorDefault);
-    if (!g_sidClient) {
-        FTHIDLog("senderID: client create failed");
-        return;
-    }
-    p_IOHIDEventSystemClientRegisterEventCallback(g_sidClient, FT_SIDCallback, NULL, NULL);
-    if (p_IOHIDEventSystemClientScheduleWithRunLoop) {
-        p_IOHIDEventSystemClientScheduleWithRunLoop(g_sidClient, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
-    }
-    FTHIDLog("senderID capture started");
-}
+// MARK: - senderID（v1.0.53：移除 IOHID 事件回调捕获——arm64e SB 注册回调
+// 是 Safe Mode 元凶，实测两次崩；直接用 zxtouch 社区通用硬编码兜底值）
 
 uint64_t FT_HIDSenderID(void) {
-    return g_deviceSenderID ? g_deviceSenderID : 0x8000000817371935ULL;
+    return 0x8000000817371935ULL;
 }
 
 // MARK: - 事件构造

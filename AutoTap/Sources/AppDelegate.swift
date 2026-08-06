@@ -36,6 +36,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
             NotificationCenter.default.post(name: .floatingTapTweakDataUpdated, object: nil)
         }
 
+        // v1.0.53：前台定时轮询共享偏好（CFPreferences），持续刷新心跳/App 列表状态
+        Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { _ in
+            TargetAppManager.pollTweakData()
+        }
+
         return true
     }
 

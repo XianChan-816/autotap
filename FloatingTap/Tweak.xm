@@ -1,15 +1,17 @@
 //
-//  Tweak.xm — FloatingTap v1.0.52
+//  Tweak.xm — FloatingTap v1.0.53
 //
 //  架构（用户原设计）：AutoTap App = 启动器（选目标 App / 拖动十字线定位置 / 间隔），
 //  FloatingTap tweak = 执行器。
-//  v1.0.52：通信彻底改为 CFMessagePort（CoreFoundation C API）+ RocketBootstrap 打通
-//  iOS 沙盒 bootstrap namespace 隔离（文件系统跨进程在 iOS15 rootless 下实测不通）。
-//    - App→tweak：msgid 0 = config plist（Targets/IntervalMs/ClickX/ClickY）；msgid 2 = 请求 App 列表
-//    - tweak→App：msgid 1 = 心跳（_loaded/_time）；msgid 3 = 已装 App 列表（SB 进程枚举）
-//    - Darwin 通知（appStarted/configUpdated）仅作唤醒信号，不承载数据
-//    - RocketBootstrap 动态 dlopen（librocketbootstrap.dylib），server 用
-//      rocketbootstrap_cfmessageportexposelocal 暴露到全局 bootstrap → App 才能查到
+//  v1.0.53：通信改为 CFPreferences（cfprefsd 守护进程，跨进程共享，纯系统 API 零第三方依赖）
+//  + Darwin 通知（仅唤醒信号，不承载数据）。
+//    - Dopamine rootless 官方无内置 rocketbootstrap（release note: "No rocketbootstrap / IPC"），
+//      CFMessagePort + RocketBootstrap 方案实测既崩 SB 又不通（两次 Safe Mode），v1.0.53 彻底废弃。
+//    - 数据全部走 cfprefsd 共享偏好（appID = com.floatingtap.shared）：
+//      tweak 写 heartbeat(_loaded/_hbtimets) + apps(bundleID->displayName)；App 写 config(ClickX/ClickY/IntervalMs)
+//    - App 前台轮询读偏好；tweak 常驻收 Darwin 通知（appStarted/configUpdated）后推数据/读配置。
+//    - 同时移除 FT_HIDStartSenderIDCapture（arm64e SB 里注册 IOHID 事件回调 = Safe Mode 元凶），
+//      senderID 直接用硬编码兜底值。
 //
 //  仍保持零静态 ObjC 元数据：无 @implementation / @"..." / block 字面量 / @selector / NSLog。
 //  日志：syslog + /tmp/floatingtap_ctor.log（append，带时间戳）。
@@ -191,66 +193,49 @@ static double FTIntervalMs(void) {
     return 400.0;
 }
 
-// MARK: - App 通信（v1.0.52：CFMessagePort IPC，经 RocketBootstrap 打通沙盒隔离）
-// 文件系统跨进程在 iOS 15.5 + Dopamine rootless 沙盒下彻底不通（App 被 sandbox 重定向，
-// 4 候选路径实测 App 全部 ✗stat）。改用 CFMessagePort（CoreFoundation C API）+ RocketBootstrap
-// 打通 bootstrap namespace 隔离——越狱社区标准跨沙盒 IPC。
-//
-// 消息协议（msgid）：
-//   0 = App→tweak  config plist（Targets/IntervalMs/ClickX/ClickY）
-//   1 = tweak→App  heartbeat plist（_loaded/_time）
-//   2 = App→tweak  request apps list
-//   3 = tweak→App  apps list plist（dict: bundleID -> displayName）
-// Darwin notification（com.floatingtap.autotap.appStarted）作唤醒：App 启动发，tweak 收
-// 到立即推心跳 + apps，避免「tweak 没跑时 App 连不上」。
+// MARK: - App 通信（v1.0.53：CFPreferences 共享偏好，cfprefsd 守护进程跨进程共享）
+// Dopamine rootless 官方无内置 rocketbootstrap（release note: "No rocketbootstrap / IPC"），
+// 且第三方移植加载即崩 SB（实测两次 Safe Mode）→ CFMessagePort 方案废弃。
+// 改用 cfprefsd（系统守护进程，所有进程共享，纯系统 API 零第三方依赖）：
+//   tweak 写：appID=com.floatingtap.shared, key=_loaded=true, key=_hbtimets=epoch秒,
+//             key=_apps=dict(bundleID->displayName)
+//   App  写：appID=com.floatingtap.shared, key=_config=dict(ClickX/ClickY/IntervalMs)
+// Darwin 通知（appStarted/configUpdated）仅作唤醒信号，不承载数据。
+// 注意：App 前台轮询读偏好（无需 tweak 主动推送），tweak 常驻收通知后推数据/读配置。
 
 typedef id         (*Msg_AllApps)(id, SEL);
 typedef id         (*Msg_AppBid)(id, SEL);
 typedef id         (*Msg_AppName)(id, SEL);
-
-// RocketBootstrap：动态加载（解决沙盒 bootstrap 隔离，CFMessagePort 跨进程必需）
-// 纯 C dlopen + dlsym，不引入任何静态 ObjC 元数据。
-typedef void (*RBExposeFunc)(CFMessagePortRef);
-static void *gRBLib = NULL;
-static RBExposeFunc gRBExpose = NULL;
-static void FTRocketBootstrapInit(void) {
-    if (gRBLib) return;
-    const char *paths[] = {
-        "/usr/lib/librocketbootstrap.dylib",
-        "/var/jb/usr/lib/librocketbootstrap.dylib",
-        "/Library/MobileSubstrate/DynamicLibraries/librocketbootstrap.dylib",
-        NULL
-    };
-    for (int i = 0; paths[i]; i++) {
-        gRBLib = dlopen(paths[i], RTLD_LAZY);
-        if (gRBLib) break;
-    }
-    if (gRBLib) {
-        gRBExpose = (RBExposeFunc)dlsym(gRBLib, "rocketbootstrap_cfmessageportexposelocal");
-        FTLog(gRBExpose ? "rocketbootstrap loaded (expose ok)" : "rocketbootstrap loaded (no expose)");
-    } else {
-        FTLog("rocketbootstrap NOT found - IPC may fail cross-process");
-    }
-}
-static void FTExposePort(CFMessagePortRef port) {
-    if (port && gRBExpose) gRBExpose(port);
-}
 
 // 动态 CFString（避免字面量字符串元数据；CFStringCreateWithCString 在 SB 启动后安全）
 static CFStringRef FTCreateCFStr(const char *s) {
     return CFStringCreateWithCString(NULL, s, kCFStringEncodingUTF8);
 }
 
-// 全局 IPC 状态
-static CFMessagePortRef gServerPort = NULL;   // tweak 端 server: com.floatingtap.tweak
-static int              gIPCAvailable = 0;    // RocketBootstrap 加载且 server 创建成功
+// 共享偏好 appID（tweak 与 App 双方约定）
+static CFStringRef FTSharedAppID(void) {
+    return FTCreateCFStr("com.floatingtap.shared");
+}
+
+// 写一条共享偏好（key:value → appID，current user / any host）
+static void FTWritePref(const char *key, CFPropertyListRef value) {
+    CFStringRef appID = FTSharedAppID();
+    if (!appID || !key || !value) { if (appID) CFRelease(appID); return; }
+    CFStringRef k = FTCreateCFStr(key);
+    if (k) {
+        CFPreferencesSetValue(k, value, appID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        CFRelease(k);
+    }
+    CFPreferencesSynchronize(appID);
+    CFRelease(appID);
+}
 
 // 前向声明（定义在文件后段）
 static void FTMoveBallToConfig(void);
-static CFDataRef FTMessagePortCallback(CFMessagePortRef local, SInt32 msgid, CFDataRef data, void *info);
+static void FTWriteAppsList(void);
 
-// 应用 App 推来的 config（CoreFoundation CFDictionary，纯 C，无 ObjC）
-static void FTApplyConfigFromIPC(CFDictionaryRef dict) {
+// 应用共享偏好里的 config（CoreFoundation CFDictionary，纯 C，无 ObjC）
+static void FTApplyConfigFromPrefs(CFDictionaryRef dict) {
     if (!dict || CFGetTypeID(dict) != CFDictionaryGetTypeID()) return;
     double nx = 0.5, ny = 0.5, ms = 400.0;
     CFStringRef kX = FTCreateCFStr("ClickX");
@@ -271,58 +256,52 @@ static void FTApplyConfigFromIPC(CFDictionaryRef dict) {
     gCfgLoaded = 1;
     FTMoveBallToConfig();
     char diag[128];
-    snprintf(diag, sizeof(diag), "IPC config x=%.2f y=%.2f ms=%.0f", nx, ny, ms);
+    snprintf(diag, sizeof(diag), "config via prefs x=%.2f y=%.2f ms=%.0f", nx, ny, ms);
     FTLog(diag);
 }
 
-// 文件心跳（fallback：已知 App 沙盒读不到，仅留痕不依赖）
-static void FTWriteHeartbeatFile(void) {
-    double now = (double)time(NULL) * 1000.0;
-    FILE *f = fopen("/var/mobile/Library/Preferences/com.floatingtap.tweak.plist", "w");
-    if (f) {
-        fprintf(f, "<?xml version=\"1.0\"?>\n<plist version=\"1.0\"><dict>"
-                   "<key>_loaded</key><true/><key>_time</key><real>%.0f</real>"
-                   "</dict></plist>\n", now);
-        fclose(f);
+// 读共享偏好里的 config（App 写；兼容 CFData(序列化) 或直接 CFDictionary 两种存储）
+static void FTReadConfig(void) {
+    CFStringRef appID = FTSharedAppID();
+    if (!appID) return;
+    CFStringRef k = FTCreateCFStr("_config");
+    if (k) {
+        CFPropertyListRef v = CFPreferencesCopyValue(k, appID, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+        if (v) {
+            CFTypeID tid = CFGetTypeID(v);
+            if (tid == CFDataGetTypeID()) {
+                CFErrorRef err = NULL;
+                CFPropertyListRef plist = CFPropertyListCreateWithData(NULL, (CFDataRef)v,
+                    kCFPropertyListImmutable, NULL, &err);
+                if (plist && CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
+                    FTApplyConfigFromPrefs((CFDictionaryRef)plist);
+                } else {
+                    FTLog("config: parse failed");
+                }
+                if (plist) CFRelease(plist);
+                if (err) CFRelease(err);
+            } else if (tid == CFDictionaryGetTypeID()) {
+                FTApplyConfigFromPrefs((CFDictionaryRef)v);
+            }
+            CFRelease(v);
+        }
+        CFRelease(k);
     }
+    CFRelease(appID);
 }
 
-// tweak→App 发心跳（CFMessagePortSendRequest，msgID=1）
-static void FTSendHeartbeatIPC(void) {
-    CFStringRef name = FTCreateCFStr("com.floatingtap.autotap");
-    if (!name) { FTWriteHeartbeatFile(); return; }
-    CFMessagePortRef appPort = CFMessagePortCreateRemote(NULL, name);
-    CFRelease(name);
-    if (!appPort) {
-        FTLog("IPC heartbeat: app port unreachable");
-        FTWriteHeartbeatFile();
-        return;
-    }
-    double nowms = (double)time(NULL) * 1000.0;
-    CFMutableDictionaryRef d = CFDictionaryCreateMutable(NULL, 0,
-        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFStringRef kL = FTCreateCFStr("_loaded");
-    CFStringRef kT = FTCreateCFStr("_time");
-    CFNumberRef t = CFNumberCreate(NULL, kCFNumberDoubleType, &nowms);
-    if (kL) { CFDictionarySetValue(d, kL, kCFBooleanTrue); CFRelease(kL); }
-    if (kT && t) { CFDictionarySetValue(d, kT, t); CFRelease(kT); }
-    CFErrorRef err = NULL;
-    CFDataRef data = CFPropertyListCreateData(NULL, d, kCFPropertyListXMLFormat_v1_0, 0, &err);
-    if (data) {
-        SInt32 r = CFMessagePortSendRequest(appPort, 1, data, 5.0, 0.0, NULL, NULL);
-        FTLog(r == kCFMessagePortSuccess ? "IPC heartbeat sent" : "IPC heartbeat send failed");
-        CFRelease(data);
-    } else {
-        FTLog("IPC heartbeat: plist serialize failed");
-    }
+// tweak→App：写心跳（_loaded=true, _hbtimets=epoch 秒）
+static void FTWriteHeartbeat(void) {
+    double now = (double)time(NULL);
+    CFNumberRef t = CFNumberCreate(NULL, kCFNumberDoubleType, &now);
+    FTWritePref("_loaded", kCFBooleanTrue);
+    FTWritePref("_hbtimets", t);
     if (t) CFRelease(t);
-    CFRelease(d);
-    CFRelease(appPort);
-    if (err) CFRelease(err);
+    FTLog("heartbeat written via CFPreferences");
 }
 
-// tweak→App 发 App 列表（SB 进程枚举 LSApplicationWorkspace，msgID=3）
-static void FTSendAppsListIPC(void) {
+// tweak→App：枚举已装 App 并写共享偏好（SB 进程 LSApplicationWorkspace 特权枚举）
+static void FTWriteAppsList(void) {
     Class ClsWS = objc_getClass("LSApplicationWorkspace");
     if (!ClsWS) { FTLog("apps: LSApplicationWorkspace missing"); return; }
     id ws = ((Msg_Send)objc_msgSend)((id)ClsWS, sel_registerName("defaultWorkspace"));
@@ -347,69 +326,14 @@ static void FTSendAppsListIPC(void) {
         if (kv) CFRelease(kv);
         CFRelease(kb);
     }
-    CFStringRef name = FTCreateCFStr("com.floatingtap.autotap");
-    CFMessagePortRef appPort = name ? CFMessagePortCreateRemote(NULL, name) : NULL;
-    if (name) CFRelease(name);
-    if (!appPort) { FTLog("apps: app port unreachable"); CFRelease(d); return; }
-    CFErrorRef err = NULL;
-    CFDataRef data = CFPropertyListCreateData(NULL, d, kCFPropertyListXMLFormat_v1_0, 0, &err);
-    if (data) {
-        SInt32 r = CFMessagePortSendRequest(appPort, 3, data, 5.0, 0.0, NULL, NULL);
-        char diag[128];
-        snprintf(diag, sizeof(diag), "apps: sent %lu entries (r=%d)", (unsigned long)n, (int)r);
-        FTLog(diag);
-        CFRelease(data);
-    } else {
-        FTLog("apps: plist serialize failed");
-    }
+    FTWritePref("_apps", d);
     CFRelease(d);
-    CFRelease(appPort);
-    if (err) CFRelease(err);
+    char diag[128];
+    snprintf(diag, sizeof(diag), "apps saved %lu entries via CFPreferences", (unsigned long)n);
+    FTLog(diag);
 }
 
-// tweak 端 IPC server（com.floatingtap.tweak）+ RocketBootstrap 暴露到全局 bootstrap
-static void FTSetupIPCServer(void) {
-    FTRocketBootstrapInit();
-    CFStringRef name = FTCreateCFStr("com.floatingtap.tweak");
-    if (!name) return;
-    gServerPort = CFMessagePortCreateLocal(NULL, name, FTMessagePortCallback, NULL, NULL);
-    CFRelease(name);
-    if (gServerPort) {
-        FTExposePort(gServerPort);
-        CFRunLoopSourceRef src = CFMessagePortCreateRunLoopSource(NULL, gServerPort, 0);
-        if (src) {
-            CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopCommonModes);
-            CFRelease(src);
-        }
-        gIPCAvailable = 1;
-        FTLog("IPC server ready (com.floatingtap.tweak)");
-    } else {
-        FTLog("IPC server FAILED: CFMessagePortCreateLocal returned NULL");
-    }
-}
-
-// server 回调（App→tweak）：msgid 0=config, 2=request apps
-// CFMessagePortCallBack 签名要求返回 CFDataRef（回复数据，无回复返回 NULL）
-static CFDataRef FTMessagePortCallback(CFMessagePortRef local, SInt32 msgid, CFDataRef data, void *info) {
-    (void)local; (void)info;
-    if (msgid == 0 && data) {
-        CFErrorRef err = NULL;
-        CFPropertyListRef plist = CFPropertyListCreateWithData(NULL, data,
-            kCFPropertyListImmutable, NULL, &err);
-        if (plist && CFGetTypeID(plist) == CFDictionaryGetTypeID()) {
-            FTApplyConfigFromIPC((CFDictionaryRef)plist);
-        } else {
-            FTLog("IPC config: parse failed");
-        }
-        if (plist) CFRelease(plist);
-        if (err) CFRelease(err);
-    } else if (msgid == 2) {
-        FTSendAppsListIPC();
-    }
-    return NULL;
-}
-
-// Darwin 通知回调（纯 C；observer=静态占位，靠 name 区分）——只作唤醒信号，数据走 IPC
+// Darwin 通知回调（纯 C；observer=静态占位，靠 name 区分）——只作唤醒信号，数据走 CFPreferences
 static int sNotifyObserver = 0;
 static void FTNotificationCallback(CFNotificationCenterRef center, void *observer,
                                    CFStringRef name, const void *object, CFDictionaryRef userInfo) {
@@ -417,19 +341,18 @@ static void FTNotificationCallback(CFNotificationCenterRef center, void *observe
     char buf[256];
     if (!name || !CFStringGetCString(name, buf, sizeof(buf), kCFStringEncodingUTF8)) return;
     if (strcmp(buf, "com.floatingtap.autotap.appStarted") == 0) {
-        FTLog("got appStarted -> push hb + apps via IPC");
-        FTSendHeartbeatIPC();
-        FTSendAppsListIPC();
+        FTLog("got appStarted -> write hb + apps via CFPreferences");
+        FTWriteHeartbeat();
+        FTWriteAppsList();
     } else if (strcmp(buf, "com.floatingtap.autotap.configUpdated") == 0) {
-        // 配置数据经 CFMessagePort msgid=0 推送；这里仅作心跳刷新
-        FTLog("got configUpdated (data via IPC)");
-        FTSendHeartbeatIPC();
+        FTLog("got configUpdated -> read config from CFPreferences");
+        FTReadConfig();
+        FTWriteHeartbeat();
     }
 }
 
-// 注册 IPC server + Darwin 通知（App→tweak 唤醒信号）
+// 注册 Darwin 通知（App→tweak 唤醒信号；无 IPC server，数据走共享偏好）
 static void FTRegisterNotifications(void) {
-    FTSetupIPCServer();
     CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
     if (!center) return;
     static CFStringRef sNameAppStarted = NULL, sNameConfig = NULL;
@@ -443,10 +366,11 @@ static void FTRegisterNotifications(void) {
     if (sNameConfig)
         CFNotificationCenterAddObserver(center, &sNotifyObserver, FTNotificationCallback,
                                         sNameConfig, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-    FTLog("notifications + IPC registered");
-    // 启动即尝试：App 可能已运行 → 立即推心跳 + App 列表
-    FTSendHeartbeatIPC();
-    FTSendAppsListIPC();
+    FTLog("darwin notify registered (CFPreferences comm)");
+    // 启动即尝试：读 App 可能已写的配置 + 推一次心跳/App 列表（App 可能已在跑）
+    FTReadConfig();
+    FTWriteHeartbeat();
+    FTWriteAppsList();
 }
 
 // 恢复球窗口交互（注入后 60ms 回调）
@@ -820,11 +744,11 @@ static void FTEnsureBallCallback(void *ctx) {
 static void FTTweakInitCallback(void *ctx) {
     (void)ctx;
     FTLog("init callback, calling FTEnsureBall");
-    // v1.0.50：App 通信（注册通知 + 反查沙盒 + 心跳 + 读配置）——必须在 SB 完全启动后
+    // v1.0.50：App 通信（注册通知 + 心跳 + 读配置）——必须在 SB 完全启动后
     // （ctor 阶段任何 ObjC 调用在 arm64e 下 PAC 崩，v1.0.50 实测 Safe Mode）
     FTRegisterNotifications();
-    // 启动 senderID 捕获（zxtouch 机制：用户下次真实触摸时提取设备专属 senderID）
-    FT_HIDStartSenderIDCapture();
+    // v1.0.53：移除 FT_HIDStartSenderIDCapture——arm64e SB 里注册 IOHID 事件回调
+    // 是 Safe Mode 元凶（实测两次崩）；senderID 用硬编码兜底值即可。
     FTDumpEventIvars();
     FTEnsureBall(0);
 }
@@ -891,14 +815,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.52 loaded (pure C ctor, CFMessagePort IPC + RocketBootstrap)");
+    syslog(LOG_ERR, "FloatingTap v1.0.53 loaded (pure C ctor, CFPreferences comm)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.52 ctor run (arm64e, pure C, IPC)\n");
+            fprintf(mk, "FloatingTap v1.0.53 ctor run (arm64e, pure C, CFPreferences)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
