@@ -52,6 +52,7 @@ typedef void       (*Msg_SetWindowLevel)(id, SEL, CGFloat);
 typedef void       (*Msg_SetHidden)(id, SEL, BOOL);
 typedef void       (*Msg_SetUserInteractionEnabled)(id, SEL, BOOL);
 typedef void       (*Msg_AddGestureRecognizer)(id, SEL, id);
+typedef void       (*Msg_SetEnabled)(id, SEL, BOOL);
 typedef void       (*Msg_AddSubview)(id, SEL, id);
 typedef void       (*Msg_MakeKeyAndVisible)(id, SEL);
 typedef void       (*Msg_SetNumberOfTapsRequired)(id, SEL, NSUInteger);
@@ -90,10 +91,11 @@ static id gBallWindow = nil;
 static id gBallView   = nil;
 static id gTapGR      = nil;
 static id gLongGR     = nil;
+static id gPanGR      = nil;   // 拖动手势（仅「红色拖动模式」生效）
+static BOOL gDragMode = NO;    // NO=蓝色连击模式（长按触发连点）；YES=红色拖动模式（拖动定位）
 
 static CGPoint gPanStartLoc;   // 触摸起始点（窗口坐标）
 static CGPoint gPanOrigin0;    // 触摸起始时窗口 frame.origin
-static BOOL    gPanActive = NO;
 
 static double  gScreenW = 0;   // 主屏尺寸（FTSetupBall 时保存）
 static double  gScreenH = 0;
@@ -569,12 +571,8 @@ static void FTStartClicking(void) {
     gIsClicking = YES;
     gClickCount = 0;
     gTapIndex = 0;
-    if (gCfgLoaded) {
-        // v1.0.50：App 配置优先——点击点 = 配置坐标（球已移动到该位置）
-        gClickLockX = gCfgX;
-        gClickLockY = gCfgY;
-    } else if (gBallWindow) {
-        // 无配置：锁定当前球心（v1.0.45：拖动球不改变注入点，避免 tap 因移动失败）
+    // 点击点 = 当前球心（拖动模式移动球后此处自动跟随；App 配置经 FTMoveBallToConfig 已先把球移到该位置）
+    if (gBallWindow) {
         CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
         double cx = f.origin.x + f.size.width * 0.5;
         double cy = f.origin.y + f.size.height * 0.5;
@@ -582,6 +580,8 @@ static void FTStartClicking(void) {
         gClickLockY = (gScreenH > 0) ? cy / gScreenH : 0.5;
         if (gClickLockX < 0.001) gClickLockX = 0.001; if (gClickLockX > 0.999) gClickLockX = 0.999;
         if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
+    } else {
+        gClickLockX = 0.5; gClickLockY = 0.5;
     }
     double ms = FTIntervalMs();
     // 一碰到球立即点一次（不等第一个 timer tick，短按也有一次点击）
@@ -615,40 +615,75 @@ static void FTStopClicking(void) {
 static Class gGRTargetClass = nil;
 static id    gGRTarget      = nil;
 
-// Long 回调：一碰即连点 + 拖动（Changed 状态拖动球，删除 Pan GR 避免手势冲突）
+// Long 回调：仅「蓝色连击模式」生效——一碰即连点（点击点锁在按下时球心，拖动不改变）。
+// 「红色拖动模式」下长按无效（拖动由 Pan GR 负责），避免双击切换与连点冲突。
 static void FTGRLongHandler(id self, SEL _cmd, id gr) {
     (void)self; (void)_cmd;
     if (!gr || !gBallWindow) return;
+    if (gDragMode) return; // 拖动模式：长按不触发连点
+    NSUInteger st = ((Msg_State)objc_msgSend)(gr, sel_registerName("state"));
+    if (st == 1) { // Began → 开始连点（点击点=当前球心）
+        FTStartClicking();
+    } else if (st == 3 || st == 4 || st == 5) { // Ended / Cancelled / Failed → 停止
+        FTStopClicking();
+    }
+}
+
+// Pan 回调：仅「红色拖动模式」生效——拖动小球重新定位（点击点同步更新到新球心）。
+// 连击模式下忽略，保证长按只连点、拖动只定位，互不干扰。
+static void FTGRPanHandler(id self, SEL _cmd, id gr) {
+    (void)self; (void)_cmd;
+    if (!gr || !gBallWindow) return;
+    if (!gDragMode) return; // 连击模式：不响应拖动
     NSUInteger st = ((Msg_State)objc_msgSend)(gr, sel_registerName("state"));
     if (st == 1) { // Began
         gPanStartLoc = ((Msg_LocationInView)objc_msgSend)(gr, sel_registerName("locationInView:"), gBallWindow);
         gPanOrigin0  = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame")).origin;
-        gPanActive   = YES;
-        FTStartClicking();
-    } else if (st == 2 && gPanActive) { // Changed → 拖动球
+    } else if (st == 2) { // Changed → 拖动球
         CGPoint cur = ((Msg_LocationInView)objc_msgSend)(gr, sel_registerName("locationInView:"), gBallWindow);
         CGRect f = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
         ((Msg_SetFrame)objc_msgSend)(gBallWindow, sel_registerName("setFrame:"),
             CGRectMake(gPanOrigin0.x + (cur.x - gPanStartLoc.x),
                        gPanOrigin0.y + (cur.y - gPanStartLoc.y),
                        f.size.width, f.size.height));
-    } else if (st == 3 || st == 4 || st == 5) { // Ended / Cancelled / Failed
-        gPanActive = NO;
-        FTStopClicking();
+        // 同步更新连点锁定坐标（拖动后点击点跟随球心）
+        CGRect nf = ((Msg_Frame)objc_msgSend)(gBallWindow, sel_registerName("frame"));
+        if (gScreenW > 0 && gScreenH > 0) {
+            gClickLockX = (nf.origin.x + nf.size.width * 0.5) / gScreenW;
+            gClickLockY = (nf.origin.y + nf.size.height * 0.5) / gScreenH;
+            if (gClickLockX < 0.001) gClickLockX = 0.001; if (gClickLockX > 0.999) gClickLockX = 0.999;
+            if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
+        }
     }
 }
 
-// Tap 回调：双击 → 停止连点并隐藏球
+// 根据模式刷新小球外观：蓝色=连击模式，红色=拖动模式
+static void FTApplyBallAppearance(void) {
+    if (!gBallView) return;
+    Class ClsColor = objc_getClass("UIColor");
+    if (!ClsColor) return;
+    CGFloat r, g, b, a;
+    if (gDragMode) { r = 1.0;  g = 0.231; b = 0.188; a = 0.9; }  // 红（拖动模式）
+    else           { r = 0.0;  g = 0.478; b = 1.0;   a = 0.9; }  // 蓝（连击模式）
+    id color = ((Msg_ColorWithRGBA)objc_msgSend)((id)ClsColor,
+        sel_registerName("colorWithRed:green:blue:alpha:"), r, g, b, a);
+    if (color) ((Msg_SetBackgroundColor)objc_msgSend)(gBallView, sel_registerName("setBackgroundColor:"), color);
+}
+
+// Tap 回调：双击 → 切换「拖动模式」与「连击模式」（不再隐藏球）。
+//   蓝色（连击模式）：长按触发连点；红色（拖动模式）：拖动小球重新定位点击点。
 static void FTGRTapHandler(id self, SEL _cmd, id gr) {
     (void)self; (void)_cmd;
-    if (!gr) return;
+    if (!gr || !gBallWindow) return;
     NSUInteger st = ((Msg_State)objc_msgSend)(gr, sel_registerName("state"));
     if (st == 3) { // Ended（双击完成）
-        FTLog("double tap, hiding ball");
         FTStopClicking();
-        if (gBallWindow) {
-            ((Msg_SetHidden)objc_msgSend)(gBallWindow, sel_registerName("setHidden:"), YES);
-        }
+        gDragMode = !gDragMode;
+        // 模式切换：仅启用当前模式对应的手势，禁用另一个，避免长按/拖动手势识别冲突
+        ((Msg_SetEnabled)objc_msgSend)(gLongGR, sel_registerName("setEnabled:"), gDragMode ? NO : YES);
+        ((Msg_SetEnabled)objc_msgSend)(gPanGR,  sel_registerName("setEnabled:"), gDragMode ? YES : NO);
+        FTApplyBallAppearance();
+        FTLog(gDragMode ? "double tap -> drag mode ON (red)" : "double tap -> combo mode ON (blue)");
     }
 }
 
@@ -661,6 +696,7 @@ static BOOL FTMakeGRTarget(void) {
     if (!gGRTargetClass) return NO;
     class_addMethod(gGRTargetClass, sel_registerName("handleLong:"), (IMP)FTGRLongHandler, "v@:@");
     class_addMethod(gGRTargetClass, sel_registerName("handleTap:"),  (IMP)FTGRTapHandler,  "v@:@");
+    class_addMethod(gGRTargetClass, sel_registerName("handlePan:"),  (IMP)FTGRPanHandler,  "v@:@");
     objc_registerClassPair(gGRTargetClass);
     gGRTarget = FTAlloc(gGRTargetClass);
     if (gGRTarget) {
@@ -688,7 +724,8 @@ static void FTSetupBall(void) {
     Class ClsColor  = objc_getClass("UIColor");
     Class ClsTapGR  = objc_getClass("UITapGestureRecognizer");
     Class ClsLongGR = objc_getClass("UILongPressGestureRecognizer");
-    if (!ClsWindow || !ClsView || !ClsScreen || !ClsColor || !ClsTapGR || !ClsLongGR) {
+    Class ClsPanGR  = objc_getClass("UIPanGestureRecognizer");
+    if (!ClsWindow || !ClsView || !ClsScreen || !ClsColor || !ClsTapGR || !ClsLongGR || !ClsPanGR) {
         FTLog("setup failed: system class missing");
         return;
     }
@@ -732,18 +769,23 @@ static void FTSetupBall(void) {
     // GR：运行时创建的 target 实例 + initWithTarget:action:
     gTapGR  = FTMakeGR(ClsTapGR, "handleTap:");
     gLongGR = FTMakeGR(ClsLongGR, "handleLong:");
-    if (!gTapGR || !gLongGR) {
+    gPanGR  = FTMakeGR(ClsPanGR, "handlePan:");
+    if (!gTapGR || !gLongGR || !gPanGR) {
         FTLog("setup failed: make GR");
     }
     ((Msg_SetNumberOfTapsRequired)objc_msgSend)(gTapGR, sel_registerName("setNumberOfTapsRequired:"), (NSUInteger)2);
-    // 长按：minimumPressDuration=0 → 手指一碰立即 Began（开始连点），
-    // Changed 状态拖动球（删除 Pan GR 避免手势冲突）。
+    // 长按：minimumPressDuration=0 → 手指一碰立即 Began（开始连点）。
+    // 仅「连击模式」启用（拖动模式下 setEnabled:NO，由 Pan GR 负责拖动）。
     // allowableMovement=200：宽松容差，iPad 上手指自然抖动/微小移动不会误判失败
     ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setMinimumPressDuration:"), 0.0);
     ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setAllowableMovement:"), 200.0);
+    // 模式初始化：蓝色连击模式 → 启用长按、禁用拖动
+    ((Msg_SetEnabled)objc_msgSend)(gLongGR, sel_registerName("setEnabled:"), YES);
+    ((Msg_SetEnabled)objc_msgSend)(gPanGR,  sel_registerName("setEnabled:"), NO);
 
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gTapGR);
     ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gLongGR);
+    ((Msg_AddGestureRecognizer)objc_msgSend)(ball, sel_registerName("addGestureRecognizer:"), gPanGR);
 
     // 直接把 ball 加到 window（不走 VC），更可靠
     ((Msg_AddSubview)objc_msgSend)(win, sel_registerName("addSubview:"), ball);
@@ -753,6 +795,7 @@ static void FTSetupBall(void) {
 
     gBallWindow = win;
     gBallView   = ball;
+    FTApplyBallAppearance(); // 初始蓝色=连击模式
 
     FTLog("ball created, gesture handlers wired");
 
@@ -881,14 +924,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.53 loaded (pure C ctor, CFPreferences comm)");
+    syslog(LOG_ERR, "FloatingTap v1.0.54 loaded (pure C ctor, CFPreferences comm)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.53.3 ctor run (arm64e, pure C, CFPreferences+diagnostic)\n");
+            fprintf(mk, "FloatingTap v1.0.54 ctor run (arm64e, pure C, drag-mode toggle)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
