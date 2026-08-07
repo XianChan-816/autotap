@@ -166,6 +166,11 @@ static dispatch_source_t gClickTimer = NULL; // 连点定时器（SB 端直接�
 // 合成触摸持续 5s tap=151 不消失）→ Home indicator（小白条）上滑失效、息屏才恢复。
 // 每个 down 记录 index，up 回调清除；连点停止时对【仍残留的 index】在点击点补发 up。
 static bool g_PendingUpIdx[16] = {false}; // index 2-9 用（1 留给用户手指，勿动）
+// v1.0.113：每个待 up index 的 down 时刻——连点期间定期清「down 超 150ms 未 up」的残留
+// 手指（up 被吞的），防残留累积（ctor-9：SBHomeScreenWindow 残留 tap 累积 40→481 →
+// 小白条失效 + 游戏长按效果 + tapCount 无限累积）
+static double g_PendingUpT[16] = {0};
+static void FTCheckResidualDuringCombo(void);
 
 // v1.0.112：连点「送达自愈验证」——锁定 SID 后若连点期间 SEND 无合成触摸回流
 //（点击点附近 !onBall 触摸）→ 锁定的 SID 假送达（顶掉型 C 类）→ 停止连点、记录跳过、
@@ -524,7 +529,10 @@ static void FTSendHIDUpCallback(void *ctx) {
     FTHIDUpCtx *c = (FTHIDUpCtx *)ctx;
     if (c) {
         FT_HIDDispatchUp(c->x, c->y, c->index);
-        if (c->index < 16) g_PendingUpIdx[c->index] = false; // v1.0.97：up 已派发，清除残留标记
+        if (c->index < 16) {
+            g_PendingUpIdx[c->index] = false; // v1.0.97：up 已派发，清除残留标记
+            g_PendingUpT[c->index] = 0;       // v1.0.113：清 down 时刻
+        }
         free(c);
     }
 }
@@ -590,7 +598,12 @@ static void FTSyntheticTap(double px, double py) {
     // touchesEnded/Cancelled 真实 → 松手即停（豆包方案）与连点持续同时成立。
     gTapIndex = (gTapIndex % 8) + 2;
     uint32_t idx = gTapIndex;
-    if (idx < 16) g_PendingUpIdx[idx] = true; // v1.0.97：记录待 up 的合成手指（停止时清场用）
+    if (idx < 16) {
+        g_PendingUpIdx[idx] = true; // v1.0.97：记录待 up 的合成手指（停止时清场用）
+        struct timespec tts;
+        clock_gettime(CLOCK_MONOTONIC, &tts); // v1.0.113：记录 down 时刻（定期清残留判断）
+        g_PendingUpT[idx] = (double)tts.tv_sec + (double)tts.tv_nsec * 1e-9;
+    }
 
     // down 立即（系统级派发）
     FT_HIDDispatchDown(nx, ny, idx);
@@ -657,6 +670,12 @@ static void FTClickCallback(void *ctx) {
         snprintf(diag, sizeof(diag), "inject tap uik=%.2f,%.2f hid=%.2f,%.2f orient=%ld",
                  gClickLockX, gClickLockY, hx, hy, (long)FTGetOrientation());
         FTLog(diag);
+    }
+    // v1.0.113：连点期间定期清残留（每 50 次 ≈ 500ms）——防残留合成手指累积
+    // （ctor-9：SBHomeScreenWindow 残留 tap 40→481 → 小白条失效 + 游戏长按 + tapCount 累积）
+    static int sResidualCheck = 0;
+    if ((sResidualCheck++ % 50) == 0) {
+        FTCheckResidualDuringCombo();
     }
 }
 
@@ -774,6 +793,41 @@ static void FTRaiseResidualUps(void) {
         }
         char dbg2[96];
         snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d (serial)", np);
+        FTLog(dbg2);
+    }
+}
+
+// v1.0.113：连点期间定期清残留——只补发「down 超 150ms 仍未 up」的 index（正常 25ms up
+// 不受影响）。防残留合成手指累积（ctor-9 铁证：SBHomeScreenWindow 残留 tap 累积 40→481
+// → 小白条失效 + 游戏长按效果持续 + tapCount 无限累积）。串行补发（逐个 25ms 间隔）。
+// 由 FTClickCallback 每 ~50 次点击（约 500ms）调用一次。
+static void FTCheckResidualDuringCombo(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    uint32_t pend[14];
+    int n = 0;
+    for (uint32_t i = 2; i < 16; i++) {
+        if (g_PendingUpIdx[i] && g_PendingUpT[i] > 0 && (now - g_PendingUpT[i]) > 0.15) {
+            g_PendingUpIdx[i] = false;
+            g_PendingUpT[i] = 0;
+            if (n < 14) pend[n++] = i;
+        }
+    }
+    if (n > 0) {
+        double rx = gClickLockX, ry = gClickLockY;
+        if (rx < 0.001) rx = 0.001; if (rx > 0.999) rx = 0.999;
+        if (ry < 0.001) ry = 0.001; if (ry > 0.999) ry = 0.999;
+        for (int k = 0; k < n; k++) {
+            FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
+            if (c) {
+                c->x = rx; c->y = ry; c->index = pend[k];
+                dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((double)k * 0.025 * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
+            }
+        }
+        char dbg2[96];
+        snprintf(dbg2, sizeof(dbg2), "combo residual cleanup: %d", n);
         FTLog(dbg2);
     }
 }
@@ -1807,10 +1861,12 @@ static void FTTweakInitCallback(void *ctx) {
                     // ⚠️ v1.0.109：200ms → 100ms——ctor(2) 用户反馈「停止按压后还是有延迟」；
                     // 现在连点机制稳定（touches-ended 即停），100ms 宽限仍可吸收注入导致的
                     // 边界重发 Began，同时停止感知更即时。
+                    // ⚠️ v1.0.113：100ms → 50ms——ctor-9 用户反馈「手离不能立马停」；
+                    // 真送达 SID 下 touches-ended 即真实松手，50ms 仅吸收极端边界重发。
                     gBallTouchClicking = NO;
                     if (gIsClicking && !gStopGracePending) {
                         gStopGracePending = YES;
-                        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
+                        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
                                          dispatch_get_main_queue(), NULL, FTStopGraceTimer);
                     }
                 }
@@ -1880,14 +1936,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.112 loaded (delivery self-verify - fake-delivering SID auto-reverts; ending-only SIDs not fallback)");
+    syslog(LOG_ERR, "FloatingTap v1.0.113 loaded (periodic residual cleanup during combo; 50ms release grace)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.112 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; scan 0x600-0x8ff; delivery self-verify)\n");
+            fprintf(mk, "FloatingTap v1.0.113 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; periodic residual cleanup; 50ms grace)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
