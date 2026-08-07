@@ -312,31 +312,31 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
 
 static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint32_t index, bool down) {
     if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
-    // v1.0.70：优先用社区通用硬编码 senderID（kIOHIDEventDigitizerSenderID=0x8000000817371935），
-    // 动态捕获的设备 senderID 仅作兜底（ctor-40 实测捕获值 0x1000007af 派发 0x1 被拒）。
-    p_IOHIDEventSetSenderID(event, 0x8000000817371935ULL);
-    FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, event);
-    if (ret != FT_kIOReturnSuccess && g_OverrideSenderID != 0) {
-        // ⚠️ 首次派发即便失败也可能已"消耗/失效"该事件对象，重试必须重建全新事件，
-        // 否则对同一 event ref 二次派发必然再失败（ctor-40 硬编码 retry 也 0x1 的真凶）。
-        CFRelease(event);
-        FT_IOHIDEventRef ev2 = FT_HIDCreateDigitizerEvent(down, nx, ny, index);
-        if (ev2) {
-            p_IOHIDEventSetSenderID(ev2, g_OverrideSenderID);
-            ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, ev2);
+    // v1.0.71：优先用动态捕获到的真实设备 senderID（ctor-39 实测此值可用，产生真实点击）；
+    // v1.0.70 误把硬编码 0x8000000817371935 当主值，本设备（M1 iPad / Dopamine）全部 0x1、零点击。
+    // 主值派发失败（罕见）才回退硬编码；每次重试重建全新事件——首次派发即便失败也会
+    // 消耗/失效原 event 对象，对同一 ref 二次派发必然再 0x1（ctor-40 隐藏坑）。
+    uint64_t sids[2];
+    int nsid = 0;
+    if (g_OverrideSenderID) sids[nsid++] = g_OverrideSenderID;      // 真实设备值（优先）
+    sids[nsid++] = 0x8000000817371935ULL;                           // 社区通用兜底
+    for (int i = 0; i < nsid; i++) {
+        FT_IOHIDEventRef ev = (i == 0) ? event : FT_HIDCreateDigitizerEvent(down, nx, ny, index);
+        if (!ev) { if (i == 0 && event) CFRelease(event); continue; }
+        p_IOHIDEventSetSenderID(ev, sids[i]);
+        FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, ev);
+        if (ret == FT_kIOReturnSuccess) {
             char dbg[96];
-            snprintf(dbg, sizeof(dbg), "DispatchEvent retry(captured) ret=0x%x", (unsigned)ret);
+            snprintf(dbg, sizeof(dbg), "DispatchEvent ok SID=0x%llx", (unsigned long long)sids[i]);
             FTHIDLog(dbg);
-            CFRelease(ev2);
+            if (ev != event) CFRelease(ev); else CFRelease(event);
             return;
         }
-    }
-    if (ret != FT_kIOReturnSuccess) {
         char dbg[96];
-        snprintf(dbg, sizeof(dbg), "DispatchEvent failed 0x%x", (unsigned)ret);
+        snprintf(dbg, sizeof(dbg), "DispatchEvent SID=0x%llx ret=0x%x", (unsigned long long)sids[i], (unsigned)ret);
         FTHIDLog(dbg);
+        if (ev != event) CFRelease(ev); else CFRelease(event);
     }
-    CFRelease(event);
 }
 
 // MARK: - 对外接口

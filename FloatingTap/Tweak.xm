@@ -103,6 +103,14 @@ static id gClickPointView = nil; // 点击点标记（独立视图，仅「红�
 static id gClickPanGR = nil;   // 点击点拖动手势（仅红色模式生效，移动点击点，与球解耦）
 static BOOL gDragMode = NO;    // NO=蓝色连击模式（长按触发连点）；YES=红色拖动模式（拖动定位）
 
+// v1.0.71：按指针身份追踪按在球上的「用户手指」触摸，替代 UILongPressGR 触发连点。
+// 免疫两大致命干扰：① 游戏内多点触摸（第 2 根手指）会让 UILongPress 被判 Cancelled；
+// ② 合成注入触摸（当点击点==球心时落回球上）会让 UILongPress 收 2nd touch 取消。
+// 只认「在球内 Began 的那一根触摸」，其余触摸/合成触摸一律忽略。
+static void *gBallTouch = NULL;          // 用户手指对应的 UITouch 对象（ARC 下系统持有，指针有效期内稳定）
+static double gBallTouchDownTime = 0;    // 该触摸 Began 的单调时间
+static BOOL   gBallTouchClicking = NO;   // 是否已据此触摸开始连点（避免重复 start）
+
 static CGPoint gClickPanStartLoc;   // 点击点拖动起点（窗口坐标）
 static CGPoint gClickPanOrigin0;    // 点击点拖动起点 frame.origin
 
@@ -623,15 +631,9 @@ static id    gGRTarget      = nil;
 // Long 回调：仅「蓝色连击模式」生效——一碰即连点（点击点锁在按下时球心，拖动不改变）。
 // 「红色拖动模式」下长按无效（拖动由 Pan GR 负责），避免双击切换与连点冲突。
 static void FTGRLongHandler(id self, SEL _cmd, id gr) {
-    (void)self; (void)_cmd;
-    if (!gr || !gBallView) return;
-    if (gDragMode) return; // 拖动模式：长按不触发连点
-    NSUInteger st = ((Msg_State)objc_msgSend)(gr, sel_registerName("state"));
-    if (st == 1) { // Began → 开始连点（点击点=当前球心）
-        FTStartClicking();
-    } else if (st == 3 || st == 4 || st == 5) { // Ended / Cancelled / Failed → 停止
-        FTStopClicking();
-    }
+    (void)self; (void)_cmd; (void)gr;
+    // v1.0.71：长按连点改由 sendEvent hook 按「触摸身份」追踪驱动（免疫游戏多点触摸 / 合成触摸取消），
+    // 此处留空，仅保留 gLongGR 实例供 double-tap / pan 的 requireGestureRecognizerToFail 依赖。
 }
 
 // Pan 回调：仅「红色拖动模式」生效——拖动小球重新定位（点击点独立，不受影响）。
@@ -1183,10 +1185,48 @@ static void FTTweakInitCallback(void *ctx) {
     if (event) {
         FT_HIDCaptureSenderIDFromUIEvent((__bridge void *)event);
     }
-    static double sLastDiag = 0;
+    // v1.0.71：按「触摸身份」追踪按在球上的用户手指，驱动连点（替代 UILongPressGR）。
+    // 免疫两大致命干扰：① 游戏内多点触摸（第 2 根手指）会让 UILongPress 被判 Cancelled；
+    // ② 合成注入触摸（点击点==球心时落回球上）会让 UILongPress 收 2nd touch 取消。
+    // 只认「在球内 Began 的那一根触摸」，合成触摸因指针身份不同被忽略；且只在按住 >120ms 后才连点，
+    // 避免双击切模式时误触发连点。
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+
+    if (gBallView && event && !gDragMode) {
+        id tset = ((Msg_Send)objc_msgSend)(event, sel_registerName("allTouches"));
+        NSUInteger tn = tset ? ((Msg_Count)objc_msgSend)(tset, sel_registerName("count")) : 0;
+        CGRect bf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
+        for (NSUInteger i = 0; i < tn; i++) {
+            id t = ((Msg_ObjectAtIndex)objc_msgSend)(tset, sel_registerName("objectAtIndex:"), i);
+            if (!t) continue;
+            long ph = (long)((Msg_Int)objc_msgSend)(t, sel_registerName("phase"));
+            CGPoint loc = ((Msg_LocationInView)objc_msgSend)(t, sel_registerName("locationInView:"), nil);
+            BOOL onBall = (loc.x >= bf.origin.x && loc.x <= bf.origin.x + bf.size.width &&
+                          loc.y >= bf.origin.y && loc.y <= bf.origin.y + bf.size.height);
+            void *tp = (__bridge void *)t;
+            if (ph == 0) {                                   // Began
+                if (onBall && gBallTouch == NULL) {
+                    gBallTouch = tp;
+                    gBallTouchDownTime = now;
+                }
+            } else if (ph == 1 || ph == 2) {                 // Moved / Stationary
+                if (gBallTouch == tp && !gBallTouchClicking && (now - gBallTouchDownTime) > 0.12) {
+                    gBallTouchClicking = YES;
+                    FTStartClicking();
+                }
+            } else if (ph == 3 || ph == 4) {                 // Ended / Cancelled
+                if (gBallTouch == tp) {
+                    gBallTouch = NULL;
+                    if (gBallTouchClicking) { gBallTouchClicking = NO; FTStopClicking(); }
+                }
+            }
+        }
+    }
+
+    // 诊断节流（保留原 SEND 日志）
+    static double sLastDiag = 0;
     if (now - sLastDiag < 0.5) return; // 节流 500ms
     sLastDiag = now;
     if (!event) return;
@@ -1247,14 +1287,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.70 loaded (decoupled click-point marker; orientation-aware HID coord; long-press combo no-alpha; 10ms default)");
+    syslog(LOG_ERR, "FloatingTap v1.0.71 loaded (touch-identity-driven combo; senderID captured-first; orientation-aware HID; 10ms)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.70 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; orientation-aware HID coord; system HID dispatch)\n");
+            fprintf(mk, "FloatingTap v1.0.71 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; touch-identity combo; captured-first senderID; system HID dispatch)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
