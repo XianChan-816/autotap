@@ -111,6 +111,11 @@ static void *gBallTouch = NULL;          // 用户手指对应的 UITouch 对象
 static double gBallTouchDownTime = 0;    // 该触摸 Began 的单调时间
 static BOOL   gBallTouchClicking = NO;   // 是否已据此触摸开始连点（避免重复 start）
 static BOOL   gBallTouchTimerPending = NO; // 120ms 长按计时器是否已排队（避免重复排）
+// v1.0.80：松手宽限——注入合成触摸会让系统把按住球的手指 Ended（touch ph=3），但用户手指
+// 仍物理按着，digitizer 会为同一手指重发 Began。故触摸结束时【不立即停止】，排 400ms 宽限
+// 计时器：宽限内系统重发 Began → 重绑继续连点；宽限过无新 Began → 确认真松手 → 停止。
+static BOOL   gStopGracePending = NO;
+static void FTStopGraceTimer(void *ctx);
 
 static CGPoint gClickPanStartLoc;   // 点击点拖动起点（窗口坐标）
 static CGPoint gClickPanOrigin0;    // 点击点拖动起点 frame.origin
@@ -644,6 +649,7 @@ static void FTStartClicking(void) {
 static void FTStopClicking(const char *reason) {
     if (!gIsClicking) return;
     gIsClicking = NO;
+    gStopGracePending = NO; // 取消任何待决的松手宽限
     if (gClickTimer) {
         dispatch_source_cancel(gClickTimer);
         gClickTimer = NULL;
@@ -758,6 +764,14 @@ static void FTBallHoldTimer(void *ctx) {
         gBallTouchClicking = YES;
         FTStartClicking();
     }
+}
+
+// v1.0.80：松手宽限计时器——400ms 内没有重发的 Began（重绑会清 gStopGracePending）才真停止。
+static void FTStopGraceTimer(void *ctx) {
+    (void)ctx;
+    if (!gStopGracePending) return; // 已被重绑取消（用户手指仍在按着，系统重发了 Began）
+    gStopGracePending = NO;
+    FTStopClicking("hold-release");
 }
 
 // Tap 回调：双击 → 切换「拖动模式」与「连击模式」（不再隐藏球）。
@@ -1269,9 +1283,12 @@ static void FTTweakInitCallback(void *ctx) {
                 if (onBall && gBallTouch == NULL) {
                     gBallTouch = tp;
                     gBallTouchDownTime = now;
-                    // v1.0.76 防御：若正在连点（gBallTouchClicking）且系统因注入把上一根
-                    // 手指 Ended 后又为同一物理手指重新 Began，直接重绑继续连点，不打断。
-                    if (!gBallTouchClicking) {
+                    // v1.0.80：若正在连点且系统因注入把上一根手指 Ended 后重发了 Began
+                    // （用户仍物理按着），重绑并【取消松手宽限】，连点继续。
+                    if (gIsClicking) {
+                        gStopGracePending = NO;
+                        gBallTouchClicking = YES;
+                    } else {
                         // 排一个 120ms 延时计时器：到时若手指仍按着（gBallTouch 不变）且非拖动模式，
                         // 就开连点。⚠️ 不能等 Moved/Stationary 事件——静止按住时 iOS 不投递这些事件
                         // （ctor-44 实测：1.6s 按住零 phase=1/2，导致旧逻辑从未触发、零点击）。
@@ -1292,11 +1309,15 @@ static void FTTweakInitCallback(void *ctx) {
                 if (gBallTouch == tp) {
                     gBallTouch = NULL;
                     gBallTouchTimerPending = NO;
-                    if (gBallTouchClicking) {
-                        gBallTouchClicking = NO;
-                        char rsn[64];
-                        snprintf(rsn, sizeof(rsn), "touch ph=%ld", ph);
-                        FTStopClicking(rsn);
+                    // v1.0.80：触摸结束【不立即停连点】——注入合成触摸会让系统把按住的手指
+                    // Ended（ctor-53 铁证：clicking started 与 stopped 同戳、SEND 同时显示
+                    // 用户手指仍在球上）。用户仍物理按着时系统会重发 Began（重绑已取消宽限）。
+                    // 只有宽限 400ms 内没有新 Began（真松手）才停止。
+                    gBallTouchClicking = NO;
+                    if (gIsClicking && !gStopGracePending) {
+                        gStopGracePending = YES;
+                        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                                         dispatch_get_main_queue(), NULL, FTStopGraceTimer);
                     }
                 }
             }
@@ -1365,14 +1386,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.79 loaded (service-enum senderID candidates; sendEvent SIDs all rejected 0x1)");
+    syslog(LOG_ERR, "FloatingTap v1.0.80 loaded (hold-to-combo with 400ms release grace: injection-induced touch end re-binds via re-Began)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.79 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; service-enum senderID; UP parent Range/Touch=0; hand index=99; DisplayIntegrated=0x0B0017)\n");
+            fprintf(mk, "FloatingTap v1.0.80 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; hold-to-combo; 400ms release grace + re-bind; UP parent Range/Touch=0)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

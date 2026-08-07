@@ -417,7 +417,8 @@ static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint3
     uint64_t cands[10];
     int nc = 0;
     if (g_WorkingSID) cands[nc++] = g_WorkingSID;
-    for (int i = 0; i < g_CapturedSIDCount && nc < 9; i++) cands[nc++] = g_CapturedSIDs[i];
+    for (int i = 0; i < g_CapturedSIDCount && nc < 7; i++) cands[nc++] = g_CapturedSIDs[i];
+    cands[nc++] = 0x1000007adULL; // v1.0.80 诊断：ctor-39 出过真实点击的 SID，固定试一发
     cands[nc++] = 0x8000000817371935ULL; // 社区通用兜底（kIOHIDEventDigitizerSenderID）
     for (int i = 0; i < nc; i++) {
         FT_IOHIDEventRef ev = (i == 0) ? event : FT_HIDCreateDigitizerEvent(down, nx, ny, index);
