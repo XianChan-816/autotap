@@ -537,16 +537,14 @@ static void FTSyntheticTap(double px, double py) {
 
     // down 立即（系统级派发）
     FT_HIDDispatchDown(nx, ny, idx);
-    // up 延迟 50ms（关联同一触摸，社区标准）。
-    // ⚠️ v1.0.76 回归修复：v1.0.75 曾把 <50ms 间隔的 up 提前到 15ms，结果 15ms 的触摸被
-    // 系统当噪声过滤，App 收不到 tapsBegan（计数器软件 0 点击、Notes 只出笔点不落墨，ctor-47）。
-    // 50ms 是已验证能注册为真实点击的最短安全时长（ctor-46 有反馈）。10ms 连点会有 5 根
-    // 同时按下的手指，属正常多指场景，App 仍逐个计数。
+    // up 延迟（关联同一触摸）。v1.0.82：50ms → 15ms——10ms 连点 + 50ms 抬指 = 同时 5 根手指
+    // 按着，图标/按钮被持续"按压高亮"（看起来像长按，ctor-55 用户反馈"桌面只触发长按效果"）。
+    // 15ms 抬指把重叠降到 ~1.5 根，触摸仍有足够时长注册为 tap。
     // 上下文按次 malloc，避免全局覆盖导致 down/up 错配。
     FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
     if (c) {
         c->x = nx; c->y = ny; c->index = idx;
-        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.015 * NSEC_PER_SEC)),
                          dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
     }
 }
@@ -1425,14 +1423,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.81 loaded (click-point flash indicator; hold-to-combo; 400ms release grace)");
+    syslog(LOG_ERR, "FloatingTap v1.0.82 loaded (up-delay 50->15ms reduce overlap; hold-to-combo; 400ms release grace)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.81 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; click-point flash; hold-to-combo; 400ms release grace)\n");
+            fprintf(mk, "FloatingTap v1.0.82 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; up-delay 15ms; click-point flash; hold-to-combo; 400ms release grace)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
