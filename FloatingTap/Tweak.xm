@@ -465,15 +465,20 @@ static void FTAppsListDeferredCallback(void *ctx) {
 // 事件队列，前台 App（游戏）收不到 → 注入日志有、但无任何点击反馈。这是"无点击效果"的真凶。
 // down 立即发，up 延迟 50ms 发（社区标准做法）——让系统把 down/up 关联为同一触摸。
 
-static double gPendingUpX = 0;
-static double gPendingUpY = 0;
-static uint32_t gPendingUpIndex = 0;
-static void FTSendHIDUpCallback(void *ctx);
+// v1.0.75：up 回调上下文按次 malloc（消除全局覆盖——10ms 连点多个 pending up 会互相覆盖
+// 坐标/index，导致 down/up 错配、部分触摸永远收不到 up）。回调里 free。
+typedef struct {
+    double   x, y;
+    uint32_t index;
+} FTHIDUpCtx;
 
 // 发送一次 up（延迟回调）——经系统 HID 服务派发
 static void FTSendHIDUpCallback(void *ctx) {
-    (void)ctx;
-    FT_HIDDispatchUp(gPendingUpX, gPendingUpY, gPendingUpIndex);
+    FTHIDUpCtx *c = (FTHIDUpCtx *)ctx;
+    if (c) {
+        FT_HIDDispatchUp(c->x, c->y, c->index);
+        free(c);
+    }
 }
 
 // 在屏幕像素点 (px,py) 发一次合成点击（down 立即 + up 延迟 50ms；每次 tap index 递增）
@@ -526,12 +531,16 @@ static void FTSyntheticTap(double px, double py) {
 
     // down 立即（系统级派发）
     FT_HIDDispatchDown(nx, ny, idx);
-    // up 延迟 50ms（关联同一触摸）
-    gPendingUpX = nx;
-    gPendingUpY = ny;
-    gPendingUpIndex = idx;
-    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                     dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
+    // up 延迟（关联同一触摸）。v1.0.75：间隔 <50ms 时把 up 提前到 15ms——
+    // 否则 10ms 连点会同时挂 5 根"按住"的手指，App 端可能把连续 tap 误判为多指手势/长按。
+    // 上下文按次 malloc，避免全局覆盖导致 down/up 错配。
+    double upDelay = (FTIntervalMs() < 50.0) ? 0.015 : 0.05;
+    FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
+    if (c) {
+        c->x = nx; c->y = ny; c->index = idx;
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(upDelay * NSEC_PER_SEC)),
+                         dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
+    }
 }
 
 // MARK: - SB 端注入（v1.0.62 起走系统 HID 服务，可命中前台 App）
@@ -585,6 +594,19 @@ static void FTDumpEventIvars(void) {
     FTLog(buf);
 }
 
+// v1.0.75：按「连点中 / 模式」统一启停全部手势识别器。
+// ⚠️ 关键修复：连点期间【禁用全部 GR】——否则任何 GR（双击/长按/拖动，含合成点击落在
+// 标记/球上的情况）都可能把按住球的手指判 Cancelled(phase=4) 或触发双击 → 连点刚启动就
+// 被 FTStopClicking 掐断（"长按只算一次"，ctor-45/46 反复出现）。用户连点时按着球，本就不需要双击。
+static void FTApplyGRModes(void) {
+    if (!gTapGR || !gLongGR || !gPanGR) return;
+    ((Msg_SetEnabled)objc_msgSend)(gTapGR,  sel_registerName("setEnabled:"), gIsClicking ? NO : YES);
+    ((Msg_SetEnabled)objc_msgSend)(gTapGR2, sel_registerName("setEnabled:"), gIsClicking ? NO : (gClickPointView ? YES : NO));
+    ((Msg_SetEnabled)objc_msgSend)(gLongGR, sel_registerName("setEnabled:"), gIsClicking ? NO : (!gDragMode ? YES : NO));
+    ((Msg_SetEnabled)objc_msgSend)(gPanGR,  sel_registerName("setEnabled:"), gIsClicking ? NO : (gDragMode ? YES : NO));
+    ((Msg_SetEnabled)objc_msgSend)(gClickPanGR, sel_registerName("setEnabled:"), gIsClicking ? NO : (gDragMode ? YES : NO));
+}
+
 // v1.0.48：SB 端恢复直接注入（不再写任务文件）。坐标锁定 = App 配置点（v1.0.50）
 // 或长按开始时球心（无配置时）。
 static void FTStartClicking(void) {
@@ -611,17 +633,23 @@ static void FTStartClicking(void) {
         dispatch_source_set_event_handler_f(gClickTimer, FTClickCallback);
         dispatch_resume(gClickTimer);
     }
+    // v1.0.75：连点中禁用全部手势识别器（防 GR 取消手指/触发双击掐断连点）
+    FTApplyGRModes();
     FTLog("clicking started");
 }
 
-static void FTStopClicking(void) {
+// v1.0.75：FTStopClicking 带停止原因（诊断用），并在停止后按模式恢复手势
+static void FTStopClicking(const char *reason) {
     if (!gIsClicking) return;
     gIsClicking = NO;
     if (gClickTimer) {
         dispatch_source_cancel(gClickTimer);
         gClickTimer = NULL;
     }
-    FTLog("clicking stopped");
+    FTApplyGRModes(); // 恢复手势（按当前模式启用对应 GR）
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg), "clicking stopped (%s)", reason ? reason : "?");
+    FTLog(dbg);
     char buf[96];
     snprintf(buf, sizeof(buf), "clicks this period: %lu", gClickCount);
     FTLog(buf);
@@ -737,22 +765,17 @@ static void FTGRTapHandler(id self, SEL _cmd, id gr) {
     if (!gr || !gBallView) return;
     NSUInteger st = ((Msg_State)objc_msgSend)(gr, sel_registerName("state"));
     if (st == 3) { // Ended（双击完成）
-        FTStopClicking();
+        FTStopClicking("dbl-tap");
         // 切模式时清掉触摸追踪状态，避免残留的 120ms 计时器在切换后误开连点（竞态）
         gBallTouch = NULL;
         gBallTouchClicking = NO;
         gBallTouchTimerPending = NO;
         gDragMode = !gDragMode;
-        // 模式切换：仅启用当前模式对应的手势，禁用另一个，避免长按/拖动手势识别冲突
-        ((Msg_SetEnabled)objc_msgSend)(gLongGR, sel_registerName("setEnabled:"), gDragMode ? NO : YES);
-        ((Msg_SetEnabled)objc_msgSend)(gPanGR,  sel_registerName("setEnabled:"), gDragMode ? YES : NO);
-        // 点击点标记：拖动模式可拖动、可见；连击模式不可交互（点击穿透到下层 App）
+        // v1.0.75：统一由 FTApplyGRModes 按模式启用/禁用对应手势（含连点中全禁用）
         if (gClickPointView) {
             ((Msg_SetUserInteractionEnabled)objc_msgSend)(gClickPointView, sel_registerName("setUserInteractionEnabled:"), gDragMode ? YES : NO);
         }
-        if (gClickPanGR) {
-            ((Msg_SetEnabled)objc_msgSend)(gClickPanGR, sel_registerName("setEnabled:"), gDragMode ? YES : NO);
-        }
+        FTApplyGRModes();
         FTApplyBallAppearance();
         FTApplyClickPointAppearance();
         FTLog(gDragMode ? "double tap -> drag mode ON (red): drag ball / click-point to position" : "double tap -> combo mode ON (blue)");
@@ -1263,7 +1286,12 @@ static void FTTweakInitCallback(void *ctx) {
                 if (gBallTouch == tp) {
                     gBallTouch = NULL;
                     gBallTouchTimerPending = NO;
-                    if (gBallTouchClicking) { gBallTouchClicking = NO; FTStopClicking(); }
+                    if (gBallTouchClicking) {
+                        gBallTouchClicking = NO;
+                        char rsn[64];
+                        snprintf(rsn, sizeof(rsn), "touch ph=%ld", ph);
+                        FTStopClicking(rsn);
+                    }
                 }
             }
         }
@@ -1331,14 +1359,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.74 loaded (cancelsTouchesInView=NO fix one-click; multi-candidate senderID; no orient rotate; 10ms)");
+    syslog(LOG_ERR, "FloatingTap v1.0.75 loaded (disable GRs while clicking; stop-reason diag; per-tap up ctx; adaptive up-delay; passthrough coords)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.74 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; cancelsTouchesInView=NO; multi-candidate senderID; no orient rotate; system HID dispatch)\n");
+            fprintf(mk, "FloatingTap v1.0.75 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; disable GRs while clicking; stop-reason diag; per-tap up ctx; passthrough coords)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
