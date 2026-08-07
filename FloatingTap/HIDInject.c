@@ -296,6 +296,13 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
         p_IOHIDEventSetFloatValue(child, 0x0B000D, x);
         p_IOHIDEventSetFloatValue(child, 0x0B000E, y);
     }
+    if (p_IOHIDEventSetIntegerValue) {
+        // v1.0.76 关键：kIOHIDEventFieldDigitizerIsDisplayIntegrated(0x0B0005)=1——
+        // 标记为「内置屏幕集成 digitizer」的真实触摸。缺失时系统可能把合成事件当
+        // 外接设备/Apple Pencil 悬停触摸：App 收不到 touchesBegan（计数器 0 点击、
+        // Notes 只显示笔点而不落墨）——ctor-47 实测。v1.0.24/25 曾设过，重构时丢失。
+        p_IOHIDEventSetIntegerValue(child, 0x0B0005, 1);
+    }
 
     // 父事件（digitizer hand）：15 参签名（含 buttonMask，位于 eventMask 之后、x 之前）。
     FT_IOHIDEventRef parent = p_IOHIDEventCreateDigitizerEvent(
@@ -312,9 +319,11 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
     }
     if (p_IOHIDEventSetIntegerValue) {
         // ZXTouch 验证生效的关键字段：
+        //   IsDisplayIntegrated(0x0B0005)=1 → 内置屏幕集成触摸（v1.0.76 补回，防被当悬停/外接）
         //   Identity(0x0B0019)=1 + Type(0x4)=1 → 认作真实屏幕集成触摸
         //   EventMask(0x0B0007)=0x23 → 父事件 composite touch state
         //   Range(0x0B0006)=1 + Touch(0x0B0008)=1 → 接触状态（与子事件一致）
+        p_IOHIDEventSetIntegerValue(parent, 0x0B0005, 1); // IsDisplayIntegrated
         p_IOHIDEventSetIntegerValue(parent, 0x0B0019, 1);
         p_IOHIDEventSetIntegerValue(parent, 0x4, 1);
         p_IOHIDEventSetIntegerValue(parent, 0x0B0007, 0x23);

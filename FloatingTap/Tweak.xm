@@ -531,14 +531,16 @@ static void FTSyntheticTap(double px, double py) {
 
     // down 立即（系统级派发）
     FT_HIDDispatchDown(nx, ny, idx);
-    // up 延迟（关联同一触摸）。v1.0.75：间隔 <50ms 时把 up 提前到 15ms——
-    // 否则 10ms 连点会同时挂 5 根"按住"的手指，App 端可能把连续 tap 误判为多指手势/长按。
+    // up 延迟 50ms（关联同一触摸，社区标准）。
+    // ⚠️ v1.0.76 回归修复：v1.0.75 曾把 <50ms 间隔的 up 提前到 15ms，结果 15ms 的触摸被
+    // 系统当噪声过滤，App 收不到 tapsBegan（计数器软件 0 点击、Notes 只出笔点不落墨，ctor-47）。
+    // 50ms 是已验证能注册为真实点击的最短安全时长（ctor-46 有反馈）。10ms 连点会有 5 根
+    // 同时按下的手指，属正常多指场景，App 仍逐个计数。
     // 上下文按次 malloc，避免全局覆盖导致 down/up 错配。
-    double upDelay = (FTIntervalMs() < 50.0) ? 0.015 : 0.05;
     FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
     if (c) {
         c->x = nx; c->y = ny; c->index = idx;
-        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(upDelay * NSEC_PER_SEC)),
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
                          dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
     }
 }
@@ -1267,13 +1269,17 @@ static void FTTweakInitCallback(void *ctx) {
                 if (onBall && gBallTouch == NULL) {
                     gBallTouch = tp;
                     gBallTouchDownTime = now;
-                    // 排一个 120ms 延时计时器：到时若手指仍按着（gBallTouch 不变）且非拖动模式，
-                    // 就开连点。⚠️ 不能等 Moved/Stationary 事件——静止按住时 iOS 不投递这些事件
-                    // （ctor-44 实测：1.6s 按住零 phase=1/2，导致旧逻辑从未触发、零点击）。
-                    if (!gBallTouchTimerPending) {
-                        gBallTouchTimerPending = YES;
-                        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
-                                         dispatch_get_main_queue(), NULL, FTBallHoldTimer);
+                    // v1.0.76 防御：若正在连点（gBallTouchClicking）且系统因注入把上一根
+                    // 手指 Ended 后又为同一物理手指重新 Began，直接重绑继续连点，不打断。
+                    if (!gBallTouchClicking) {
+                        // 排一个 120ms 延时计时器：到时若手指仍按着（gBallTouch 不变）且非拖动模式，
+                        // 就开连点。⚠️ 不能等 Moved/Stationary 事件——静止按住时 iOS 不投递这些事件
+                        // （ctor-44 实测：1.6s 按住零 phase=1/2，导致旧逻辑从未触发、零点击）。
+                        if (!gBallTouchTimerPending) {
+                            gBallTouchTimerPending = YES;
+                            dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                                             dispatch_get_main_queue(), NULL, FTBallHoldTimer);
+                        }
                     }
                 }
             } else if (ph == 1 || ph == 2) {                 // Moved / Stationary（仅作保险，主要靠计时器）
@@ -1359,14 +1365,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.75 loaded (disable GRs while clicking; stop-reason diag; per-tap up ctx; adaptive up-delay; passthrough coords)");
+    syslog(LOG_ERR, "FloatingTap v1.0.76 loaded (IsDisplayIntegrated=1 real touch; 50ms up-delay; touch re-bind defense; passthrough coords)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.75 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; disable GRs while clicking; stop-reason diag; per-tap up ctx; passthrough coords)\n");
+            fprintf(mk, "FloatingTap v1.0.76 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; IsDisplayIntegrated=1; 50ms up-delay; touch re-bind; passthrough coords)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
