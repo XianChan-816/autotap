@@ -792,7 +792,12 @@ static id FTFindOverlayWindow(int *outIsGesture) {
             id w = ((Msg_ObjectAtIndex)objc_msgSend)(ws, sel_registerName("objectAtIndex:"), i);
             if (!w) continue;
             const char *cn = object_getClassName(w);
-            if (cn && strstr(cn, "Alert")) continue; // 跳过瞬时弹窗（SBAlertItemWindow 等）
+            // v1.0.68：跳过瞬时 / 非交互窗口。iOS 15 的 SBRecordingIndicatorWindow（隐私/录屏指示）
+            // 尺寸极小却拥有最高 windowLevel，旧版兜底误选它 → 球挂上去 touch 命中范围错乱、手势收不到、
+            // 在 App 内被完全盖住无反馈。一并排除 Alert / StatusBar / Keyboard / CoverSheet 等。
+            if (cn && (strstr(cn, "Alert") || strstr(cn, "Recording") ||
+                       strstr(cn, "Indicator") || strstr(cn, "StatusBar") ||
+                       strstr(cn, "Keyboard") || strstr(cn, "CoverSheet"))) continue;
             CGFloat lvl = ((Msg_CGFloatReturn)objc_msgSend)(w, sel_registerName("windowLevel"));
             if (lvl > bestLvl) { bestLvl = lvl; best = w; }
         }
@@ -805,6 +810,22 @@ static id FTFindOverlayWindow(int *outIsGesture) {
 static void FTSetupBallRetry(void *ctx) {
     (void)ctx;
     FTSetupBall();
+}
+
+// v1.0.68：把球重新挂到系统手势窗口（当 sendEvent 捕获到真正手势窗口、而球此前挂在兜底窗口时）。
+// 用主线程异步回调执行，避免在事件派发途中直接改视图层级导致异常。
+static void FTReparentBallToGestureWin(void *ctx) {
+    (void)ctx;
+    if (!gBallView || !gGestureWin) return;
+    id sup = ((Msg_Send)objc_msgSend)(gBallView, sel_registerName("superview"));
+    if (sup == gGestureWin) return; // 已经在正确窗口
+    if (sup) ((Msg_Send)objc_msgSend)(gBallView, sel_registerName("removeFromSuperview"));
+    ((Msg_AddSubview)objc_msgSend)(gGestureWin, sel_registerName("addSubview:"), gBallView);
+    gBallContainer = gGestureWin;
+    const char *oldCls = sup ? object_getClassName(sup) : "?";
+    char diag[160];
+    snprintf(diag, sizeof(diag), "ball reparented: %s -> %s", oldCls, object_getClassName(gGestureWin));
+    FTLog(diag);
 }
 
 // MARK: - 创建小球
@@ -865,9 +886,9 @@ static void FTSetupBall(void) {
             isGesture);
         FTLog(diagSel);
     }
-    if ((!targetWin || !isGesture) && gBallSetupTries < FT_BALL_MAX_TRIES) {
+    if (!targetWin && gBallSetupTries < FT_BALL_MAX_TRIES) {
         gBallSetupTries++;
-        FTLog("ball: system gesture window not ready, retry later");
+        FTLog("ball: no overlay window yet, retry later");
         dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                          dispatch_get_main_queue(), NULL, FTSetupBallRetry);
         return;
@@ -1024,6 +1045,10 @@ static void FTTweakInitCallback(void *ctx) {
         if (cn && (strstr(cn, "SystemGesture") || strstr(cn, "GestureWindow") || strstr(cn, "FBSystemGesture"))) {
             gGestureWin = self;
             FTLog("captured system gesture window from sendEvent");
+            // v1.0.68：若球此前挂在兜底窗口（如 SBRecordingIndicatorWindow），立即异步重挂到正确窗口。
+            if (gBallView) {
+                dispatch_async_f(dispatch_get_main_queue(), NULL, FTReparentBallToGestureWin);
+            }
         }
     }
     // v1.0.64：从真实触摸事件的 _hidEvent 动态捕获设备 senderID（逻辑在 HIDInject.c，
@@ -1098,7 +1123,7 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.67 loaded (pure C ctor, ball on _UISystemGestureWindow; corrected 13-param finger event sig; system HID dispatch)");
+    syslog(LOG_ERR, "FloatingTap v1.0.68 loaded (pure C ctor, ball on _UISystemGestureWindow; corrected 13-param finger event sig; system HID dispatch; reparent-to-gesture-win on capture)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
