@@ -595,11 +595,15 @@ static void FTSyntheticTap(double px, double py) {
     // 游戏内残留 Stationary 手指导致视角跳屏 + 停止延迟感知。15ms 重叠 ~1.5 根，
     // up 丢失率大幅下降（v1.0.82 已验证 15ms 触摸可注册为 tap；v1.0.76 的"15ms 噪声"
     // 结论当时被悬停/senderID bug 混淆，现代结构已修正）。
+    // ⚠️ v1.0.110：15ms → 25ms（回退）——ctor-6 实测 15ms 每轮只 11-13 次（100ms 宽限停）：
+    // down(N+1) 紧贴 up(N)（10ms < 15ms）触发系统触摸上下文重置 → 顶掉用户手指 → 连点
+    // 不连续。25ms 下 up 在 down 后从容发出（v1.0.108 实测 clicks 131 持续）。跳屏改由
+    // FTRaiseResidualUps 串行补发（v1.0.110）解决，不再牺牲 up-delay。
     // 上下文按次 malloc，避免全局覆盖导致 down/up 错配。
     FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
     if (c) {
         c->x = nx; c->y = ny; c->index = idx;
-        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.015 * NSEC_PER_SEC)),
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.025 * NSEC_PER_SEC)),
                          dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
     }
 }
@@ -731,21 +735,32 @@ static void FTStartClicking(void) {
 // 且残留跨轮积累会干扰下一次连点（ctor-71：每轮残留 4 根）。只抬【有匹配 down 的残留
 // index 2-9】（永不碰用户手指 index=1），坐标用点击点（残留手指实际位置）——最安全清场。
 // v1.0.99：FTStartClicking + FTStopClicking 都调用（开始清上一轮残留、停止清本轮残留）。
+// v1.0.110：串行补发——一次性 dispatch 多个 up 会被系统合并/丢弃，残留手指清不掉
+// → 停止后游戏仍看到点击点有手指按着（视角跳屏，ctor(2) 用户反馈）；逐个间隔 25ms
+// 延迟发出，确保每个 up 都被系统独立处理、全部送达。
 static void FTRaiseResidualUps(void) {
-    int raised = 0;
     double rx = gClickLockX, ry = gClickLockY;
     if (rx < 0.001) rx = 0.001; if (rx > 0.999) rx = 0.999;
     if (ry < 0.001) ry = 0.001; if (ry > 0.999) ry = 0.999;
+    uint32_t pend[14];
+    int np = 0;
     for (uint32_t i = 2; i < 16; i++) {
         if (g_PendingUpIdx[i]) {
             g_PendingUpIdx[i] = false;
-            FT_HIDDispatchUp(rx, ry, i);
-            raised++;
+            if (np < 14) pend[np++] = i;
         }
     }
-    if (raised > 0) {
+    if (np > 0) {
+        for (int k = 0; k < np; k++) {
+            FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
+            if (c) {
+                c->x = rx; c->y = ry; c->index = pend[k];
+                dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((double)k * 0.025 * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
+            }
+        }
         char dbg2[96];
-        snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d", raised);
+        snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d (serial)", np);
         FTLog(dbg2);
     }
 }
@@ -1803,14 +1818,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.109 loaded (up-delay 15ms - fewer residual fingers; 100ms release grace)");
+    syslog(LOG_ERR, "FloatingTap v1.0.110 loaded (up-delay back to 25ms - combo continuity; serial residual-up cleanup)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.109 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; up-delay 15ms; 100ms grace)\n");
+            fprintf(mk, "FloatingTap v1.0.110 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; up-delay 25ms; serial residual cleanup)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
