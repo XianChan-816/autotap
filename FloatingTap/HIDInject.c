@@ -237,15 +237,13 @@ void FT_HIDCaptureSenderIDFromUIEvent(void *event) {
 
 // MARK: - 事件构造
 
-// v1.0.64：按 zxtouch（iOS13-16 验证可用）+ TouchSimulator-iOS14 的事件树构造。
-// 关键点（对照 ctor-10 全 DispatchEvent failed 0x1 的根因）：
-//  1) senderID 只在【事件级】设置（client 级设错会致 DispatchEvent 返回 0x1）。
-//  2) 父事件（hand）第 8~10 个位置参数是 accuracy/altitude/azimuth（不是 x/y），
-//     真实坐标靠【子事件 finger 的位置参数 x,y】承载（zxtouch 验证生效），不要再当 x/y 传入。
-//  3) 子事件需设 MajorRadius/MinorRadius；父事件需设 IsDisplayIntegrated（屏幕集成触摸标记）。
-//     —— 这些字段常量 iOS 15 SDK 布局：X=0x0B000D Y=0x0B000E
-//        MajorRadius=0x0B0015 MinorRadius=0x0B0016 IsDisplayIntegrated=0x0B0017。
-//  4) eventMask：down=0x07(Range|Touch|Position)，up=0x06(Touch|Position，range=0 表抬起)。
+// v1.0.65：逐字对照 ios-mcp/HIDManager.m（现代 iOS 验证可用的实现）重写。
+// 之前 v1.0.64 的 MajorRadius/MinorRadius 字段常量错（用了 0x0B0015/0x0B0016，
+// 正确应为 0x0B0014/0x0B0015），且父事件关键魔法字段错（IsDisplayIntegrated=0x0B0017
+// 应为 0x0B0019=1 + 0x4=1，等同 digitizerEventMask + isBuiltIn，让系统认作真实屏触）。
+// 坐标靠子事件 finger 的位置参数 x,y（归一化 0~1）承载即可，无需另写 float 字段。
+// eventMask：down=0x07(Range|Touch|Position) / up=0x06(Touch|Position, range=0 抬起)。
+// senderID 由 FT_DispatchEvent 设置（优先捕获的真实值，失败自动回退硬编码）。
 FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint32_t index) {
     if (!FT_HIDLoadSymbols()) return NULL;
     if (!p_IOHIDEventCreateDigitizerEvent || !p_IOHIDEventCreateDigitizerFingerEvent ||
@@ -254,75 +252,68 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
         return NULL;
     }
     uint64_t ts = mach_absolute_time();
-    uint32_t mask = down ? 0x07 : 0x06;   // down: Range|Touch|Position ; up: Touch|Position(lift)
+    uint32_t mask = down
+        ? (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventTouch | FT_kIOHIDDigitizerEventPosition)
+        : (FT_kIOHIDDigitizerEventTouch | FT_kIOHIDDigitizerEventPosition); // up: range=0
+    Boolean range = down ? 1 : 0;
+    Boolean touch = down ? 1 : 0;
 
-    // 子事件（finger）：坐标 x,y 按位置参数传入（zxtouch 验证 iOS13-16 有效）
+    // 子事件（finger）：坐标 x,y 按位置参数传入（归一化 0~1），ios-mcp 验证生效
     FT_IOHIDEventRef child = p_IOHIDEventCreateDigitizerFingerEvent(
         kCFAllocatorDefault, ts,
-        index, 1,                      // index（每次 tap 递增）, identity
+        index, 3,                      // index（每次 tap 递增，作 finger id）, identity
         mask, 0,                       // eventMask, buttonMask
-        x, y, 0.0,                     // x, y（归一化 0~1）, z
-        down ? 1.0 : 0.0,              // tipPressure
-        0.0,                           // twist
-        down, down,                    // range, touch
-        0);                            // options
+        x, y, 0.0,                     // x, y（归一化）, z
+        0.0, 0.0,                      // tipPressure, twist
+        range, touch, 0);              // range, touch, options
     if (!child) return NULL;
     if (p_IOHIDEventSetFloatValue) {
-        // kIOHIDEventFieldDigitizerMajorRadius / MinorRadius（触摸尺寸，模拟真实手指）
+        // kIOHIDEventFieldDigitizerMajorRadius / MinorRadius（模拟真实手指尺寸，ios-mcp 用 0.04）
+        p_IOHIDEventSetFloatValue(child, 0x0B0014, 0.04);
         p_IOHIDEventSetFloatValue(child, 0x0B0015, 0.04);
-        p_IOHIDEventSetFloatValue(child, 0x0B0016, 0.04);
-        // 冗余保险：坐标也用 float 字段写一遍（X/Y）
-        p_IOHIDEventSetFloatValue(child, 0x0B000D, x);
-        p_IOHIDEventSetFloatValue(child, 0x0B000E, y);
     }
 
-    // 父事件（digitizer hand）：坐标位置参数传 0（那是 accuracy/altitude/azimuth，非 x/y）
+    // 父事件（digitizer hand）
     FT_IOHIDEventRef parent = p_IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault, ts,
         3,                             // kIOHIDDigitizerTransducerTypeHand
-        index,                         // index（每次 tap 递增，避免被串流）
-        1,                             // identity
-        mask, 0,                       // eventMask, buttonMask
-        0.0, 0.0, 0.0,                 // accuracy, altitude, azimuth（不是 x,y！）
-        down ? 1.0 : 0.0,              // tipPressure
-        0.0,                           // barrelPressure
-        down, down,                    // range, touch
-        0);                            // options
+        index, 1,                      // index, identity
+        0, 0,                          // eventMask, childEventMask（由子事件体现）
+        0.0, 0.0, 0.0,                 // x, y, z
+        0.0, 0.0,                      // tipPressure, barrelPressure
+        0, 0, 0);                      // range, touch, options
     if (!parent) {
         CFRelease(child);
         return NULL;
     }
     if (p_IOHIDEventSetIntegerValue) {
-        // kIOHIDEventFieldDigitizerIndex = 0x0B0002
-        p_IOHIDEventSetIntegerValue(parent, 0x0B0002, (int64_t)index);
-        // kIOHIDEventFieldDigitizerIdentity = 0x0B0003
-        p_IOHIDEventSetIntegerValue(parent, 0x0B0003, 1);
-        // kIOHIDEventFieldDigitizerIsDisplayIntegrated = 0x0B0017 —— 屏幕集成触摸标记
-        p_IOHIDEventSetIntegerValue(parent, 0x0B0017, 1);
-    }
-    if (p_IOHIDEventSetFloatValue) {
-        // 父事件也写一遍坐标（部分派发路径读父事件坐标）
-        p_IOHIDEventSetFloatValue(parent, 0x0B000D, x);
-        p_IOHIDEventSetFloatValue(parent, 0x0B000E, y);
+        // ios-mcp 验证生效的关键魔法字段：digitizerEventMask=1 + isBuiltIn=1
+        // （让系统把合成事件认作真实屏幕集成触摸，否则被静默丢弃）
+        p_IOHIDEventSetIntegerValue(parent, 0x0B0019, 1);
+        p_IOHIDEventSetIntegerValue(parent, 0x4, 1);
     }
 
     p_IOHIDEventAppendEvent(parent, child, 0);
     CFRelease(child);
 
-    // senderID：只设事件级。优先用从真实 digitizer 事件捕获的设备专属值，
-    // 兜底硬编码 kIOHIDEventDigitizerSenderID (0x8000000817371935)。
-    if (p_IOHIDEventSetSenderID) {
-        p_IOHIDEventSetSenderID(parent, FT_HIDSenderID());
-    }
+    // senderID 由 FT_DispatchEvent 设置（优先捕获到的真实设备值，失败自动回退硬编码）
     return parent;
 }
 
 static void FT_DispatchEvent(FT_IOHIDEventRef event) {
-    if (!event || !g_hidClient) return;
+    if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
+    // 先用当前 senderID（优先捕获到的真实设备值，兜底硬编码 0x8000000817371935）
     p_IOHIDEventSetSenderID(event, FT_HIDSenderID());
     FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, event);
+    if (ret != FT_kIOReturnSuccess && g_OverrideSenderID != 0) {
+        // 捕获到的 senderID 派发失败 → 自动回退到社区通用硬编码值再试一次（诊断用）
+        p_IOHIDEventSetSenderID(event, 0x8000000817371935ULL);
+        ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, event);
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg), "DispatchEvent retry(hardcoded SID) ret=0x%x", (unsigned)ret);
+        FTHIDLog(dbg);
+    }
     if (ret != FT_kIOReturnSuccess) {
-        syslog(LOG_ERR, "FloatingTap DispatchEvent failed 0x%x", (unsigned)ret);
         char dbg[96];
         snprintf(dbg, sizeof(dbg), "DispatchEvent failed 0x%x", (unsigned)ret);
         FTHIDLog(dbg);
