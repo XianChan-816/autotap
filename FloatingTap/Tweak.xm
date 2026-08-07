@@ -1385,15 +1385,15 @@ static void FTTweakInitCallback(void *ctx) {
                 if (gBallTouch == tp) {
                     gBallTouch = NULL;
                     gBallTouchTimerPending = NO;
-                    // v1.0.94（豆包方案）：touchesEnded（手指抬起）/ touchesCancelled（滑出球/
-                    // 系统手势打断）→ 排 120ms 短宽限，无新 Began 即停止连点（接近立刻终止）。
-                    // 前提：注入已改用 0x8000... + 0x0B0018 字段不再顶掉用户手指，因此这里的
-                    // Ended/Cancelled 是真实松手信号；120ms 仅吸收「顶掉后系统重发 Began」的
-                    // 边界情况（若重发 → Began 分支取消宽限、连点继续）。
+                    // v1.0.94+（豆包方案）：touchesEnded（手指抬起）/ touchesCancelled（滑出球/
+                    // 系统手势打断）→ 排短宽限，无新 Began 即停止连点（接近立刻终止）。
+                    // v1.0.96：宽限 120ms→200ms——registryID 首选若送达且不顶掉，这里的
+                    // Ended/Cancelled 是真实松手信号（200ms 停感知即时）；若顶掉仍在
+                    // （fallback captured），200ms 宽限 = 每轮 ~20 次（比 120ms 的 13 次好）。
                     gBallTouchClicking = NO;
                     if (gIsClicking && !gStopGracePending) {
                         gStopGracePending = YES;
-                        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
                                          dispatch_get_main_queue(), NULL, FTStopGraceTimer);
                     }
                 }
@@ -1463,14 +1463,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.95 loaded (finger index 2-9 avoid user index=1; captured-first SID; touchesEnded stop)");
+    syslog(LOG_ERR, "FloatingTap v1.0.96 loaded (registryID primary + auto-fallback; zxtouch pure-inject client; 200ms grace)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.95 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; finger index 2-9; captured-first SID; touchesEnded stop)\n");
+            fprintf(mk, "FloatingTap v1.0.96 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; registryID primary + auto-fallback; pure-inject client; 200ms grace)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

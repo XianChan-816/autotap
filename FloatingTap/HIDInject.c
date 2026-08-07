@@ -66,7 +66,6 @@ static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerEvent)(CFAllocatorRef,
 
 static FT_IOHIDEventSystemClientRef (*p_IOHIDEventSystemClientCreate)(CFAllocatorRef);
 static FT_IOReturn (*p_IOHIDEventSystemClientDispatchEvent)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef);
-static void (*p_IOHIDEventSystemClientScheduleWithRunLoop)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef);
 static void (*p_IOHIDEventSetSenderID)(FT_IOHIDEventRef, uint64_t);
 static void (*p_IOHIDEventSetIntegerValue)(FT_IOHIDEventRef, uint32_t, int64_t);
 // v1.0.64：float 字段设置（坐标/半径），以及读事件类型（用于筛选 digitizer 事件抓 senderID）
@@ -77,15 +76,12 @@ static uint64_t (*p_IOHIDEventGetSenderID)(FT_IOHIDEventRef);
 // 系统可能认为本 client 就是真实 digitizer → 注入不被当「未知设备」→ 不触发触摸上下文
 // 重置 → 用户按住的手指不再被注入顶掉（Ended）→ 连点可持续（ctor-62：每轮 400ms 就
 // hold-release 停，因为注入第一个 down 就把用户手指 Ended 且系统不重发 Began）。
-// ⚠️ v1.0.89 结论：该符号 iOS 15.5 不存在（dlsym NULL），无效。
-static void (*p_IOHIDEventSystemClientSetSenderID)(FT_IOHIDEventSystemClientRef, uint64_t);
+// ⚠️ v1.0.89 结论：该符号 iOS 15.5 不存在（dlsym NULL），无效。v1.0.96 移除符号声明。
 // v1.0.92：IOHID 事件回调（纯 C）——从真实触摸的【原始 IOHIDEvent】提取 senderID。
 // sendEvent 的 _hidEvent 是"翻译后"事件（0x1000007xx，送达但触发上下文重置 → 顶掉用户
 // 手指）；zxtouch 用 IOHID 回调里的原始 senderID（系统真正认领，注入当真实 digitizer →
-// 不顶掉）。v1.0.53 注册回调崩过（ObjC/block 实现），纯 C 回调重新尝试。
-typedef void (*FT_HIDEventCallback)(void *target, void *refcon, void *service, FT_IOHIDEventRef event);
-static void (*p_IOHIDEventSystemClientRegisterEventCallback)(FT_IOHIDEventSystemClientRef, FT_HIDEventCallback, void *, void *);
-static void (*p_IOHIDEventSystemClientUnregisterEventCallback)(FT_IOHIDEventSystemClientRef, FT_HIDEventCallback, void *, void *);
+// 不顶掉）。v1.0.53 注册回调崩过（ObjC/block 实现）；v1.0.92 纯 C 回调在 Dopamine 上
+// 只拿到翻译值（ctor-66），v1.0.96 已移除回调（对齐 zxtouch 纯注入 client）。
 // ⚠️ 子事件签名铁律（v1.0.67，来自 SimulateTouch 对系统函数的 hook 反编译，权威）：
 //   IOHIDEventCreateDigitizerFingerEvent(allocator, ts, index, identity, eventMask,
 //       IOHIDFloat x, IOHIDFloat y, IOHIDFloat z,
@@ -126,13 +122,17 @@ static uint64_t g_OverrideSenderID = 0;
 static uint64_t g_CapturedSIDs[12] = {0};
 static int      g_CapturedSIDCount = 0;
 static uint64_t g_WorkingSID = 0;   // 已验证可用（ret=0）的 senderID（锁定后优先使用）
-// v1.0.92：IOHID 回调提取的【原始设备 senderID】（zxtouch 方式）——系统真正认领，
-// 注入当真实 digitizer → 不触发上下文重置 → 用户手指不被顶掉 → 连点持续。
-static uint64_t g_OriginalSenderID = 0;
-// v1.0.84 教训（ctor-57）：服务枚举的 digitizer registryID（0x8de4/0x9114... 形态）不是
-// 系统接受的 senderID——用它派发事件【完全不送达】（日志连点期间无合成触摸、计数器零点击）。
-// sendEvent 捕获的 0x1000007xx（「翻译后」ID）虽然 ret=0x1（假阴性）但事件实际送达、点击有效。
-// → 首选必须是 captured[0]（sendEvent 捕获值）；registryID 只入候选不做首选。
+// ⚠️ v1.0.96 定案（ctor-68 重证）：finger index 2-9 避开 index=1 仍顶掉（clicks 13/轮）——
+// 顶掉与 finger index 无关。且 v1.0.84 用 registryID 时事件结构还是旧的（child mask 0x07），
+// v1.0.90 改 0x03 + v1.0.94 加 0x0B0018 之后【从没重试过 registryID】。registryID 是真实
+// digitizer 服务 SID（zxtouch 用的就是真实 SID），可能「送达且不顶掉」。v1.0.96：
+//   · g_PrimarySID = 第一个确认 digitizer 的 registryID（真实服务 SID）
+//   · 派发 ret≠0 累计 5 次 → 自适应 fallback 到 captured[0]（送达保底，日志标记）
+//   · 移除 ScheduleWithRunLoop + RegisterEventCallback（对齐 zxtouch 纯注入 client，
+//     回调已验证拿不到原始 SID——Dopamine 上只有翻译值）
+static uint64_t g_PrimarySID = 0;    // v1.0.96：首选（digitizer 服务 registryID）
+static int      g_PrimarySIDFailCount = 0; // 首选连续失败计数（≥5 → fallback captured）
+static bool     g_PrimarySIDFellBack = false;
 
 // 前向声明（定义在文件后部「诊断日志」段，但 FT_HIDConnect 等前面函数要用）
 static void FTHIDLog(const char *msg);
@@ -158,18 +158,11 @@ static bool FT_HIDLoadSymbols(void) {
         (FT_IOHIDEventSystemClientRef (*)(CFAllocatorRef))dlsym(handle, "IOHIDEventSystemClientCreate");
     p_IOHIDEventSystemClientDispatchEvent =
         (FT_IOReturn (*)(FT_IOHIDEventSystemClientRef, FT_IOHIDEventRef))dlsym(handle, "IOHIDEventSystemClientDispatchEvent");
-    p_IOHIDEventSystemClientScheduleWithRunLoop =
-        (void (*)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef))dlsym(handle, "IOHIDEventSystemClientScheduleWithRunLoop");
     p_IOHIDEventSetSenderID =
         (void (*)(FT_IOHIDEventRef, uint64_t))dlsym(handle, "IOHIDEventSetSenderID");
-    // v1.0.89：client 级 senderID（可选符号）
-    p_IOHIDEventSystemClientSetSenderID =
-        (void (*)(FT_IOHIDEventSystemClientRef, uint64_t))dlsym(handle, "IOHIDEventSystemClientSetSenderID");
-    // v1.0.92：IOHID 事件回调（纯 C 提取原始 senderID）
-    p_IOHIDEventSystemClientRegisterEventCallback =
-        (void (*)(FT_IOHIDEventSystemClientRef, FT_HIDEventCallback, void *, void *))dlsym(handle, "IOHIDEventSystemClientRegisterEventCallback");
-    p_IOHIDEventSystemClientUnregisterEventCallback =
-        (void (*)(FT_IOHIDEventSystemClientRef, FT_HIDEventCallback, void *, void *))dlsym(handle, "IOHIDEventSystemClientUnregisterEventCallback");
+    // v1.0.96：Register/UnregisterEventCallback dlsym 已移除（回调路径在 Dopamine 上
+    // 拿不到原始 SID，且与纯注入 client 形态冲突）；client 级 SetSenderID 符号
+    // iOS 15.5 不存在（v1.0.89 结论），一并移除。
     p_IOHIDEventSetIntegerValue =
         (void (*)(FT_IOHIDEventRef, uint32_t, int64_t))dlsym(handle, "IOHIDEventSetIntegerValue");
     // v1.0.64：float 字段设置 + 事件类型读取（筛选 digitizer 事件）
@@ -276,11 +269,20 @@ static void FT_HIDEnumerateServices(void) {
             }
             break; // 该服务取到一个就下一个
         }
-        // registryID 路径（v1.0.83）：独立 API。⚠️ v1.0.84 实测（ctor-57）registryID
-        // 派发事件【不送达】——只入候选做诊断，不做首选（首选必须 sendEvent 捕获值）。
+        // registryID 路径（v1.0.83）：独立 API。⚠️ v1.0.96：registryID 是【真实 digitizer
+        // 服务 SID】（zxtouch 用的就是真实 SID）——v1.0.84 首次试它时事件结构还是旧的
+        // （child mask 0x07），v1.0.90 改 0x03 + v1.0.94 加 0x0B0018 后没重试过。
+        // 现在重试：第一个确认 digitizer 的 registryID 设为首选（g_PrimarySID），
+        // 派发连续失败 ≥5 次自动 fallback 到 captured[0]（送达保底）。
         if (p_IOHIDServiceClientGetRegistryID) {
             uint64_t rid = p_IOHIDServiceClientGetRegistryID(svc);
             if (rid) {
+                if (!g_PrimarySID && gotUsage && usagePage == 0x0D) {
+                    g_PrimarySID = rid;
+                    snprintf(dbg, sizeof(dbg), "primary SID (digitizer service registryID): 0x%llx",
+                             (unsigned long long)rid);
+                    FTHIDLog(dbg);
+                }
                 bool dup = false;
                 for (int j = 0; j < g_CapturedSIDCount; j++) {
                     if (g_CapturedSIDs[j] == rid) { dup = true; break; }
@@ -297,26 +299,9 @@ static void FT_HIDEnumerateServices(void) {
     CFRelease(arr);
 }
 
-// v1.0.92：纯 C 回调——从真实触摸的【原始 IOHIDEvent】提取设备 senderID。
-// 与 sendEvent 的 _hidEvent（翻译后 0x1000007xx）不同，这里是硬件原始值，
-// 系统真正认领它 → 注入当真实 digitizer → 不触发触摸上下文重置 → 用户手指不被顶掉。
-// 提取一次后立即注销回调（防反复触发/性能影响）。⚠️ 纯 C、零 ObjC 元数据（v1.0.53 崩
-// 是 ObjC/block 实现问题，此回调只有基础读值）。
-static void FTOriginalSIDCallback(void *target, void *refcon, void *service, FT_IOHIDEventRef event) {
-    (void)target; (void)refcon; (void)service;
-    if (!event || g_OriginalSenderID) return;
-    if (!p_IOHIDEventGetType || !p_IOHIDEventGetSenderID) return;
-    if (p_IOHIDEventGetType(event) != 11) return; // kIOHIDEventTypeDigitizer
-    uint64_t sid = (uint64_t)p_IOHIDEventGetSenderID(event);
-    if (!sid) return;
-    g_OriginalSenderID = sid;
-    char dbg[96];
-    snprintf(dbg, sizeof(dbg), "original senderID via callback: 0x%llx", (unsigned long long)sid);
-    FTHIDLog(dbg);
-    if (p_IOHIDEventSystemClientUnregisterEventCallback && g_hidClient) {
-        p_IOHIDEventSystemClientUnregisterEventCallback(g_hidClient, FTOriginalSIDCallback, NULL, NULL);
-    }
-}
+    // v1.0.96：移除 v1.0.92 的回调提取——ctor-66 实测回调在 Dopamine 上拿到的也是
+    // 翻译值 0x100000709（与 sendEvent 捕获一致），无「原始硬件 SID」；且回调需要
+    // client 挂 runloop，与 zxtouch 纯注入 client（不挂 runloop）形态冲突，已移除。
 
 bool FT_HIDConnect(void) {
     if (g_hidClient) return true;
@@ -333,21 +318,16 @@ bool FT_HIDConnect(void) {
     // client 设错误的 senderID 反而导致 DispatchEvent 返回 0x1（系统拒绝）。
     // ⚠️ v1.0.89 实验结论：IOHIDEventSystemClientSetSenderID 符号在 iOS 15.5 不存在
     // （dlsym NULL，ctor-63 无 client senderID 日志），该路径无效，已回退。
-    // 部分 iOS 版本需要 client 挂 runloop 才会真正派发事件（符号存在则挂，失败无害）
-    if (p_IOHIDEventSystemClientScheduleWithRunLoop) {
-        p_IOHIDEventSystemClientScheduleWithRunLoop(g_hidClient, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
-    }
+    // ⚠️ v1.0.96：移除 ScheduleWithRunLoop + RegisterEventCallback——zxtouch 的【事件注入
+    // client】是纯创建 + DispatchEvent（不挂 runloop、不注册回调；回调只用于【监控】client）。
+    // 我们 v1.0.92 的回调已验证拿不到原始 SID（Dopamine 只有翻译值 0x1000007xx），
+    // 挂 runloop 反而让 client 同时成为「监听者」，对齐 zxtouch 纯注入形态再验证。
     // v1.0.79：枚举服务收 senderID 候选（sendEvent 捕获不到系统接受的 SID）
     FT_HIDEnumerateServices();
-    // v1.0.92：注册纯 C 回调提取【原始设备 senderID】（zxtouch 方式）——
-    // 用户下一次真实触摸时回调触发，提取后自动注销
-    if (!g_OriginalSenderID && p_IOHIDEventSystemClientRegisterEventCallback) {
-        p_IOHIDEventSystemClientRegisterEventCallback(g_hidClient, FTOriginalSIDCallback, NULL, NULL);
-        FTHIDLog("original senderID callback registered");
-    }
     char dbg[128];
-    snprintf(dbg, sizeof(dbg), "HID connected (senderID=0x%llx override=%d)",
-             (unsigned long long)FT_HIDSenderID(), g_OverrideSenderID ? 1 : 0);
+    snprintf(dbg, sizeof(dbg), "HID connected (senderID=0x%llx override=%d primary=0x%llx)",
+             (unsigned long long)FT_HIDSenderID(), g_OverrideSenderID ? 1 : 0,
+             (unsigned long long)g_PrimarySID);
     FTHIDLog(dbg);
     return true;
 }
@@ -522,36 +502,50 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
 // 实测后果：连点之后 Home indicator（小白条）上滑手势失效（什么位置都触发、息屏才恢复）。
 // 且 ret=0x1 是假阴性（ctor-54 证据：全候选 0x1 但 41 下真实点击照常），循环无收益。
 // ⚠️ v1.0.94/95 定案（ctor-65 + ctor(12) 双份实测）：
-//   · captured[0]（0x1000007xx 翻译 ID）——【送达】（SEND 可见合成触摸、App 有点击）但
-//     【顶掉】用户按住的手指 → 松手检测死、连点每 ~40 次断。**v1.0.95 新假设：顶掉的元凶
-//     是注入 finger index=1 与用户手指 index 冲突**（v1.0.45 起的 (gTapIndex%19)+1 首发=1），
-//     Tweak.xm 已改 index 2-9 避开 → 预期「送达且不顶掉」。
-//   · 0x8000000817371935（zxtouch 官方）+ 0x0B0018 字段——【不顶掉】（ctor(12)：手指全程
-//     ball=1 phase=1、clicks 201/100/68 持续、touches-ended 即停达成）但【仍不送达】
-//     （ret=0x1、SEND 无合成触摸、App 无点击）→ Dopamine 上 0x8000... 无解，移出首选。
-//   v1.0.95：首选 = g_WorkingSID → captured[0]（送达）→ 0x1000007ad；0x0B0018 字段保留
-//   （=sid，让 captured[0] 事件更完整，无害）。
+// ⚠️ v1.0.96 定案（ctor-68 重证 finger index 假设失败）：
+//   · captured[0]（0x1000007xx 翻译 ID）——【送达】但【顶掉】用户手指（index 2-9 也顶掉，
+//     clicks 13/轮 → 顶掉与 finger index 无关，与 SID 属性强相关）；
+//   · 0x8000000817371935 + 0x0B0018 ——【不顶掉】但【不送达】→ Dopamine 无解，弃用；
+//   · **registryID（真实 digitizer 服务 SID，zxtouch 用真实 SID 注入）从未用最新事件结构
+//     重试过**（v1.0.84 首次试时 child mask 还是 0x07）。v1.0.96 首选 g_PrimarySID
+//     （第一个确认 digitizer 的 registryID），ret≠0 连续 5 次 → 自适应 fallback captured[0]。
+//   · 首选 + fallback 各自【单次派发】（不重建不重试同 ref），保持 v1.0.83 防污染铁律。
 static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint32_t index, bool down) {
     (void)nx; (void)ny; (void)index; (void)down;
     if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
-    uint64_t sid = g_WorkingSID;
-    if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
-    if (!sid) sid = 0x1000007adULL;
+    uint64_t sid;
+    if (!g_PrimarySIDFellBack && g_PrimarySID) {
+        sid = g_PrimarySID;
+    } else {
+        sid = g_WorkingSID;
+        if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
+        if (!sid) sid = 0x1000007adULL;
+    }
     p_IOHIDEventSetSenderID(event, sid);
-    // v1.0.94 关键：digitizer 事件字段里的 SenderID（0x0B0018 = kIOHIDEventFieldDigitizerSenderID）。
-    // 仅设顶层 senderID 时系统可能无法把事件归属到 digitizer 服务 → 当未知设备丢弃（0x8000...
-    // 不送达的疑因）。字段级 senderID 与顶层一致，让系统按「官方 digitizer」路由事件。
+    // v1.0.94 保留：digitizer 事件字段里的 SenderID（0x0B0018 = kIOHIDEventFieldDigitizerSenderID）
+    // 与顶层一致，让系统按事件字段归属 digitizer（对 registryID 首选尤其关键）。
     if (p_IOHIDEventSetIntegerValue) {
         p_IOHIDEventSetIntegerValue(event, 0x0B0018, (int64_t)sid);
     }
     FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, event);
     if (ret == FT_kIOReturnSuccess && !g_WorkingSID) {
         g_WorkingSID = sid; // 首次 ret=0 锁定（后续直用）
+        g_PrimarySIDFailCount = 0;
         char dbg[96];
         snprintf(dbg, sizeof(dbg), "DispatchEvent ok SID=0x%llx", (unsigned long long)sid);
         FTHIDLog(dbg);
     } else if (ret != FT_kIOReturnSuccess) {
-        // 失败也节流打一条（0x1 假阴性，仅诊断用；不打会丢失排查线索）
+        // 首选（registryID）连续失败 → 自适应 fallback 到 captured[0]（送达保底）
+        if (!g_PrimarySIDFellBack && g_PrimarySID && sid == g_PrimarySID) {
+            if (++g_PrimarySIDFailCount >= 5) {
+                g_PrimarySIDFellBack = true;
+                char dbg[96];
+                snprintf(dbg, sizeof(dbg), "SID fallback: registryID %d fails -> captured",
+                         g_PrimarySIDFailCount);
+                FTHIDLog(dbg);
+            }
+        }
+        // 失败节流打一条（0x1 假阴性，仅诊断用；不打会丢失排查线索）
         static int sFailLog = 0;
         if ((sFailLog++ % 200) == 0) {
             char dbg[96];
