@@ -113,7 +113,11 @@ static uint64_t g_OverrideSenderID = 0;
 // v1.0.79：上限 8→12（服务枚举会加入多个 digitizer 服务的 SID）。
 static uint64_t g_CapturedSIDs[12] = {0};
 static int      g_CapturedSIDCount = 0;
-static uint64_t g_WorkingSID = 0;   // 已验证可用的 senderID（锁定后优先使用）
+static uint64_t g_WorkingSID = 0;   // 已验证可用（ret=0）的 senderID（锁定后优先使用）
+// v1.0.84：服务枚举拿到的第一个 digitizer 服务 registryID（0x8de4... 形态，与 zxtouch
+// 的 kIOHIDEventDigitizerSenderID 0x8000... 同段）——sendEvent 捕获的 0x1000007xx 全是
+// 「翻译后」ID、系统不认领（ret=0x1，ctor-56 实测），服务 registryID 才可能是被接受的。
+static uint64_t g_ServiceSID = 0;
 
 // 前向声明（定义在文件后部「诊断日志」段，但 FT_HIDConnect 等前面函数要用）
 static void FTHIDLog(const char *msg);
@@ -253,6 +257,13 @@ static void FT_HIDEnumerateServices(void) {
         if (p_IOHIDServiceClientGetRegistryID) {
             uint64_t rid = p_IOHIDServiceClientGetRegistryID(svc);
             if (rid) {
+                // v1.0.84：第一个【确认 digitizer】的服务 registryID 设为首选派发 SID
+                // （PrimaryUsagePage 可读且==0x0D 才收；读不到的无关服务不收，避免误选）
+                if (!g_ServiceSID && gotUsage && usagePage == 0x0D) {
+                    g_ServiceSID = rid;
+                    snprintf(dbg, sizeof(dbg), "preferred service SID (digitizer): 0x%llx", (unsigned long long)rid);
+                    FTHIDLog(dbg);
+                }
                 bool dup = false;
                 for (int j = 0; j < g_CapturedSIDCount; j++) {
                     if (g_CapturedSIDs[j] == rid) { dup = true; break; }
@@ -460,12 +471,14 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
 // 在 10ms 连点下 = 每秒 ~2000 次系统事件注入，严重污染系统触摸/手势状态机——
 // 实测后果：连点之后 Home indicator（小白条）上滑手势失效（什么位置都触发、息屏才恢复）。
 // 且 ret=0x1 是假阴性（ctor-54 证据：全候选 0x1 但 41 下真实点击照常），循环无收益。
-// 现固定首选 SID 只派发 1 次：g_WorkingSID（已锁定）→ captured[0]（最新捕获的真实设备值）
-// → 0x1000007ad（ctor-39 验证产生过真实点击）→ 硬编码。不再重建重试。
+// 现固定首选 SID 只派发 1 次：g_WorkingSID（已锁定）→ g_ServiceSID（v1.0.84 服务枚举的
+// digitizer registryID，0x8de4... 形态与 zxtouch 的 0x8000... 同段，可能才是系统认领的）
+// → captured[0]（sendEvent 翻译后的真实设备值）→ 0x1000007ad → 硬编码。不再重建重试。
 static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint32_t index, bool down) {
     (void)nx; (void)ny; (void)index; (void)down;
     if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
     uint64_t sid = g_WorkingSID;
+    if (!sid && g_ServiceSID) sid = g_ServiceSID;
     if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
     if (!sid) sid = 0x1000007adULL;
     p_IOHIDEventSetSenderID(event, sid);
@@ -546,6 +559,7 @@ void FT_HIDRaiseAllSyntheticUp(void) {
         p_IOHIDEventSetIntegerValue(ev, 0x0B0008, 0);    // Touch = 0 ← hand 无触摸，抬全部
     }
     uint64_t sid = g_WorkingSID;
+    if (!sid && g_ServiceSID) sid = g_ServiceSID;
     if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
     if (!sid) sid = 0x1000007adULL;
     p_IOHIDEventSetSenderID(ev, sid);

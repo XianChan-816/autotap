@@ -508,17 +508,32 @@ static NSInteger FTGetOrientation(void) {
     return 1; // 默认竖屏
 }
 
-// v1.0.74：移除之前的横竖屏旋转转换（重要修正）。
-// 结论：球/点击点标记是旋转窗口（UIWindow 用 transform 旋转显示）的 subview，其 frame 坐标与
-// UITouch locationInView: 都在窗口的「未旋转基准坐标空间」= UIScreen.bounds 原生竖屏空间
-// （gScreenW/H 也是 mainScreen.bounds，竖屏尺寸）。而 IOHIDEvent digitizer 坐标同样是
-// 设备原生竖屏空间 → 二者一致，直接透传即可命中标记处。
-// v1.0.70 加的旋转转换会把点击点旋转 90°（"真实点击点不在选定位置"的根因，ctor-39 已现偏移）。
-// 若设备坐标系确实需要旋转，可在此按方向换算，但先按透传验证（最符合 UIKit 坐标语义）。
+// v1.0.74：曾判定「窗口坐标 = digitizer 原生空间，直接透传」——仅竖屏成立。
+// v1.0.84 实测修正（ctor-56 横屏微信）：_UISystemGestureWindow 的 bounds 是【横屏尺寸】
+// （球 frame=569,389 证实 gScreenW=1194, gScreenH=834），但系统把注入的 digitizer 归一化
+// 坐标按【竖屏基准（短边×长边）】换算后放进窗口 → 横屏下注入点与标记错位约 52°/240px
+// （注入 0.40,0.52 → 窗口 329.5,624.0；标记在 477.6,433.7）。修正：横屏时把窗口归一化
+// 按 W/H 缩放换算回 digitizer 竖屏空间；竖屏保持透传（v1.0.74 验证正确）。
 static void FTOrientForHID(double ox, double oy, double *nx, double *ny) {
-    (void)ox; (void)oy;
-    *nx = ox;
-    *ny = oy;
+    NSInteger o = FTGetOrientation();
+    if (o == 3 || o == 4) { // 横屏：窗口(横屏 W×H) → digitizer(竖屏 H×W) 换算
+        double Ww = gScreenW, Hw = gScreenH;
+        if (Ww > 0 && Hw > 0 && Ww != Hw) {
+            // 注入 digitizer 归一化 nx×Hw = ox×Ww → nx = ox×Ww/Hw；ny 同理反向
+            *nx = ox * (Ww / Hw);
+            *ny = oy * (Hw / Ww);
+        } else {
+            *nx = ox; *ny = oy;
+        }
+    } else if (o == 2) { // 竖屏倒：上下翻转
+        *nx = 1 - ox;
+        *ny = 1 - oy;
+    } else { // 竖屏：透传（v1.0.74 验证正确）
+        *nx = ox;
+        *ny = oy;
+    }
+    if (*nx < 0.001) *nx = 0.001; if (*nx > 0.999) *nx = 0.999;
+    if (*ny < 0.001) *ny = 0.001; if (*ny > 0.999) *ny = 0.999;
 }
 
 static void FTSyntheticTap(double px, double py) {
@@ -1427,14 +1442,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.83 loaded (single-shot dispatch; hand-up cleanup on stop; registryID service enum)");
+    syslog(LOG_ERR, "FloatingTap v1.0.84 loaded (landscape coord conversion; preferred service SID)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.83 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; single-shot dispatch; hand-up cleanup; registryID service enum)\n");
+            fprintf(mk, "FloatingTap v1.0.84 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; landscape coord conversion; preferred service SID; single-shot dispatch)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
