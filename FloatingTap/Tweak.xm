@@ -497,18 +497,17 @@ static NSInteger FTGetOrientation(void) {
     return 1; // 默认竖屏
 }
 
-// v1.0.70：UIKit 归一化坐标（当前界面方向，UIScreen.bounds 得出）转 HID digitizer 原生（竖屏）坐标。
-// iPad 横屏游戏下 bounds 是横屏尺寸，但 IOHIDEvent 的 digitizer 坐标走硬件原生竖屏空间，
-// 不转换会导致点击点旋转 90° 偏移（"真实点击点不在标记处"的根因）。
+// v1.0.74：移除之前的横竖屏旋转转换（重要修正）。
+// 结论：球/点击点标记是旋转窗口（UIWindow 用 transform 旋转显示）的 subview，其 frame 坐标与
+// UITouch locationInView: 都在窗口的「未旋转基准坐标空间」= UIScreen.bounds 原生竖屏空间
+// （gScreenW/H 也是 mainScreen.bounds，竖屏尺寸）。而 IOHIDEvent digitizer 坐标同样是
+// 设备原生竖屏空间 → 二者一致，直接透传即可命中标记处。
+// v1.0.70 加的旋转转换会把点击点旋转 90°（"真实点击点不在选定位置"的根因，ctor-39 已现偏移）。
+// 若设备坐标系确实需要旋转，可在此按方向换算，但先按透传验证（最符合 UIKit 坐标语义）。
 static void FTOrientForHID(double ox, double oy, double *nx, double *ny) {
-    NSInteger o = FTGetOrientation();
-    switch (o) {
-        case 2: *nx = 1 - ox; *ny = 1 - oy; break;        // 竖屏倒
-        case 3: *nx = 1 - oy; *ny = 1 - ox; break;         // 横屏左（home 左）
-        case 4: *nx = oy;     *ny = ox;     break;         // 横屏右（home 右）
-        case 1:
-        default: *nx = ox; *ny = oy; break;                // 竖屏
-    }
+    (void)ox; (void)oy;
+    *nx = ox;
+    *ny = oy;
 }
 
 static void FTSyntheticTap(double px, double py) {
@@ -1031,6 +1030,15 @@ static void FTSetupBall(void) {
     // 这样双击必然触发模式切换，长按/拖动只在「不是双击」时才生效，二者不再抢触摸。
     ((Msg_RequireToFail)objc_msgSend)(gLongGR, sel_registerName("requireGestureRecognizerToFail:"), gTapGR);
     ((Msg_RequireToFail)objc_msgSend)(gPanGR,  sel_registerName("requireGestureRecognizerToFail:"), gTapGR);
+    // v1.0.74：关键修复——UITapGestureRecognizer 默认 cancelsTouchesInView=YES，会在手势
+    // 识别/失败时把触摸判为 Cancelled(phase=4)，导致 sendEvent 里追踪的「球上手指」被清空、
+    // 连点定时器立刻被取消（"点一下只触发一次 / 长按只算一次"，ctor-45 根因）。
+    // 设 NO：手势照常识别双击，但不再取消触摸，按住的手指持续被追踪 → 连点持续。
+    ((Msg_SetEnabled)objc_msgSend)(gTapGR,  sel_registerName("setCancelsTouchesInView:"), NO);
+    ((Msg_SetEnabled)objc_msgSend)(gTapGR2, sel_registerName("setCancelsTouchesInView:"), NO);
+    ((Msg_SetEnabled)objc_msgSend)(gLongGR, sel_registerName("setCancelsTouchesInView:"), NO);
+    ((Msg_SetEnabled)objc_msgSend)(gPanGR,  sel_registerName("setCancelsTouchesInView:"), NO);
+    ((Msg_SetEnabled)objc_msgSend)(gClickPanGR, sel_registerName("setCancelsTouchesInView:"), NO);
     // 模式初始化：蓝色连击模式 → 启用长按、禁用拖动
     ((Msg_SetEnabled)objc_msgSend)(gLongGR, sel_registerName("setEnabled:"), YES);
     ((Msg_SetEnabled)objc_msgSend)(gPanGR,  sel_registerName("setEnabled:"), NO);
@@ -1070,6 +1078,7 @@ static void FTSetupBall(void) {
             if (gClickPanGR) {
                 ((Msg_RequireToFail)objc_msgSend)(gClickPanGR, sel_registerName("requireGestureRecognizerToFail:"), gTapGR);
                 ((Msg_SetEnabled)objc_msgSend)(gClickPanGR, sel_registerName("setEnabled:"), gDragMode ? YES : NO);
+                ((Msg_SetEnabled)objc_msgSend)(gClickPanGR, sel_registerName("setCancelsTouchesInView:"), NO); // v1.0.74
                 ((Msg_AddGestureRecognizer)objc_msgSend)(gClickPointView, sel_registerName("addGestureRecognizer:"), gClickPanGR);
             }
             // 点击点标记上也挂一个双击手势（同一 toggle handler）——避免编辑模式下标记盖住球时，
@@ -1080,6 +1089,7 @@ static void FTSetupBall(void) {
                 ((Msg_RequireToFail)objc_msgSend)(gTapGR2, sel_registerName("requireGestureRecognizerToFail:"), gLongGR);
                 ((Msg_RequireToFail)objc_msgSend)(gTapGR2, sel_registerName("requireGestureRecognizerToFail:"), gClickPanGR);
                 ((Msg_RequireToFail)objc_msgSend)(gClickPanGR, sel_registerName("requireGestureRecognizerToFail:"), gTapGR2);
+                ((Msg_SetEnabled)objc_msgSend)(gTapGR2, sel_registerName("setCancelsTouchesInView:"), NO); // v1.0.74
                 ((Msg_AddGestureRecognizer)objc_msgSend)(gClickPointView, sel_registerName("addGestureRecognizer:"), gTapGR2);
             }
             ((Msg_AddSubview)objc_msgSend)(targetWin, sel_registerName("addSubview:"), gClickPointView);
@@ -1321,14 +1331,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.73 loaded (timer-based hold trigger; fixed NSSet crash; senderID captured-first; orientation-aware HID; 10ms)");
+    syslog(LOG_ERR, "FloatingTap v1.0.74 loaded (cancelsTouchesInView=NO fix one-click; multi-candidate senderID; no orient rotate; 10ms)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.73 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; timer-based hold trigger; fixed NSSet crash; captured-first senderID; system HID dispatch)\n");
+            fprintf(mk, "FloatingTap v1.0.74 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; cancelsTouchesInView=NO; multi-candidate senderID; no orient rotate; system HID dispatch)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

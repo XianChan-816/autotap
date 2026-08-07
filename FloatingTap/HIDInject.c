@@ -96,6 +96,12 @@ static FT_IOHIDEventSystemClientRef g_hidClient = NULL;
 static bool g_hidLoaded = false;
 // v1.0.63：动态捕获的真实设备 senderID（0 表示未捕获，用兜底硬编码）
 static uint64_t g_OverrideSenderID = 0;
+// v1.0.74：sendEvent 里会出现【多个】digitizer senderID（主屏 digitizer / 手势翻译服务等），
+// 最后一个捕获值不一定是系统认领的那个（ctor-45 实测 0x1000007af 被拒、ctor-39 的 0x1000007ad 可用）。
+// 改为收集候选集，派发时逐个尝试，首个成功即锁定为 g_WorkingSID。
+static uint64_t g_CapturedSIDs[4] = {0};
+static int      g_CapturedSIDCount = 0;
+static uint64_t g_WorkingSID = 0;   // 已验证可用的 senderID（锁定后优先使用）
 
 // 前向声明（定义在文件后部「诊断日志」段，但 FT_HIDConnect 等前面函数要用）
 static void FTHIDLog(const char *msg);
@@ -223,6 +229,9 @@ uint64_t FT_HIDGetSenderIDFromEvent(FT_IOHIDEventRef event) {
 // ctor-10 实测从 _UISystemGestureWindow 抓到 0x1000007b1（手势/翻译事件的非法 senderID），
 // 设到事件上导致 DispatchEvent 返回 0x1（系统拒绝）。必须过滤掉非 digitizer 事件。
 // Tweak.xm 的 sendEvent: hook 调本函数即可——用户首次真实触摸屏幕后便捕获到设备专属 senderID。
+// v1.0.74：改为【候选集】收集——sendEvent 事件流里会出现多个 digitizer senderID
+// （主屏 digitizer 与手势/翻译服务的），单独最后值不可靠（ctor-45：0x1000007af 被拒）。
+// 每个不同的 digitizer senderID 都收进候选集，派发时逐个尝试。
 void FT_HIDCaptureSenderIDFromUIEvent(void *event) {
     if (!event) return;
     if (!FT_HIDLoadSymbols()) return;
@@ -232,10 +241,20 @@ void FT_HIDCaptureSenderIDFromUIEvent(void *event) {
     FT_IOHIDEventRef hid = NULL;
     object_getInstanceVariable((id)event, "_hidEvent", (void **)&hid);
     if (!hid) return;
-    // kIOHIDEventTypeDigitizer = 11，只有 digitizer 触摸事件的 senderID 才是系统认领的
+    // kIOHIDEventTypeDigitizer = 11，只有 digitizer 触摸事件的 senderID 才是候选
     if (p_IOHIDEventGetType(hid) != 11) return;
     uint64_t sid = (uint64_t)p_IOHIDEventGetSenderID(hid);
-    if (sid) g_OverrideSenderID = sid;
+    if (!sid) return;
+    if (g_OverrideSenderID == 0) g_OverrideSenderID = sid; // 首个（连接日志用）
+    for (int i = 0; i < g_CapturedSIDCount; i++) {
+        if (g_CapturedSIDs[i] == sid) return; // 已有，不重复
+    }
+    if (g_CapturedSIDCount < 4) {
+        g_CapturedSIDs[g_CapturedSIDCount++] = sid;
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg), "senderID candidate #%d: 0x%llx", g_CapturedSIDCount, (unsigned long long)sid);
+        FTHIDLog(dbg);
+    }
 }
 
 // MARK: - 事件构造
@@ -312,35 +331,44 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
 
 static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint32_t index, bool down) {
     if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
-    // v1.0.71：优先用动态捕获到的真实设备 senderID（ctor-39 实测此值可用，产生真实点击）；
-    // v1.0.70 误把硬编码 0x8000000817371935 当主值，本设备（M1 iPad / Dopamine）全部 0x1、零点击。
-    // 主值派发失败（罕见）才回退硬编码；每次重试重建全新事件——首次派发即便失败也会
-    // 消耗/失效原 event 对象，对同一 ref 二次派发必然再 0x1（ctor-40 隐藏坑）。
-    uint64_t sids[2];
-    int nsid = 0;
-    if (g_OverrideSenderID) sids[nsid++] = g_OverrideSenderID;      // 真实设备值（优先）
-    sids[nsid++] = 0x8000000817371935ULL;                           // 社区通用兜底
-    for (int i = 0; i < nsid; i++) {
+    // v1.0.74：候选 senderID 逐个尝试——优先已验证可用的 g_WorkingSID，其次所有捕获候选，
+    // 最后社区通用硬编码兜底。每个候选用【全新事件】派发（首次派发会消耗/失效原 event ref，
+    // 同一 ref 二次派发必 0x1，ctor-40 隐藏坑）。首个成功即锁定 g_WorkingSID，后续直接用它。
+    uint64_t cands[6];
+    int nc = 0;
+    if (g_WorkingSID) cands[nc++] = g_WorkingSID;
+    for (int i = 0; i < g_CapturedSIDCount && nc < 5; i++) cands[nc++] = g_CapturedSIDs[i];
+    cands[nc++] = 0x8000000817371935ULL; // 社区通用兜底（kIOHIDEventDigitizerSenderID）
+    for (int i = 0; i < nc; i++) {
         FT_IOHIDEventRef ev = (i == 0) ? event : FT_HIDCreateDigitizerEvent(down, nx, ny, index);
         if (!ev) { if (i == 0 && event) CFRelease(event); continue; }
-        p_IOHIDEventSetSenderID(ev, sids[i]);
+        p_IOHIDEventSetSenderID(ev, cands[i]);
         FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, ev);
         if (ret == FT_kIOReturnSuccess) {
-        // 成功只打一次（避免 10ms 连点每发一条把日志刷爆；失败照常全打）
-        static bool sDidLogOk = false;
-        if (!sDidLogOk) {
-            sDidLogOk = true;
-            char dbg[96];
-            snprintf(dbg, sizeof(dbg), "DispatchEvent ok SID=0x%llx", (unsigned long long)sids[i]);
-            FTHIDLog(dbg);
-        }
+            g_WorkingSID = cands[i];
+            // 成功只打一次（避免 10ms 连点每发一条把日志刷爆；失败照常全打）
+            static bool sDidLogOk = false;
+            if (!sDidLogOk) {
+                sDidLogOk = true;
+                char dbg[96];
+                snprintf(dbg, sizeof(dbg), "DispatchEvent ok SID=0x%llx", (unsigned long long)cands[i]);
+                FTHIDLog(dbg);
+            }
             if (ev != event) CFRelease(ev); else CFRelease(event);
             return;
         }
-        char dbg[96];
-        snprintf(dbg, sizeof(dbg), "DispatchEvent SID=0x%llx ret=0x%x", (unsigned long long)sids[i], (unsigned)ret);
-        FTHIDLog(dbg);
         if (ev != event) CFRelease(ev); else CFRelease(event);
+    }
+    // 全部候选都失败：只打一次摘要（避免 10ms 连点刷爆日志）
+    static bool sDidLogFail = false;
+    if (!sDidLogFail) {
+        sDidLogFail = true;
+        char dbg[192];
+        int off = snprintf(dbg, sizeof(dbg), "DispatchEvent all failed (%d candidates):", nc);
+        for (int k = 0; k < nc && off < (int)sizeof(dbg) - 24; k++) {
+            off += snprintf(dbg + off, sizeof(dbg) - (size_t)off, " 0x%llx", (unsigned long long)cands[k]);
+        }
+        FTHIDLog(dbg);
     }
 }
 
