@@ -1026,10 +1026,11 @@ static void FTTweakInitCallback(void *ctx) {
             FTLog("captured system gesture window from sendEvent");
         }
     }
-    // v1.0.63：从真实触摸事件的 _hidEvent 动态捕获设备 senderID（逻辑在 HIDInject.c，
+    // v1.0.64：从真实触摸事件的 _hidEvent 动态捕获设备 senderID（逻辑在 HIDInject.c，
     // 纯 C 绕开 Theos 对 Tweak.xm 的 ARC 限制——object_getInstanceVariable 在 ARC 下禁用）。
-    // 这是让系统认领合成事件、产生真实点击的关键：硬编码 senderID 在 Dopamine rootless
-    // + iOS 15.5 上会被系统静默丢弃（派发 ret=success 但无触摸）。
+    // 仅接受 digitizer 触摸事件（type=11）的 senderID——ctor-10 实测抓到手势事件的
+    // 非法 senderID(0x1000007b1) 会导致 DispatchEvent 返回 0x1。硬编码 senderID 在
+    // Dopamine rootless + iOS 15.5 上会被系统静默丢弃，故必须捕获真实设备值。
     if (event) {
         FT_HIDCaptureSenderIDFromUIEvent((__bridge void *)event);
     }
@@ -1097,14 +1098,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.63 loaded (pure C ctor, ball on _UISystemGestureWindow; dynamic senderID capture; system HID dispatch)");
+    syslog(LOG_ERR, "FloatingTap v1.0.64 loaded (pure C ctor, ball on _UISystemGestureWindow; digitizer-only senderID capture; system HID dispatch)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.63 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; dynamic senderID capture; system HID dispatch)\n");
+            fprintf(mk, "FloatingTap v1.0.64 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; digitizer-only senderID capture; system HID dispatch)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
