@@ -557,8 +557,12 @@ static void FTSyntheticTap(double px, double py) {
 
 // 连点回调：在点击点标记坐标发一次合成点击。
 // v1.0.70：不再把球设为 alpha=0——实测 iOS 15.5 下改 alpha 会让长按手势被判 Cancelled，
-// 导致连点定时器被立刻取消（只点 1 下就停、10s 仅数下）。点击点已独立成「标记视图」，
-// 连击模式下 marker 的 userInteractionEnabled=NO → 合成点击直接穿透到下层 App，无需隐藏球。
+// 导致连点定时器被立刻取消（只点 1 下就停、10s 仅数下）。
+// ⚠️ v1.0.88 验证实验（ctor-60）：合成触摸只到 _UISystemGestureWindow、不透传前台 App
+// （SEND 全 win=手势窗口，备忘录无笔点、计数器 0）。v1.0.86/87 注入坐标精确命中标记后
+// 反而不透传（v1.0.85 注入偏离标记、落在空白时反而有效）→ 怀疑手势窗口把落在自身
+// subview（标记/红圈）上的触摸「收口」不路由。连点期间把标记+红圈 alpha=0（不参与
+// hitTest），验证注入是否恢复透传。
 static void FTClickCallback(void *ctx) {
     (void)ctx;
     if (!gBallView || !gIsClicking) return;
@@ -566,12 +570,12 @@ static void FTClickCallback(void *ctx) {
     FTSyntheticTap(gClickLockX * gScreenW, gClickLockY * gScreenH);
     gClickCount++;
 
-    // v1.0.81：点击落点光圈——每次注入把光圈移到点击点并点亮（10ms 连点期间保持常亮）
-    if (gClickFlashView) {
-        ((Msg_SetFrame)objc_msgSend)(gClickFlashView, sel_registerName("setFrame:"),
-            CGRectMake(gClickLockX * gScreenW - 13, gClickLockY * gScreenH - 13, 26, 26));
-        ((Msg_SetAlpha)objc_msgSend)(gClickFlashView, sel_registerName("setAlpha:"), 1.0);
-    }
+    // v1.0.88：红圈保持隐藏（验证 subview 遮挡假说）——点击恢复后再恢复光圈显示
+    // if (gClickFlashView) {
+    //     ((Msg_SetFrame)objc_msgSend)(gClickFlashView, sel_registerName("setFrame:"),
+    //         CGRectMake(gClickLockX * gScreenW - 13, gClickLockY * gScreenH - 13, 26, 26));
+    //     ((Msg_SetAlpha)objc_msgSend)(gClickFlashView, sel_registerName("setAlpha:"), 1.0);
+    // }
 
     double hx = gClickLockX, hy = gClickLockY;
     FTOrientForHID(gClickLockX, gClickLockY, &hx, &hy);
@@ -648,6 +652,11 @@ static void FTStartClicking(void) {
     }
     // v1.0.75：连点中禁用全部手势识别器（防 GR 取消手指/触发双击掐断连点）
     FTApplyGRModes();
+    // v1.0.88 验证：连点期间隐藏点击点标记（alpha=0 不参与 hitTest）——
+    // 怀疑手势窗口把落在自身 subview（标记/红圈）上的注入触摸「收口」不透传 App
+    if (gClickPointView) {
+        ((Msg_SetAlpha)objc_msgSend)(gClickPointView, sel_registerName("setAlpha:"), 0.0);
+    }
     FTLog("clicking started");
 }
 
@@ -662,6 +671,10 @@ static void FTStopClicking(const char *reason) {
     }
     if (gClickFlashView) {
         ((Msg_SetAlpha)objc_msgSend)(gClickFlashView, sel_registerName("setAlpha:"), 0.0); // 灭光圈
+    }
+    // v1.0.88：恢复标记可见（连点期间被隐藏以验证 subview 遮挡假说）
+    if (gClickPointView) {
+        ((Msg_SetAlpha)objc_msgSend)(gClickPointView, sel_registerName("setAlpha:"), 1.0);
     }
     // v1.0.83：强制抬起全部残留合成手指——10ms 高频连点若残留未闭合触摸，
     // 系统会认为屏幕一直有手指按着 → Home indicator（小白条）上滑手势失效
@@ -1437,14 +1450,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.87 loaded (parent-only hand-up; portrait-base coords; captured-first SID)");
+    syslog(LOG_ERR, "FloatingTap v1.0.88 loaded (hide marker+flash during combo - subview occlusion test)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.87 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; parent-only hand-up; portrait-base coords; captured-first SID)\n");
+            fprintf(mk, "FloatingTap v1.0.88 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; hide marker+flash during combo; portrait-base coords)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
