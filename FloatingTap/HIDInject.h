@@ -60,6 +60,12 @@ uint64_t FT_HIDGetSenderIDFromEvent(FT_IOHIDEventRef event);
 // 由 Tweak.xm 的 sendEvent: hook 调用，参数传 (__bridge void *)event。
 void FT_HIDCaptureSenderIDFromUIEvent(void *event);
 
+// v1.0.83：连点停止时强制「抬全手」——派发一个 hand-only up 事件（hand index=99,
+// Range=0/Touch=0），让系统把该合成 hand 的所有残留子手指一次抬起。
+// 背景：高频连点（10ms）会残留未闭合的合成触摸，污染系统触摸状态机 →
+// Home indicator（小白条）上滑手势失效（连点后息屏才恢复）。停止连点立即清场。
+void FT_HIDRaiseAllSyntheticUp(void);
+
 #ifdef __cplusplus
 }
 #endif

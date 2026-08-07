@@ -663,6 +663,10 @@ static void FTStopClicking(const char *reason) {
     if (gClickFlashView) {
         ((Msg_SetAlpha)objc_msgSend)(gClickFlashView, sel_registerName("setAlpha:"), 0.0); // 灭光圈
     }
+    // v1.0.83：强制抬起全部残留合成手指——10ms 高频连点若残留未闭合触摸，
+    // 系统会认为屏幕一直有手指按着 → Home indicator（小白条）上滑手势失效
+    // （连点后息屏才恢复）。停止即清场，模拟息屏的触摸重置。
+    FT_HIDRaiseAllSyntheticUp();
     FTApplyGRModes(); // 恢复手势（按当前模式启用对应 GR）
     char dbg[128];
     snprintf(dbg, sizeof(dbg), "clicking stopped (%s)", reason ? reason : "?");
@@ -1423,14 +1427,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.82 loaded (up-delay 50->15ms reduce overlap; hold-to-combo; 400ms release grace)");
+    syslog(LOG_ERR, "FloatingTap v1.0.83 loaded (single-shot dispatch; hand-up cleanup on stop; registryID service enum)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.82 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; up-delay 15ms; click-point flash; hold-to-combo; 400ms release grace)\n");
+            fprintf(mk, "FloatingTap v1.0.83 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; single-shot dispatch; hand-up cleanup; registryID service enum)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
