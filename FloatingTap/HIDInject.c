@@ -74,21 +74,20 @@ static void (*p_IOHIDEventSetFloatValue)(FT_IOHIDEventRef, uint32_t, double);
 static uint32_t (*p_IOHIDEventGetType)(FT_IOHIDEventRef);
 static uint64_t (*p_IOHIDEventGetSenderID)(FT_IOHIDEventRef);
 // 注：client 级 senderID 设置符号 (IOHIDEventSystemClientSetSenderID) 已弃用（v1.0.64）——设错会致 DispatchEvent 0x1。
-// ⚠️ 子事件签名铁律（v1.0.66 修正）：之前误用 14 参数的 IOHIDEventCreateDigitizerFingerEvent
-// 声明（漏了 minorRadius/majorRadius 两个 IOHIDFloat 参数），导致 range/touch 落到错误栈槽 →
-// 事件畸形 → DispatchEvent 返回 0x1（系统拒绝）。以下签名来自对系统函数的 hook 反编译，已验证。
-// 优先用 WithQuality 变体（ZXTouch 验证可用，18 参数）。
-static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerFingerEventWithQuality)(
-    CFAllocatorRef, uint64_t timeStamp, uint32_t index, uint32_t identity,
-    uint32_t eventMask, double x, double y, double z, double tipPressure,
-    double twist, double minorRadius, double majorRadius, double quality,
-    double density, double irregularity, Boolean range, Boolean touch, FT_IOOptionBits options);
-// 兜底：无 Quality 变体（15 参数 = WithQuality 去掉 quality/density/irregularity）
+// ⚠️ 子事件签名铁律（v1.0.67，来自 SimulateTouch 对系统函数的 hook 反编译，权威）：
+//   IOHIDEventCreateDigitizerFingerEvent(allocator, ts, index, identity, eventMask,
+//       IOHIDFloat x, IOHIDFloat y, IOHIDFloat z,
+//       IOHIDFloat tipPressure, IOHIDFloat twist,
+//       Boolean range, Boolean touch, IOOptionBits options)
+//   —— 共 13 参数，【eventMask 之后直接是 x,y,z,tipPressure,twist,range,touch,options，
+//      没有 buttonMask、也没有 minorRadius/majorRadius】。
+//   v1.0.66 给 plain 变体误加了 minorRadius/majorRadius（15 参）→ 后续参数整体偏移一格 →
+//   事件畸形 → DispatchEvent 0x1。现彻底修正为 13 参（与 ZXTouch 验证可用实现一致）。
+//   （WithQuality 变体在 iOS 15.5 大概率不存在，已弃用，统一走 plain 13 参。）
 static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerFingerEvent)(
     CFAllocatorRef, uint64_t timeStamp, uint32_t index, uint32_t identity,
     uint32_t eventMask, double x, double y, double z, double tipPressure,
-    double twist, double minorRadius, double majorRadius, Boolean range,
-    Boolean touch, FT_IOOptionBits options);
+    double twist, Boolean range, Boolean touch, FT_IOOptionBits options);
 static void (*p_IOHIDEventAppendEvent)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits);
 
 // MARK: - 状态
@@ -135,15 +134,10 @@ static bool FT_HIDLoadSymbols(void) {
         (uint32_t (*)(FT_IOHIDEventRef))dlsym(handle, "IOHIDEventGetType");
     p_IOHIDEventGetSenderID =
         (uint64_t (*)(FT_IOHIDEventRef))dlsym(handle, "IOHIDEventGetSenderID");
-    p_IOHIDEventCreateDigitizerFingerEventWithQuality =
-        (FT_IOHIDEventRef (*)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t,
-                              double, double, double, double, double, double, double, double,
-                              double, double, Boolean, Boolean, FT_IOOptionBits))
-        dlsym(handle, "IOHIDEventCreateDigitizerFingerEventWithQuality");
     p_IOHIDEventCreateDigitizerFingerEvent =
         (FT_IOHIDEventRef (*)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t,
-                              double, double, double, double, double, double, double,
-                              Boolean, Boolean, FT_IOOptionBits))
+                              double, double, double, double, double, Boolean, Boolean,
+                              FT_IOOptionBits))
         dlsym(handle, "IOHIDEventCreateDigitizerFingerEvent");
     p_IOHIDEventAppendEvent =
         (void (*)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits))dlsym(handle, "IOHIDEventAppendEvent");
@@ -246,18 +240,14 @@ void FT_HIDCaptureSenderIDFromUIEvent(void *event) {
 
 // MARK: - 事件构造
 
-// v1.0.66：真正根因修复。之前 v1.0.64/65 一直 `DispatchEvent failed 0x1`，反复猜字段常量
-// 都无效；抓到权威源码（iolate/SimulateTouch 对系统函数的 hook + ZXTouch 验证实现）后才发现：
-// ⚠️ 根因是 `IOHIDEventCreateDigitizerFingerEvent` 的函数指针【声明签名错】——漏了
-// minorRadius/majorRadius 两个 IOHIDFloat 参数，导致 range/touch 布尔值落到错误栈槽 →
-// 事件在 ABI 层面就畸形 → 系统直接拒绝派发（0x1），与 senderID 无关（所以硬编码也失败）。
-// 修正：改用签名已验证的 `IOHIDEventCreateDigitizerFingerEventWithQuality`（18 参数），
-// 父事件字段用 ZXTouch 验证值（Identity 0xb0019=1 + Type 0x4=1 + EventMask 0xb0007=0x23），
-// 子事件 Major/MinorRadius=0.04、X/Y 归一化 0~1。eventMask down=0x07 / up=0x06。
+// v1.0.67：彻底修正子事件函数签名（权威来源 SimulateTouch 对系统函数的 hook）。
+// 之前 v1.0.66 的 plain finger 事件声明多了一个 minorRadius/majorRadius（15 参，应为 13 参），
+// 导致 range/touch 落到错误栈槽 → 事件在 ABI 层面畸形 → DispatchEvent 0x1（连硬编码 senderID 也失败）。
+// 现严格按 13 参签名构造（ZXTouch 验证可用），并补齐父事件 Range/Touch 字段（对齐 ZXTouch）。
 FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint32_t index) {
     if (!FT_HIDLoadSymbols()) return NULL;
     if (!p_IOHIDEventCreateDigitizerEvent ||
-        (!p_IOHIDEventCreateDigitizerFingerEventWithQuality && !p_IOHIDEventCreateDigitizerFingerEvent) ||
+        !p_IOHIDEventCreateDigitizerFingerEvent ||
         !p_IOHIDEventAppendEvent) {
         FTHIDLog("parent-child symbols missing");
         return NULL;
@@ -269,45 +259,31 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
     Boolean range = down ? 1 : 0;
     Boolean touch = down ? 1 : 0;
 
-    // 子事件（finger）：坐标 x,y 归一化 0~1 按位置参数传入；major/minor radius 模拟真实手指。
-    // ⚠️ v1.0.66 修正签名：WithQuality 变体 18 参数（minorRadius/majorRadius 在 twist 之后、
-    // range/touch 之前），漏掉会导致 range/touch 错位 → 事件畸形 → DispatchEvent 0x1。
-    FT_IOHIDEventRef child = NULL;
-    if (p_IOHIDEventCreateDigitizerFingerEventWithQuality) {
-        child = p_IOHIDEventCreateDigitizerFingerEventWithQuality(
-            kCFAllocatorDefault, ts,
-            index, 3,                  // index（finger id）, identity
-            mask,                      // eventMask
-            x, y, 0.0,                 // x, y（归一化）, z
-            0.0, 0.0,                  // tipPressure, twist
-            0.04, 0.04,                // minorRadius, majorRadius（模拟手指接触面积）
-            0.0, 0.0, 0.0,             // quality, density, irregularity
-            range, touch, 0);          // range, touch, options
-    } else if (p_IOHIDEventCreateDigitizerFingerEvent) {
-        child = p_IOHIDEventCreateDigitizerFingerEvent(
-            kCFAllocatorDefault, ts,
-            index, 3,
-            mask,
-            x, y, 0.0,
-            0.0, 0.0,
-            0.04, 0.04,
-            range, touch, 0);
-    }
+    // 子事件（finger）：13 参签名（无 buttonMask / minorRadius / majorRadius）。
+    // 坐标 x,y 归一化 0~1 按位置参数传入（ZXTouch 验证：x/screenW, y/screenH）。
+    FT_IOHIDEventRef child = p_IOHIDEventCreateDigitizerFingerEvent(
+        kCFAllocatorDefault, ts,
+        index, 3,                      // index（finger id）, identity(3=finger transducer)
+        mask,                         // eventMask
+        x, y, 0.0,                     // x, y（归一化）, z
+        0.0, 0.0,                      // tipPressure, twist
+        range, touch, 0);              // range, touch, options
     if (!child) return NULL;
     if (p_IOHIDEventSetFloatValue) {
-        // 保险：用字段常量再写一遍（iOS 15 SDK 布局，与 ZXTouch 验证实现一致）
-        p_IOHIDEventSetFloatValue(child, 0x0B0014, 0.04); // MajorRadius
-        p_IOHIDEventSetFloatValue(child, 0x0B0015, 0.04); // MinorRadius
-        p_IOHIDEventSetFloatValue(child, 0x0B000D, x);    // X
-        p_IOHIDEventSetFloatValue(child, 0x0B000E, y);    // Y
+        // 字段常量再写一遍（iOS 15 SDK 布局，与 ZXTouch 验证实现一致）：
+        // MajorRadius=0x0B0014 / MinorRadius=0x0B0015（模拟手指接触面积 0.04），X=0x0B000D, Y=0x0B000E
+        p_IOHIDEventSetFloatValue(child, 0x0B0014, 0.04);
+        p_IOHIDEventSetFloatValue(child, 0x0B0015, 0.04);
+        p_IOHIDEventSetFloatValue(child, 0x0B000D, x);
+        p_IOHIDEventSetFloatValue(child, 0x0B000E, y);
     }
 
-    // 父事件（digitizer hand）：index 用 0（转换器标识，与 finger 区分，对齐 ZXTouch/SimulateTouch）
+    // 父事件（digitizer hand）：15 参签名（含 buttonMask，位于 eventMask 之后、x 之前）。
     FT_IOHIDEventRef parent = p_IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault, ts,
         3,                             // kIOHIDDigitizerTransducerTypeHand
         0, 1,                          // index（hand=0）, identity
-        0, 0,                          // eventMask, childEventMask（由子事件体现）
+        0, 0,                          // eventMask, buttonMask（由子事件体现）
         0.0, 0.0, 0.0,                 // x, y, z
         0.0, 0.0,                      // tipPressure, barrelPressure
         0, 0, 0);                      // range, touch, options
@@ -316,12 +292,15 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
         return NULL;
     }
     if (p_IOHIDEventSetIntegerValue) {
-        // ZXTouch 验证生效的关键字段：Identity(0xb0019)=1 + Type(0x4)=1
-        // 让系统把合成事件认作真实屏幕集成触摸。
+        // ZXTouch 验证生效的关键字段：
+        //   Identity(0x0B0019)=1 + Type(0x4)=1 → 认作真实屏幕集成触摸
+        //   EventMask(0x0B0007)=0x23 → 父事件 composite touch state
+        //   Range(0x0B0006)=1 + Touch(0x0B0008)=1 → 接触状态（与子事件一致）
         p_IOHIDEventSetIntegerValue(parent, 0x0B0019, 1);
         p_IOHIDEventSetIntegerValue(parent, 0x4, 1);
-        // 父事件 composite touch state = 0x23（Range|Touch|Identity 标志），ZXTouch 同样设置
         p_IOHIDEventSetIntegerValue(parent, 0x0B0007, 0x23);
+        p_IOHIDEventSetIntegerValue(parent, 0x0B0006, 1); // Range
+        p_IOHIDEventSetIntegerValue(parent, 0x0B0008, 1); // Touch
     }
 
     p_IOHIDEventAppendEvent(parent, child, 0);
