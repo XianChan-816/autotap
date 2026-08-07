@@ -532,8 +532,13 @@ static void FTSyntheticTap(double px, double py) {
     double nx = ux, ny = uy;
     FTOrientForHID(ux, uy, &nx, &ny);
 
-    // 每次 tap 递增 index（v1.0.45：避免系统把连续注入事件串成同一触摸流）
-    gTapIndex = (gTapIndex % 19) + 1;
+    // 每次 tap 递增 index（v1.0.45：避免系统把连续注入事件串成同一触摸流）。
+    // ⚠️ v1.0.95 关键修正：index 从 2 开始（2-9 循环）——旧代码 (gTapIndex%19)+1 首发 index=1，
+    // 与用户按住球的手指 index(=1) 冲突 → 系统把注入 down 当「index 1 手指重复按下」→
+    // 结束用户手指（touch ph=3 顶掉）→ 松手检测死 + 连点每 ~40 次断。避开 index=1 后
+    // 注入成为「同源第二根手指」，系统不重置触摸上下文 → 用户手指全程 alive →
+    // touchesEnded/Cancelled 真实 → 松手即停（豆包方案）与连点持续同时成立。
+    gTapIndex = (gTapIndex % 8) + 2;
     uint32_t idx = gTapIndex;
 
     // down 立即（系统级派发）
@@ -1458,14 +1463,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.94 loaded (digitizer SID field 0x0B0018; official SID 0x8000...; touchesEnded/Cancelled stop combo)");
+    syslog(LOG_ERR, "FloatingTap v1.0.95 loaded (finger index 2-9 avoid user index=1; captured-first SID; touchesEnded stop)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.94 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; digitizer SID field 0x0B0018; official SID; touchesEnded/Cancelled stop)\n");
+            fprintf(mk, "FloatingTap v1.0.95 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; finger index 2-9; captured-first SID; touchesEnded stop)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

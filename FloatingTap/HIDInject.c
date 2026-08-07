@@ -521,20 +521,20 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
 // 在 10ms 连点下 = 每秒 ~2000 次系统事件注入，严重污染系统触摸/手势状态机——
 // 实测后果：连点之后 Home indicator（小白条）上滑手势失效（什么位置都触发、息屏才恢复）。
 // 且 ret=0x1 是假阴性（ctor-54 证据：全候选 0x1 但 41 下真实点击照常），循环无收益。
-// ⚠️ v1.0.94 定案（综合 ctor-65 关键数据）：
-//   · 0x8000000817371935（zxtouch 官方 kIOHIDEventDigitizerSenderID）——【不顶掉】用户手指
-//     （ctor-65：连点 350 次用户手指全程 ball=1 phase=1 未被系统 Ended）但之前【不送达】；
-//   · captured[0]（0x1000007xx 翻译 ID）——【送达】但【顶掉】用户手指 → 松手检测死；
-//   · 结论：送达 ⇔ 顶掉；不顶掉 ⇔ 不送达。要「送达且不顶掉」必须让 0x8000... 被系统认领。
-//   · 缺的一环：只设了事件级 IOHIDEventSetSenderID，没设 digitizer 字段
-//     kIOHIDEventFieldDigitizerSenderID（0x0B0018）——系统可能从字段找事件源，缺失则丢弃。
-//   v1.0.94：补 0x0B0018 字段 + 首选 0x8000...（若送达且不顶掉 → 用户手指全程 alive →
-//   松手 touchesEnded 真实到达 → 豆包方案「Ended/Cancelled 即停」成立）。
+// ⚠️ v1.0.94/95 定案（ctor-65 + ctor(12) 双份实测）：
+//   · captured[0]（0x1000007xx 翻译 ID）——【送达】（SEND 可见合成触摸、App 有点击）但
+//     【顶掉】用户按住的手指 → 松手检测死、连点每 ~40 次断。**v1.0.95 新假设：顶掉的元凶
+//     是注入 finger index=1 与用户手指 index 冲突**（v1.0.45 起的 (gTapIndex%19)+1 首发=1），
+//     Tweak.xm 已改 index 2-9 避开 → 预期「送达且不顶掉」。
+//   · 0x8000000817371935（zxtouch 官方）+ 0x0B0018 字段——【不顶掉】（ctor(12)：手指全程
+//     ball=1 phase=1、clicks 201/100/68 持续、touches-ended 即停达成）但【仍不送达】
+//     （ret=0x1、SEND 无合成触摸、App 无点击）→ Dopamine 上 0x8000... 无解，移出首选。
+//   v1.0.95：首选 = g_WorkingSID → captured[0]（送达）→ 0x1000007ad；0x0B0018 字段保留
+//   （=sid，让 captured[0] 事件更完整，无害）。
 static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint32_t index, bool down) {
     (void)nx; (void)ny; (void)index; (void)down;
     if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
     uint64_t sid = g_WorkingSID;
-    if (!sid) sid = 0x8000000817371935ULL; // zxtouch 官方 digitizer SID（v1.0.94 首选：不顶掉）
     if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
     if (!sid) sid = 0x1000007adULL;
     p_IOHIDEventSetSenderID(event, sid);
