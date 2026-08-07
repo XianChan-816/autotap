@@ -110,6 +110,7 @@ static BOOL gDragMode = NO;    // NO=蓝色连击模式（长按触发连点）�
 static void *gBallTouch = NULL;          // 用户手指对应的 UITouch 对象（ARC 下系统持有，指针有效期内稳定）
 static double gBallTouchDownTime = 0;    // 该触摸 Began 的单调时间
 static BOOL   gBallTouchClicking = NO;   // 是否已据此触摸开始连点（避免重复 start）
+static BOOL   gBallTouchTimerPending = NO; // 120ms 长按计时器是否已排队（避免重复排）
 
 static CGPoint gClickPanStartLoc;   // 点击点拖动起点（窗口坐标）
 static CGPoint gClickPanOrigin0;    // 点击点拖动起点 frame.origin
@@ -553,10 +554,14 @@ static void FTClickCallback(void *ctx) {
 
     double hx = gClickLockX, hy = gClickLockY;
     FTOrientForHID(gClickLockX, gClickLockY, &hx, &hy);
-    char diag[160];
-    snprintf(diag, sizeof(diag), "inject tap uik=%.2f,%.2f hid=%.2f,%.2f orient=%ld",
-             gClickLockX, gClickLockY, hx, hy, (long)FTGetOrientation());
-    FTLog(diag);
+    // 节流：每 ~25 次点击（约 250ms@10ms）打一条，避免日志被刷爆
+    static int sTapLogCount = 0;
+    if ((sTapLogCount++ % 25) == 0) {
+        char diag[160];
+        snprintf(diag, sizeof(diag), "inject tap uik=%.2f,%.2f hid=%.2f,%.2f orient=%ld",
+                 gClickLockX, gClickLockY, hx, hy, (long)FTGetOrientation());
+        FTLog(diag);
+    }
 }
 
 // 诊断：dump UIEvent 的 ivar 名（已确认有 _hidEvent/_gsEvent）
@@ -714,6 +719,18 @@ static void FTApplyClickPointAppearance(void) {
     if (dot) ((Msg_SetBackgroundColor)objc_msgSend)(dot, sel_registerName("setBackgroundColor:"), color);
 }
 
+// v1.0.73：按下球 120ms 后的延时计时器回调——静止按住时 iOS 不投递 Moved/Stationary 事件，
+// 不能靠它们触发连点，改用此计时器。到时若手指仍按着（gBallTouch 未清空 = 同一根手指没抬起）
+// 且非拖动模式，就开始连点。
+static void FTBallHoldTimer(void *ctx) {
+    (void)ctx;
+    gBallTouchTimerPending = NO;
+    if (gBallTouch != NULL && !gBallTouchClicking && !gDragMode) {
+        gBallTouchClicking = YES;
+        FTStartClicking();
+    }
+}
+
 // Tap 回调：双击 → 切换「拖动模式」与「连击模式」（不再隐藏球）。
 //   蓝色（连击模式）：长按触发连点；红色（拖动模式）：拖动小球重新定位点击点。
 static void FTGRTapHandler(id self, SEL _cmd, id gr) {
@@ -722,6 +739,10 @@ static void FTGRTapHandler(id self, SEL _cmd, id gr) {
     NSUInteger st = ((Msg_State)objc_msgSend)(gr, sel_registerName("state"));
     if (st == 3) { // Ended（双击完成）
         FTStopClicking();
+        // 切模式时清掉触摸追踪状态，避免残留的 120ms 计时器在切换后误开连点（竞态）
+        gBallTouch = NULL;
+        gBallTouchClicking = NO;
+        gBallTouchTimerPending = NO;
         gDragMode = !gDragMode;
         // 模式切换：仅启用当前模式对应的手势，禁用另一个，避免长按/拖动手势识别冲突
         ((Msg_SetEnabled)objc_msgSend)(gLongGR, sel_registerName("setEnabled:"), gDragMode ? NO : YES);
@@ -1213,15 +1234,25 @@ static void FTTweakInitCallback(void *ctx) {
                 if (onBall && gBallTouch == NULL) {
                     gBallTouch = tp;
                     gBallTouchDownTime = now;
+                    // 排一个 120ms 延时计时器：到时若手指仍按着（gBallTouch 不变）且非拖动模式，
+                    // 就开连点。⚠️ 不能等 Moved/Stationary 事件——静止按住时 iOS 不投递这些事件
+                    // （ctor-44 实测：1.6s 按住零 phase=1/2，导致旧逻辑从未触发、零点击）。
+                    if (!gBallTouchTimerPending) {
+                        gBallTouchTimerPending = YES;
+                        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                                         dispatch_get_main_queue(), NULL, FTBallHoldTimer);
+                    }
                 }
-            } else if (ph == 1 || ph == 2) {                 // Moved / Stationary
-                if (gBallTouch == tp && !gBallTouchClicking && (now - gBallTouchDownTime) > 0.12) {
+            } else if (ph == 1 || ph == 2) {                 // Moved / Stationary（仅作保险，主要靠计时器）
+                if (gBallTouch == tp && !gBallTouchClicking && !gDragMode &&
+                    (now - gBallTouchDownTime) > 0.12 && !gBallTouchTimerPending) {
                     gBallTouchClicking = YES;
                     FTStartClicking();
                 }
             } else if (ph == 3 || ph == 4) {                 // Ended / Cancelled
                 if (gBallTouch == tp) {
                     gBallTouch = NULL;
+                    gBallTouchTimerPending = NO;
                     if (gBallTouchClicking) { gBallTouchClicking = NO; FTStopClicking(); }
                 }
             }
@@ -1290,14 +1321,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.72 loaded (touch-identity-driven combo; fixed NSSet objectAtIndex crash; senderID captured-first; orientation-aware HID; 10ms)");
+    syslog(LOG_ERR, "FloatingTap v1.0.73 loaded (timer-based hold trigger; fixed NSSet crash; senderID captured-first; orientation-aware HID; 10ms)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.72 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; touch-identity combo; fixed NSSet objectAtIndex crash; captured-first senderID; system HID dispatch)\n");
+            fprintf(mk, "FloatingTap v1.0.73 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; timer-based hold trigger; fixed NSSet crash; captured-first senderID; system HID dispatch)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

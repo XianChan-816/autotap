@@ -326,9 +326,14 @@ static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint3
         p_IOHIDEventSetSenderID(ev, sids[i]);
         FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, ev);
         if (ret == FT_kIOReturnSuccess) {
+        // 成功只打一次（避免 10ms 连点每发一条把日志刷爆；失败照常全打）
+        static bool sDidLogOk = false;
+        if (!sDidLogOk) {
+            sDidLogOk = true;
             char dbg[96];
             snprintf(dbg, sizeof(dbg), "DispatchEvent ok SID=0x%llx", (unsigned long long)sids[i]);
             FTHIDLog(dbg);
+        }
             if (ev != event) CFRelease(ev); else CFRelease(event);
             return;
         }
