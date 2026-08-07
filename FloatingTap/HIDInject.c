@@ -89,6 +89,11 @@ static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerFingerEvent)(
     uint32_t eventMask, double x, double y, double z, double tipPressure,
     double twist, Boolean range, Boolean touch, FT_IOOptionBits options);
 static void (*p_IOHIDEventAppendEvent)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits);
+// v1.0.79：IOHID 服务枚举——sendEvent 管线里的 senderID 是"翻译后"的（全被拒 0x1，
+// ctor-49/52 实测 0x100000709/7af/251 全 0x1），系统真正接受的 digitizer 服务 senderID
+// （ctor-39 的 0x1000007ad）只能直接从服务枚举拿。
+static CFArrayRef (*p_IOHIDEventSystemClientCopyServices)(FT_IOHIDEventSystemClientRef);
+static CFTypeRef  (*p_IOHIDServiceClientCopyProperty)(FT_IOHIDServiceRef, CFStringRef);
 
 // MARK: - 状态
 
@@ -100,7 +105,8 @@ static uint64_t g_OverrideSenderID = 0;
 // 最后一个捕获值不一定是系统认领的那个（ctor-45 实测 0x1000007af 被拒、ctor-39 的 0x1000007ad 可用）。
 // 改为收集候选集，派发时逐个尝试，首个成功即锁定为 g_WorkingSID。
 // v1.0.77：候选上限 4→8（不设 type==11 过滤，任何事件出现的 senderID 都收，扩大命中面）。
-static uint64_t g_CapturedSIDs[8] = {0};
+// v1.0.79：上限 8→12（服务枚举会加入多个 digitizer 服务的 SID）。
+static uint64_t g_CapturedSIDs[12] = {0};
 static int      g_CapturedSIDCount = 0;
 static uint64_t g_WorkingSID = 0;   // 已验证可用的 senderID（锁定后优先使用）
 
@@ -148,6 +154,11 @@ static bool FT_HIDLoadSymbols(void) {
         dlsym(handle, "IOHIDEventCreateDigitizerFingerEvent");
     p_IOHIDEventAppendEvent =
         (void (*)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits))dlsym(handle, "IOHIDEventAppendEvent");
+    // v1.0.79：服务枚举符号（可选，缺了不影响主流程）
+    p_IOHIDEventSystemClientCopyServices =
+        (CFArrayRef (*)(FT_IOHIDEventSystemClientRef))dlsym(handle, "IOHIDEventSystemClientCopyServices");
+    p_IOHIDServiceClientCopyProperty =
+        (CFTypeRef (*)(FT_IOHIDServiceRef, CFStringRef))dlsym(handle, "IOHIDServiceClientCopyProperty");
 
     g_hidLoaded = (p_IOHIDEventCreateDigitizerEvent &&
                    p_IOHIDEventSystemClientCreate &&
@@ -163,6 +174,52 @@ static bool FT_HIDLoadSymbols(void) {
 }
 
 // MARK: - 连接
+
+// v1.0.79：枚举 IOHID 系统服务，把服务的 senderID（SenderID / RegistryID 属性）收进候选集。
+// sendEvent 事件流的 senderID 是翻译后的（全 0x1 被拒），系统真正接受的 digitizer 服务
+// senderID 只能从这里拿。失败无害（无候选就仍用 sendEvent 捕获的）。
+static void FT_HIDEnumerateServices(void) {
+    if (!g_hidClient) return;
+    if (!p_IOHIDEventSystemClientCopyServices || !p_IOHIDServiceClientCopyProperty) {
+        FTHIDLog("service enum: symbols missing");
+        return;
+    }
+    CFArrayRef arr = p_IOHIDEventSystemClientCopyServices(g_hidClient);
+    if (!arr) { FTHIDLog("service enum: none"); return; }
+    CFIndex n = CFArrayGetCount(arr);
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg), "service enum: %ld services", (long)n);
+    FTHIDLog(dbg);
+    const char *propKeys[3] = { "SenderID", "RegistryID", "RegistryEntryID" };
+    for (CFIndex i = 0; i < n; i++) {
+        FT_IOHIDServiceRef svc = (FT_IOHIDServiceRef)CFArrayGetValueAtIndex(arr, i);
+        if (!svc) continue;
+        for (int k = 0; k < 3; k++) {
+            CFStringRef key = CFStringCreateWithCString(kCFAllocatorDefault, propKeys[k], kCFStringEncodingUTF8);
+            if (!key) continue;
+            CFTypeRef val = p_IOHIDServiceClientCopyProperty(svc, key);
+            CFRelease(key);
+            if (!val) continue;
+            uint64_t sid = 0;
+            if (CFGetTypeID(val) == CFNumberGetTypeID()) {
+                CFNumberGetValue((CFNumberRef)val, kCFNumberSInt64Type, &sid);
+            }
+            CFRelease(val);
+            if (!sid) continue;
+            bool dup = false;
+            for (int j = 0; j < g_CapturedSIDCount; j++) {
+                if (g_CapturedSIDs[j] == sid) { dup = true; break; }
+            }
+            if (!dup && g_CapturedSIDCount < 12) {
+                g_CapturedSIDs[g_CapturedSIDCount++] = sid;
+                snprintf(dbg, sizeof(dbg), "service SID via '%s': 0x%llx", propKeys[k], (unsigned long long)sid);
+                FTHIDLog(dbg);
+            }
+            break; // 该服务取到一个就下一个
+        }
+    }
+    CFRelease(arr);
+}
 
 bool FT_HIDConnect(void) {
     if (g_hidClient) return true;
@@ -181,6 +238,8 @@ bool FT_HIDConnect(void) {
     if (p_IOHIDEventSystemClientScheduleWithRunLoop) {
         p_IOHIDEventSystemClientScheduleWithRunLoop(g_hidClient, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
     }
+    // v1.0.79：枚举服务收 senderID 候选（sendEvent 捕获不到系统接受的 SID）
+    FT_HIDEnumerateServices();
     char dbg[128];
     snprintf(dbg, sizeof(dbg), "HID connected (senderID=0x%llx override=%d)",
              (unsigned long long)FT_HIDSenderID(), g_OverrideSenderID ? 1 : 0);
@@ -250,7 +309,7 @@ void FT_HIDCaptureSenderIDFromUIEvent(void *event) {
     for (int i = 0; i < g_CapturedSIDCount; i++) {
         if (g_CapturedSIDs[i] == sid) return; // 已有，不重复
     }
-    if (g_CapturedSIDCount < 8) {
+    if (g_CapturedSIDCount < 12) {
         g_CapturedSIDs[g_CapturedSIDCount++] = sid;
         char dbg[96];
         snprintf(dbg, sizeof(dbg), "senderID candidate #%d: 0x%llx", g_CapturedSIDCount, (unsigned long long)sid);
