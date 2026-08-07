@@ -77,7 +77,15 @@ static uint64_t (*p_IOHIDEventGetSenderID)(FT_IOHIDEventRef);
 // 系统可能认为本 client 就是真实 digitizer → 注入不被当「未知设备」→ 不触发触摸上下文
 // 重置 → 用户按住的手指不再被注入顶掉（Ended）→ 连点可持续（ctor-62：每轮 400ms 就
 // hold-release 停，因为注入第一个 down 就把用户手指 Ended 且系统不重发 Began）。
+// ⚠️ v1.0.89 结论：该符号 iOS 15.5 不存在（dlsym NULL），无效。
 static void (*p_IOHIDEventSystemClientSetSenderID)(FT_IOHIDEventSystemClientRef, uint64_t);
+// v1.0.92：IOHID 事件回调（纯 C）——从真实触摸的【原始 IOHIDEvent】提取 senderID。
+// sendEvent 的 _hidEvent 是"翻译后"事件（0x1000007xx，送达但触发上下文重置 → 顶掉用户
+// 手指）；zxtouch 用 IOHID 回调里的原始 senderID（系统真正认领，注入当真实 digitizer →
+// 不顶掉）。v1.0.53 注册回调崩过（ObjC/block 实现），纯 C 回调重新尝试。
+typedef void (*FT_HIDEventCallback)(void *target, void *refcon, void *service, FT_IOHIDEventRef event);
+static void (*p_IOHIDEventSystemClientRegisterEventCallback)(FT_IOHIDEventSystemClientRef, FT_HIDEventCallback, void *, void *);
+static void (*p_IOHIDEventSystemClientUnregisterEventCallback)(FT_IOHIDEventSystemClientRef, FT_HIDEventCallback, void *, void *);
 // ⚠️ 子事件签名铁律（v1.0.67，来自 SimulateTouch 对系统函数的 hook 反编译，权威）：
 //   IOHIDEventCreateDigitizerFingerEvent(allocator, ts, index, identity, eventMask,
 //       IOHIDFloat x, IOHIDFloat y, IOHIDFloat z,
@@ -118,6 +126,9 @@ static uint64_t g_OverrideSenderID = 0;
 static uint64_t g_CapturedSIDs[12] = {0};
 static int      g_CapturedSIDCount = 0;
 static uint64_t g_WorkingSID = 0;   // 已验证可用（ret=0）的 senderID（锁定后优先使用）
+// v1.0.92：IOHID 回调提取的【原始设备 senderID】（zxtouch 方式）——系统真正认领，
+// 注入当真实 digitizer → 不触发上下文重置 → 用户手指不被顶掉 → 连点持续。
+static uint64_t g_OriginalSenderID = 0;
 // v1.0.84 教训（ctor-57）：服务枚举的 digitizer registryID（0x8de4/0x9114... 形态）不是
 // 系统接受的 senderID——用它派发事件【完全不送达】（日志连点期间无合成触摸、计数器零点击）。
 // sendEvent 捕获的 0x1000007xx（「翻译后」ID）虽然 ret=0x1（假阴性）但事件实际送达、点击有效。
@@ -154,6 +165,11 @@ static bool FT_HIDLoadSymbols(void) {
     // v1.0.89：client 级 senderID（可选符号）
     p_IOHIDEventSystemClientSetSenderID =
         (void (*)(FT_IOHIDEventSystemClientRef, uint64_t))dlsym(handle, "IOHIDEventSystemClientSetSenderID");
+    // v1.0.92：IOHID 事件回调（纯 C 提取原始 senderID）
+    p_IOHIDEventSystemClientRegisterEventCallback =
+        (void (*)(FT_IOHIDEventSystemClientRef, FT_HIDEventCallback, void *, void *))dlsym(handle, "IOHIDEventSystemClientRegisterEventCallback");
+    p_IOHIDEventSystemClientUnregisterEventCallback =
+        (void (*)(FT_IOHIDEventSystemClientRef, FT_HIDEventCallback, void *, void *))dlsym(handle, "IOHIDEventSystemClientUnregisterEventCallback");
     p_IOHIDEventSetIntegerValue =
         (void (*)(FT_IOHIDEventRef, uint32_t, int64_t))dlsym(handle, "IOHIDEventSetIntegerValue");
     // v1.0.64：float 字段设置 + 事件类型读取（筛选 digitizer 事件）
@@ -281,6 +297,27 @@ static void FT_HIDEnumerateServices(void) {
     CFRelease(arr);
 }
 
+// v1.0.92：纯 C 回调——从真实触摸的【原始 IOHIDEvent】提取设备 senderID。
+// 与 sendEvent 的 _hidEvent（翻译后 0x1000007xx）不同，这里是硬件原始值，
+// 系统真正认领它 → 注入当真实 digitizer → 不触发触摸上下文重置 → 用户手指不被顶掉。
+// 提取一次后立即注销回调（防反复触发/性能影响）。⚠️ 纯 C、零 ObjC 元数据（v1.0.53 崩
+// 是 ObjC/block 实现问题，此回调只有基础读值）。
+static void FTOriginalSIDCallback(void *target, void *refcon, void *service, FT_IOHIDEventRef event) {
+    (void)target; (void)refcon; (void)service;
+    if (!event || g_OriginalSenderID) return;
+    if (!p_IOHIDEventGetType || !p_IOHIDEventGetSenderID) return;
+    if (p_IOHIDEventGetType(event) != 11) return; // kIOHIDEventTypeDigitizer
+    uint64_t sid = (uint64_t)p_IOHIDEventGetSenderID(event);
+    if (!sid) return;
+    g_OriginalSenderID = sid;
+    char dbg[96];
+    snprintf(dbg, sizeof(dbg), "original senderID via callback: 0x%llx", (unsigned long long)sid);
+    FTHIDLog(dbg);
+    if (p_IOHIDEventSystemClientUnregisterEventCallback && g_hidClient) {
+        p_IOHIDEventSystemClientUnregisterEventCallback(g_hidClient, FTOriginalSIDCallback, NULL, NULL);
+    }
+}
+
 bool FT_HIDConnect(void) {
     if (g_hidClient) return true;
     if (!FT_HIDLoadSymbols()) {
@@ -302,6 +339,12 @@ bool FT_HIDConnect(void) {
     }
     // v1.0.79：枚举服务收 senderID 候选（sendEvent 捕获不到系统接受的 SID）
     FT_HIDEnumerateServices();
+    // v1.0.92：注册纯 C 回调提取【原始设备 senderID】（zxtouch 方式）——
+    // 用户下一次真实触摸时回调触发，提取后自动注销
+    if (!g_OriginalSenderID && p_IOHIDEventSystemClientRegisterEventCallback) {
+        p_IOHIDEventSystemClientRegisterEventCallback(g_hidClient, FTOriginalSIDCallback, NULL, NULL);
+        FTHIDLog("original senderID callback registered");
+    }
     char dbg[128];
     snprintf(dbg, sizeof(dbg), "HID connected (senderID=0x%llx override=%d)",
              (unsigned long long)FT_HIDSenderID(), g_OverrideSenderID ? 1 : 0);
@@ -480,16 +523,15 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
 // 且 ret=0x1 是假阴性（ctor-54 证据：全候选 0x1 但 41 下真实点击照常），循环无收益。
 // v1.0.85 首选修正（ctor-57 铁证）：captured[0]（0x1000007xx）事件实际送达、点击有效；
 // registryID（0x8de4/0x9114...）完全不送达 → 只留候选。
-// ⚠️ v1.0.91：首选改回 zxtouch 官方 digitizer senderID = kIOHIDEventDigitizerSenderID
-// (0x8000000817371935)。v1.0.70 试过它返回 0x1，但那时事件结构是错的（WithQuality 18 参）；
-// 现在 13 参结构已完全对齐 zxtouch。若系统认领该官方值（注入当真实 digitizer 触摸），
-// 不再触发触摸上下文重置 → 用户按住球的手指不被顶掉 → 连点持续（ctor-64：静止按住
-// 每轮 ~400ms 停的根因 = 注入 down 顶掉用户手指且系统不重发 Began）。
+// ⚠️ v1.0.91 实测：0x8000000817371935（zxtouch 官方值）在 Dopamine 上也【不送达】
+// （ctor-65：SEND 无合成触摸、点击无反馈；但连点因手指没被顶掉持续 350 次）。
+// v1.0.92：首选顺序 = g_WorkingSID → g_OriginalSenderID（回调提取的硬件原始值，
+// 可能"送达且不顶掉"）→ captured[0]（送达、顶掉）→ 0x1000007ad。
 static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint32_t index, bool down) {
     (void)nx; (void)ny; (void)index; (void)down;
     if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
     uint64_t sid = g_WorkingSID;
-    if (!sid) sid = 0x8000000817371935ULL; // zxtouch 官方 digitizer senderID（v1.0.91 首选）
+    if (!sid && g_OriginalSenderID) sid = g_OriginalSenderID;
     if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
     if (!sid) sid = 0x1000007adULL;
     p_IOHIDEventSetSenderID(event, sid);
