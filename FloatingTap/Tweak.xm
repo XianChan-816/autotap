@@ -100,6 +100,7 @@ static id gTapGR2     = nil;   // 点击点标记上的双击手势（同样触�
 static id gLongGR     = nil;
 static id gPanGR      = nil;   // 拖动手势（仅「红色拖动模式」生效，移动球本身）
 static id gClickPointView = nil; // 点击点标记（独立视图，仅「红色拖动模式」可拖动；蓝色连击模式不可交互→点击穿透到下层 App）
+static id gClickFlashView = nil; // v1.0.81：点击落点光圈——连点每次注入都在点击点显示红圈，直观看到"点击落在哪"
 static id gClickPanGR = nil;   // 点击点拖动手势（仅红色模式生效，移动点击点，与球解耦）
 static BOOL gDragMode = NO;    // NO=蓝色连击模式（长按触发连点）；YES=红色拖动模式（拖动定位）
 
@@ -567,6 +568,13 @@ static void FTClickCallback(void *ctx) {
     FTSyntheticTap(gClickLockX * gScreenW, gClickLockY * gScreenH);
     gClickCount++;
 
+    // v1.0.81：点击落点光圈——每次注入把光圈移到点击点并点亮（10ms 连点期间保持常亮）
+    if (gClickFlashView) {
+        ((Msg_SetFrame)objc_msgSend)(gClickFlashView, sel_registerName("setFrame:"),
+            CGRectMake(gClickLockX * gScreenW - 13, gClickLockY * gScreenH - 13, 26, 26));
+        ((Msg_SetAlpha)objc_msgSend)(gClickFlashView, sel_registerName("setAlpha:"), 1.0);
+    }
+
     double hx = gClickLockX, hy = gClickLockY;
     FTOrientForHID(gClickLockX, gClickLockY, &hx, &hy);
     // 节流：每 ~25 次点击（约 250ms@10ms）打一条，避免日志被刷爆
@@ -653,6 +661,9 @@ static void FTStopClicking(const char *reason) {
     if (gClickTimer) {
         dispatch_source_cancel(gClickTimer);
         gClickTimer = NULL;
+    }
+    if (gClickFlashView) {
+        ((Msg_SetAlpha)objc_msgSend)(gClickFlashView, sel_registerName("setAlpha:"), 0.0); // 灭光圈
     }
     FTApplyGRModes(); // 恢复手势（按当前模式启用对应 GR）
     char dbg[128];
@@ -958,6 +969,14 @@ static void FTReparentBallToGestureWin(void *ctx) {
             ((Msg_AddSubview)objc_msgSend)(gGestureWin, sel_registerName("addSubview:"), gClickPointView);
         }
     }
+    // 点击落点光圈一并重挂
+    if (gClickFlashView) {
+        id fsup = ((Msg_Send)objc_msgSend)(gClickFlashView, sel_registerName("superview"));
+        if (fsup != gGestureWin) {
+            if (fsup) ((Msg_Send)objc_msgSend)(gClickFlashView, sel_registerName("removeFromSuperview"));
+            ((Msg_AddSubview)objc_msgSend)(gGestureWin, sel_registerName("addSubview:"), gClickFlashView);
+        }
+    }
     const char *oldCls = sup ? object_getClassName(sup) : "?";
     char diag[160];
     snprintf(diag, sizeof(diag), "ball reparented: %s -> %s", oldCls, object_getClassName(gGestureWin));
@@ -1133,6 +1152,26 @@ static void FTSetupBall(void) {
             }
             ((Msg_AddSubview)objc_msgSend)(targetWin, sel_registerName("addSubview:"), gClickPointView);
             FTApplyClickPointAppearance();
+        }
+    }
+
+    // v1.0.81：点击落点光圈——每次注入在点击点显示红圈（连点时常亮），直观看到"点击落在哪"。
+    // App 里点空白处/备忘录默认不显示反馈，用户看不到落点，故自绘光圈。
+    {
+        CGFloat f = 26.0;
+        gClickFlashView = FTAllocInitWithFrame(ClsView, CGRectMake(0, 0, f, f));
+        if (gClickFlashView) {
+            ((Msg_SetUserInteractionEnabled)objc_msgSend)(gClickFlashView, sel_registerName("setUserInteractionEnabled:"), NO);
+            id flayer = ((Msg_Layer)objc_msgSend)(gClickFlashView, sel_registerName("layer"));
+            ((Msg_SetCGFloat)objc_msgSend)(flayer, sel_registerName("setCornerRadius:"), (CGFloat)(f / 2));
+            ((Msg_SetCGFloat)objc_msgSend)(flayer, sel_registerName("setBorderWidth:"), (CGFloat)3.0);
+            id fcol = ((Msg_ColorWithRGBA)objc_msgSend)((id)ClsColor, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.3, 0.2, 0.95);
+            ((Msg_SetBorderColor)objc_msgSend)(flayer, sel_registerName("setBorderColor:"),
+                ((Msg_CGColor)objc_msgSend)(fcol, sel_registerName("CGColor")));
+            ((Msg_SetBackgroundColor)objc_msgSend)(gClickFlashView, sel_registerName("setBackgroundColor:"),
+                ((Msg_ColorWithRGBA)objc_msgSend)((id)ClsColor, sel_registerName("colorWithRed:green:blue:alpha:"), 1.0, 0.55, 0.35, 0.30));
+            ((Msg_SetAlpha)objc_msgSend)(gClickFlashView, sel_registerName("setAlpha:"), 0.0);
+            ((Msg_AddSubview)objc_msgSend)(targetWin, sel_registerName("addSubview:"), gClickFlashView);
         }
     }
 
@@ -1386,14 +1425,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.80 loaded (hold-to-combo with 400ms release grace: injection-induced touch end re-binds via re-Began)");
+    syslog(LOG_ERR, "FloatingTap v1.0.81 loaded (click-point flash indicator; hold-to-combo; 400ms release grace)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.80 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; hold-to-combo; 400ms release grace + re-bind; UP parent Range/Touch=0)\n");
+            fprintf(mk, "FloatingTap v1.0.81 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; click-point flash; hold-to-combo; 400ms release grace)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
