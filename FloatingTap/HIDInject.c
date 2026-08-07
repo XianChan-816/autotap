@@ -542,11 +542,10 @@ static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint3
     if (!g_PrimarySIDFellBack && g_PrimarySID) {
         sid = g_PrimarySID; // registryID（真实服务 SID）——若送达且同源则理想
     } else {
+        // v1.0.99：注入路径恢复 ctor-69 完美形态——首选 captured[0]（首个捕获的真实触摸
+        // SID）。v1.0.98 改用 g_UserSID 首选后顶掉回归（ctor-71 clicks 22-27）；ctor-69
+        // 用 captured[0]=0x100000709 时不顶掉（clicks 155）。g_UserSID 仅保留诊断。
         sid = g_WorkingSID;
-        // v1.0.98：首选【用户手指同源 SID】——顶掉与否取决于注入 SID 是否与用户手指同源
-        // （ctor-69 vs ctor-70：重启后 captured[0] 变了导致顶掉回归）。g_UserSID 在 sendEvent
-        // 检测到球上用户手指 Began 时动态更新，保证注入与用户手指同源 → 不重置触摸上下文。
-        if (!sid && g_UserSID) sid = g_UserSID;
         if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
         if (!sid) sid = 0x1000007adULL;
     }
