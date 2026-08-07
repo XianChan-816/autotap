@@ -478,13 +478,18 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
 // 在 10ms 连点下 = 每秒 ~2000 次系统事件注入，严重污染系统触摸/手势状态机——
 // 实测后果：连点之后 Home indicator（小白条）上滑手势失效（什么位置都触发、息屏才恢复）。
 // 且 ret=0x1 是假阴性（ctor-54 证据：全候选 0x1 但 41 下真实点击照常），循环无收益。
-// v1.0.85 首选修正（ctor-57 铁证）：首选必须是 sendEvent 捕获的 captured[0]（0x1000007xx，
-// ret=0x1 假阴性但事件实际送达、点击有效）；服务枚举 registryID（0x8de4/0x9114...）派发
-// 事件完全不送达（v1.0.84 实测零点击）→ 只留候选。单次派发、不再重建重试。
+// v1.0.85 首选修正（ctor-57 铁证）：captured[0]（0x1000007xx）事件实际送达、点击有效；
+// registryID（0x8de4/0x9114...）完全不送达 → 只留候选。
+// ⚠️ v1.0.91：首选改回 zxtouch 官方 digitizer senderID = kIOHIDEventDigitizerSenderID
+// (0x8000000817371935)。v1.0.70 试过它返回 0x1，但那时事件结构是错的（WithQuality 18 参）；
+// 现在 13 参结构已完全对齐 zxtouch。若系统认领该官方值（注入当真实 digitizer 触摸），
+// 不再触发触摸上下文重置 → 用户按住球的手指不被顶掉 → 连点持续（ctor-64：静止按住
+// 每轮 ~400ms 停的根因 = 注入 down 顶掉用户手指且系统不重发 Began）。
 static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint32_t index, bool down) {
     (void)nx; (void)ny; (void)index; (void)down;
     if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
     uint64_t sid = g_WorkingSID;
+    if (!sid) sid = 0x8000000817371935ULL; // zxtouch 官方 digitizer senderID（v1.0.91 首选）
     if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
     if (!sid) sid = 0x1000007adULL;
     p_IOHIDEventSetSenderID(event, sid);
