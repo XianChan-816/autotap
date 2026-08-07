@@ -1642,14 +1642,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.103 loaded (capture true main-window SID - exclude gesture-window touches; purple hint)");
+    syslog(LOG_ERR, "FloatingTap v1.0.104 loaded (dispatch uses probed SID - registryID primary removed)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.103 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; main-window-only capture; purple hint)\n");
+            fprintf(mk, "FloatingTap v1.0.104 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; dispatch=probed SID; main-window capture)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

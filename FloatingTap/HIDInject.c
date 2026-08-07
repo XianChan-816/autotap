@@ -126,13 +126,10 @@ static uint64_t g_WorkingSID = 0;   // 已验证可用（ret=0）的 senderID（
 // 顶掉与 finger index 无关。且 v1.0.84 用 registryID 时事件结构还是旧的（child mask 0x07），
 // v1.0.90 改 0x03 + v1.0.94 加 0x0B0018 之后【从没重试过 registryID】。registryID 是真实
 // digitizer 服务 SID（zxtouch 用的就是真实 SID），可能「送达且不顶掉」。v1.0.96：
-//   · g_PrimarySID = 第一个确认 digitizer 的 registryID（真实服务 SID）
-//   · 派发 ret≠0 累计 5 次 → 自适应 fallback 到 captured[0]（送达保底，日志标记）
+//   · g_PrimarySID = 第一个确认 digitizer 的 registryID（真实服务 SID，v1.0.104 起仅诊断）
 //   · 移除 ScheduleWithRunLoop + RegisterEventCallback（对齐 zxtouch 纯注入 client，
 //     回调已验证拿不到原始 SID——Dopamine 上只有翻译值）
-static uint64_t g_PrimarySID = 0;    // v1.0.96：首选（digitizer 服务 registryID）
-static int      g_PrimarySIDFailCount = 0; // 首选连续失败计数（≥5 → fallback captured）
-static bool     g_PrimarySIDFellBack = false;
+static uint64_t g_PrimarySID = 0;    // v1.0.96：registryID（v1.0.104 起仅诊断，派发弃用）
 
 // 前向声明（定义在文件后部「诊断日志」段，但 FT_HIDConnect 等前面函数要用）
 static void FTHIDLog(const char *msg);
@@ -553,42 +550,28 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
 static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint32_t index, bool down) {
     (void)nx; (void)ny; (void)index; (void)down;
     if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
-    uint64_t sid;
-    if (!g_PrimarySIDFellBack && g_PrimarySID) {
-        sid = g_PrimarySID; // registryID（真实服务 SID）——若送达且同源则理想
-    } else {
-        // v1.0.100：首选【非球上（主屏/App 窗口）触摸 SID】g_MainSID——球上触摸被手势
-        // 服务翻译成 0x1000007af 类无效值（注入顶掉用户手指，ctor-72 铁证）；主屏 digitizer
-        // SID（0x100000709 类）系统认领、不顶掉（ctor-69 完美）。captured[0] 兜底。
-        sid = g_WorkingSID;
-        if (!sid && g_MainSID) sid = g_MainSID;
-        if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
-        if (!sid) sid = 0x1000007adULL;
-    }
+    // ⚠️ v1.0.104：移除 g_PrimarySID（registryID）首选——ctor-2 铁证：探测锁定
+    // g_WorkingSID=0x100000709（有效）后，FT_DispatchEvent 仍首选 registryID 派发
+    // （ret=0x1、不送达、零点击），连点 3 次就停没触发 5 次 fallback。registryID 在
+    // Dopamine 上从不送达（v1.0.84/96 实测），直接弃用；派发一律走探测锁定的
+    // g_WorkingSID（v1.0.101 探测机制已保证它是「送达且不顶掉」的会话有效值）。
+    uint64_t sid = g_WorkingSID;
+    if (!sid && g_MainSID) sid = g_MainSID;
+    if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
+    if (!sid) sid = 0x1000007adULL;
     p_IOHIDEventSetSenderID(event, sid);
     // v1.0.94 保留：digitizer 事件字段里的 SenderID（0x0B0018 = kIOHIDEventFieldDigitizerSenderID）
-    // 与顶层一致，让系统按事件字段归属 digitizer（对 registryID 首选尤其关键）。
+    // 与顶层一致，让系统按事件字段归属 digitizer。
     if (p_IOHIDEventSetIntegerValue) {
         p_IOHIDEventSetIntegerValue(event, 0x0B0018, (int64_t)sid);
     }
     FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, event);
     if (ret == FT_kIOReturnSuccess && !g_WorkingSID) {
         g_WorkingSID = sid; // 首次 ret=0 锁定（后续直用）
-        g_PrimarySIDFailCount = 0;
         char dbg[96];
         snprintf(dbg, sizeof(dbg), "DispatchEvent ok SID=0x%llx", (unsigned long long)sid);
         FTHIDLog(dbg);
     } else if (ret != FT_kIOReturnSuccess) {
-        // 首选（registryID）连续失败 → 自适应 fallback 到 captured[0]（送达保底）
-        if (!g_PrimarySIDFellBack && g_PrimarySID && sid == g_PrimarySID) {
-            if (++g_PrimarySIDFailCount >= 5) {
-                g_PrimarySIDFellBack = true;
-                char dbg[96];
-                snprintf(dbg, sizeof(dbg), "SID fallback: registryID %d fails -> captured",
-                         g_PrimarySIDFailCount);
-                FTHIDLog(dbg);
-            }
-        }
         // 失败节流打一条（0x1 假阴性，仅诊断用；不打会丢失排查线索）
         static int sFailLog = 0;
         if ((sFailLog++ % 200) == 0) {
