@@ -1359,14 +1359,10 @@ static void FTTweakInitCallback(void *ctx) {
             }
         }
     }
-    // v1.0.64：从真实触摸事件的 _hidEvent 动态捕获设备 senderID（逻辑在 HIDInject.c，
-    // 纯 C 绕开 Theos 对 Tweak.xm 的 ARC 限制——object_getInstanceVariable 在 ARC 下禁用）。
-    // 仅接受 digitizer 触摸事件（type=11）的 senderID——ctor-10 实测抓到手势事件的
-    // 非法 senderID(0x1000007b1) 会导致 DispatchEvent 返回 0x1。硬编码 senderID 在
-    // Dopamine rootless + iOS 15.5 上会被系统静默丢弃，故必须捕获真实设备值。
-    if (event) {
-        FT_HIDCaptureSenderIDFromUIEvent((__bridge void *)event);
-    }
+    // ⚠️ v1.0.100：SID 捕获移入下方遍历循环——只对【非球上触摸】（主屏/App 窗口）捕获
+    // g_MainSID。球上触摸被手势服务翻译成 0x1000007af 类无效值（注入顶掉用户手指，
+    // ctor-72 铁证）；主屏 digitizer SID（0x100000709 类）系统认领、不顶掉（ctor-69 完美）。
+    // 注意：不在此处无条件捕获（否则球上触摸的翻译值污染候选集）。
     // v1.0.71：按「触摸身份」追踪按在球上的用户手指，驱动连点（替代 UILongPressGR）。
     // 免疫两大致命干扰：① 游戏内多点触摸（第 2 根手指）会让 UILongPress 被判 Cancelled；
     // ② 合成注入触摸（点击点==球心时落回球上）会让 UILongPress 收 2nd touch 取消。
@@ -1391,14 +1387,15 @@ static void FTTweakInitCallback(void *ctx) {
             BOOL onBall = (loc.x >= bf.origin.x && loc.x <= bf.origin.x + bf.size.width &&
                           loc.y >= bf.origin.y && loc.y <= bf.origin.y + bf.size.height);
             void *tp = (__bridge void *)t;
+            // v1.0.100：非球上触摸（主屏/App 窗口）→ 捕获其 SID 为 g_MainSID（注入首选）。
+            // 球上触摸是手势服务翻译值（0x1000007af 类，注入顶掉用户手指），绝不捕获。
+            if (!onBall) {
+                FT_HIDCaptureMainSIDFromUIEvent((__bridge void *)event);
+            }
             if (ph == 0) {                                   // Began
                 if (onBall && gBallTouch == NULL) {
                     gBallTouch = tp;
                     gBallTouchDownTime = now;
-                    // v1.0.98：注入 SID 动态跟随用户手指（同源 → 不顶掉）。
-                    // Dopamine 重启后设备 SID 会变（ctor-70：captured[0] 从 0x100000709
-                    // 变 0x1000006f0 → 顶掉回归），必须用用户手指当前触摸的 SID 注入。
-                    FT_HIDCaptureUserFingerSIDFromUIEvent((__bridge void *)event);
                     // v1.0.80：若正在连点且系统因注入把上一根手指 Ended 后重发了 Began
                     // （用户仍物理按着），重绑并【取消松手宽限】，连点继续。
                     if (gIsClicking) {
@@ -1503,14 +1500,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.99 loaded (captured-first SID like ctor-69; cleanup on start+stop; up-delay 25ms)");
+    syslog(LOG_ERR, "FloatingTap v1.0.100 loaded (main-window SID primary - ball touch is translated garbage)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.99 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; captured-first SID; cleanup start+stop; up-delay 25ms)\n");
+            fprintf(mk, "FloatingTap v1.0.100 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; main-window SID primary; cleanup start+stop)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

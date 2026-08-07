@@ -402,15 +402,18 @@ void FT_HIDCaptureSenderIDFromUIEvent(void *event) {
     }
 }
 
-// v1.0.98：注入 SID 动态跟随【用户手指】——顶掉用户手指的机制与 SID 是否「同源」强相关：
-// 注入 SID 与用户手指当前触摸的 SID 相同 → 系统当「同源第二根手指」→ 不重置触摸上下文
-// （不顶掉）；不同源 → 当「新触摸源」→ 重置（顶掉）。Dopamine 每次重新激活分配的设备
-// SID 会变（ctor-69 重启前 captured[0]=0x100000709 不顶掉、clicks 155；ctor-70 重启后
-// captured[0]=0x1000006f0 顶掉、clicks 25）——captured[0] 是「首个捕获」未必是用户手指。
-// 此函数在 sendEvent 检测到【球上用户手指 Began】时调用，把该事件的 senderID 存为
-// g_UserSID，FT_DispatchEvent 首选它（保证与用户手指同源）。
-static uint64_t g_UserSID = 0;
-void FT_HIDCaptureUserFingerSIDFromUIEvent(void *event) {
+// ⚠️ v1.0.100 定案（ctor-69/71/72 三会话数据）：**有效 SID = 「普通窗口触摸」的 SID**。
+//   · ctor-69：candidate #1=0x100000709（有效，clicks 155 不顶掉）、#2=0x1000007af——同一会话
+//     两个 SID，一个是主屏 digitizer（有效），一个是手势服务翻译值（无效）；
+//   · ctor-72：user finger SID=0x1000007af（球上 Began 读到）= 手势服务翻译值 → 注入它顶掉；
+//   · 结论：球在 _UISystemGestureWindow 里，**球上触摸被手势服务翻译成 0x1000007xx 无效值**；
+//     注入必须用【非球上（主屏/App 窗口）触摸】的 SID（0x100000709 类，系统认领、不顶掉）。
+//   · 因此 v1.0.98 的 g_UserSID（读球上触摸）方向错误，v1.0.99 的 captured[0] 若来自球上
+//     触摸（用户先双击球）也无效。v1.0.100：捕获只认【非球上触摸】→ g_MainSID 首选。
+static uint64_t g_MainSID = 0;   // v1.0.100：非球上（主屏/App 窗口）触摸的 SID（有效）
+// 从 UIEvent 读 _hidEvent senderID → g_MainSID + 收入候选集（去重）。仅由 Tweak.xm 在
+// 【确认该事件不含球上触摸】时调用（纯 C 绕 ARC，object_getInstanceVariable 放 .c）。
+void FT_HIDCaptureMainSIDFromUIEvent(void *event) {
     if (!event) return;
     if (!FT_HIDLoadSymbols()) return;
     if (!p_IOHIDEventGetSenderID) return;
@@ -420,11 +423,23 @@ void FT_HIDCaptureUserFingerSIDFromUIEvent(void *event) {
     object_getInstanceVariable((id)event, "_hidEvent", (void **)&hid);
     if (!hid) return;
     uint64_t sid = (uint64_t)p_IOHIDEventGetSenderID(hid);
-    if (!sid || sid == g_UserSID) return;
-    g_UserSID = sid;
-    char dbg[96];
-    snprintf(dbg, sizeof(dbg), "user finger SID: 0x%llx", (unsigned long long)sid);
-    FTHIDLog(dbg);
+    if (!sid) return;
+    if (g_MainSID == 0) {
+        g_MainSID = sid;
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg), "main (non-ball) SID: 0x%llx", (unsigned long long)sid);
+        FTHIDLog(dbg);
+    }
+    if (g_OverrideSenderID == 0) g_OverrideSenderID = sid;
+    for (int i = 0; i < g_CapturedSIDCount; i++) {
+        if (g_CapturedSIDs[i] == sid) return;
+    }
+    if (g_CapturedSIDCount < 12) {
+        g_CapturedSIDs[g_CapturedSIDCount++] = sid;
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg), "senderID candidate #%d: 0x%llx", g_CapturedSIDCount, (unsigned long long)sid);
+        FTHIDLog(dbg);
+    }
 }
 
 // MARK: - 事件构造
@@ -542,10 +557,11 @@ static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint3
     if (!g_PrimarySIDFellBack && g_PrimarySID) {
         sid = g_PrimarySID; // registryID（真实服务 SID）——若送达且同源则理想
     } else {
-        // v1.0.99：注入路径恢复 ctor-69 完美形态——首选 captured[0]（首个捕获的真实触摸
-        // SID）。v1.0.98 改用 g_UserSID 首选后顶掉回归（ctor-71 clicks 22-27）；ctor-69
-        // 用 captured[0]=0x100000709 时不顶掉（clicks 155）。g_UserSID 仅保留诊断。
+        // v1.0.100：首选【非球上（主屏/App 窗口）触摸 SID】g_MainSID——球上触摸被手势
+        // 服务翻译成 0x1000007af 类无效值（注入顶掉用户手指，ctor-72 铁证）；主屏 digitizer
+        // SID（0x100000709 类）系统认领、不顶掉（ctor-69 完美）。captured[0] 兜底。
         sid = g_WorkingSID;
+        if (!sid && g_MainSID) sid = g_MainSID;
         if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
         if (!sid) sid = 0x1000007adULL;
     }
