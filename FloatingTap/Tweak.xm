@@ -132,6 +132,7 @@ static uint32_t gTapIndex = 0;              // 每次 tap 递增的 index（区�
 static double  gClickLockX = 0.5;           // 连点锁定坐标 = 点击点标记位置（与球解耦，由标记拖动/App 配置设定）
 static double  gClickLockY = 0.5;
 static dispatch_source_t gClickTimer = NULL; // 连点定时器（SB 端直接注入用）
+static dispatch_source_t gBallSimTimer = NULL; // v1.0.93：模拟手指定时器（球上注入触摸，让连点持续）
 
 // v1.0.50：AutoTap App 配置（位置/间隔）——定义在 FTIntervalMs 之前（它要读）
 static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 10.0;
@@ -549,6 +550,41 @@ static void FTSyntheticTap(double px, double py) {
     }
 }
 
+// v1.0.93：模拟手指——在【球中心】注入 down/up（60ms 周期），让系统/触摸追踪持续看到
+// "球上有手指活动"。背景：注入点击会顶掉用户按住球的手指（系统机制，试遍 senderID 无法
+// 避免），静止时系统不重发 Began → 400ms 宽限停（连点每 ~40 次断一轮）。用户提议"自动
+// 模拟手指动"：定期在球上注入触摸 → sendEvent 追踪看到"球上 Began"（重绑、取消宽限）→
+// 连点持续不断（用户手指动/不动都不再中断）。停止 = 双击切模式（现有）。模拟触摸落在
+// 球上（subview）会被手势窗口收口、不透传 App，仅用于驱动我们的追踪，不影响点击注入。
+static void FTSyntheticBallSimTap(void) {
+    if (!gBallView) return;
+    CGRect bf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
+    double cx = bf.origin.x + bf.size.width * 0.5;
+    double cy = bf.origin.y + bf.size.height * 0.5;
+    double ux = (gScreenW > 0) ? cx / gScreenW : 0.5;
+    double uy = (gScreenH > 0) ? cy / gScreenH : 0.5;
+    if (ux < 0.001) ux = 0.001; if (ux > 0.999) ux = 0.999;
+    if (uy < 0.001) uy = 0.001; if (uy > 0.999) uy = 0.999;
+    double nx = ux, ny = uy;
+    FTOrientForHID(ux, uy, &nx, &ny);
+    gTapIndex = (gTapIndex % 19) + 1;
+    uint32_t idx = gTapIndex;
+    FT_HIDDispatchDown(nx, ny, idx);
+    FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
+    if (c) {
+        c->x = nx; c->y = ny; c->index = idx;
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)),
+                         dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
+    }
+}
+
+// v1.0.93：模拟手指定时器回调（60ms 周期）
+static void FTBallSimTimerCB(void *ctx) {
+    (void)ctx;
+    if (!gIsClicking) return;
+    FTSyntheticBallSimTap();
+}
+
 // MARK: - SB 端注入（v1.0.62 起走系统 HID 服务，可命中前台 App）
 // v1.0.62：改为 IOHIDEventSystemClientDispatchEvent 系统级派发（HIDInject.c 的
 // FT_HIDDispatchDown/Up），事件由系统路由到前台 App——游戏内点击也有效。
@@ -657,6 +693,16 @@ static void FTStartClicking(void) {
     if (gClickPointView) {
         ((Msg_SetAlpha)objc_msgSend)(gClickPointView, sel_registerName("setAlpha:"), 0.0);
     }
+    // v1.0.93：启动模拟手指定时器——注入点击会顶掉用户按住的手指（系统机制），
+    // 静止时系统不重发 Began → 连点每 ~40 次断一轮。模拟手指让追踪持续重绑 → 连点不断。
+    gBallSimTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (gBallSimTimer) {
+        dispatch_source_set_timer(gBallSimTimer,
+                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)),
+                                  (uint64_t)(0.06 * NSEC_PER_SEC), 0);
+        dispatch_source_set_event_handler_f(gBallSimTimer, FTBallSimTimerCB);
+        dispatch_resume(gBallSimTimer);
+    }
     FTLog("clicking started");
 }
 
@@ -668,6 +714,10 @@ static void FTStopClicking(const char *reason) {
     if (gClickTimer) {
         dispatch_source_cancel(gClickTimer);
         gClickTimer = NULL;
+    }
+    if (gBallSimTimer) { // v1.0.93：停止模拟手指定时器
+        dispatch_source_cancel(gBallSimTimer);
+        gBallSimTimer = NULL;
     }
     if (gClickFlashView) {
         ((Msg_SetAlpha)objc_msgSend)(gClickFlashView, sel_registerName("setAlpha:"), 0.0); // 灭光圈
@@ -1450,14 +1500,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.92 loaded (pure-C callback captures original device senderID)");
+    syslog(LOG_ERR, "FloatingTap v1.0.93 loaded (ball-sim finger keeps combo continuous)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.92 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; callback original senderID; portrait-base coords)\n");
+            fprintf(mk, "FloatingTap v1.0.93 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; ball-sim finger; portrait-base coords)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
