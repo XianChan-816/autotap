@@ -23,6 +23,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <dispatch/dispatch.h>
+// v1.0.63：纯 C 文件内读 UIEvent 的 _hidEvent 需要 objc runtime（Tweak.xm 是 ARC，
+// object_getInstanceVariable 被禁；移到本 .c 文件绕开）。
+#include <objc/runtime.h>
 
 // MARK: - 私有类型与常量（本地前缀，避免与 SDK IOKit 头冲突）
 
@@ -89,6 +92,9 @@ static FT_IOHIDEventSystemClientRef g_hidClient = NULL;
 static bool g_hidLoaded = false;
 // v1.0.63：动态捕获的真实设备 senderID（0 表示未捕获，用兜底硬编码）
 static uint64_t g_OverrideSenderID = 0;
+
+// 前向声明（定义在文件后部「诊断日志」段，但 FT_HIDConnect 等前面函数要用）
+static void FTHIDLog(const char *msg);
 
 // MARK: - 符号解析（C 静态 flag 代替 dispatch_once）
 
@@ -202,6 +208,23 @@ uint64_t FT_HIDGetSenderIDFromEvent(FT_IOHIDEventRef event) {
     if (!FT_HIDLoadSymbols()) return 0;
     if (!p_IOHIDEventGetSenderID) return 0;
     return (uint64_t)p_IOHIDEventGetSenderID(event);
+}
+
+// v1.0.63：从真实触摸 UIEvent 读 _hidEvent 的 senderID 并缓存（放在 .c 文件，
+// 绕开 Theos 对 Tweak.xm 的 ARC 限制——object_getInstanceVariable 在 ARC 下被禁用）。
+// Tweak.xm 的 sendEvent: hook 调本函数即可。持续用真实设备值覆盖硬编码。
+void FT_HIDCaptureSenderIDFromUIEvent(void *event) {
+    if (!event) return;
+    if (!FT_HIDLoadSymbols()) return;
+    if (!p_IOHIDEventGetSenderID) return;
+    Ivar hidIvar = class_getInstanceVariable(object_getClass((id)event), "_hidEvent");
+    if (!hidIvar) return;
+    FT_IOHIDEventRef hid = NULL;
+    object_getInstanceVariable((id)event, "_hidEvent", (void **)&hid);
+    if (hid) {
+        uint64_t sid = (uint64_t)p_IOHIDEventGetSenderID(hid);
+        if (sid) g_OverrideSenderID = sid;
+    }
 }
 
 // MARK: - 事件构造

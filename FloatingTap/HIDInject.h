@@ -55,6 +55,11 @@ void FT_HIDSetSenderID(uint64_t sid);
 // v1.0.63：从 IOHIDEvent 读取 senderID（返回 0 表示无效 / 无法读取）。
 uint64_t FT_HIDGetSenderIDFromEvent(FT_IOHIDEventRef event);
 
+// v1.0.63：从真实触摸 UIEvent 读 _hidEvent 的 senderID 并缓存（纯 C 实现，放在 .c 文件
+// 以绕开 Theos 对 Tweak.xm 的 ARC 限制——object_getInstanceVariable 在 ARC 下被禁用）。
+// 由 Tweak.xm 的 sendEvent: hook 调用，参数传 (__bridge void *)event。
+void FT_HIDCaptureSenderIDFromUIEvent(void *event);
+
 #ifdef __cplusplus
 }
 #endif

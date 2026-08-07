@@ -1026,20 +1026,12 @@ static void FTTweakInitCallback(void *ctx) {
             FTLog("captured system gesture window from sendEvent");
         }
     }
-    // v1.0.63：从真实触摸事件的 _hidEvent 动态捕获设备 senderID。
-    // 这是让系统认领合成事件、产生真实点击的关键——硬编码 senderID 在 Dopamine
-    // rootless + iOS 15.5 上会被系统静默丢弃（派发 ret=success 但无触摸）。
-    // 持续用真实设备值覆盖即可（FT_HIDSetSenderID 内部只在非零时更新）。
+    // v1.0.63：从真实触摸事件的 _hidEvent 动态捕获设备 senderID（逻辑在 HIDInject.c，
+    // 纯 C 绕开 Theos 对 Tweak.xm 的 ARC 限制——object_getInstanceVariable 在 ARC 下禁用）。
+    // 这是让系统认领合成事件、产生真实点击的关键：硬编码 senderID 在 Dopamine rootless
+    // + iOS 15.5 上会被系统静默丢弃（派发 ret=success 但无触摸）。
     if (event) {
-        Ivar hidIvar = class_getInstanceVariable(object_getClass(event), "_hidEvent");
-        if (hidIvar) {
-            FT_IOHIDEventRef hid = NULL;
-            object_getInstanceVariable(event, "_hidEvent", (void **)&hid);
-            if (hid) {
-                uint64_t sid = FT_HIDGetSenderIDFromEvent(hid);
-                if (sid) FT_HIDSetSenderID(sid);
-            }
-        }
+        FT_HIDCaptureSenderIDFromUIEvent((__bridge void *)event);
     }
     static double sLastDiag = 0;
     struct timespec ts;
