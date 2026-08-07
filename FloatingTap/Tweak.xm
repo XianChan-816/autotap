@@ -1098,14 +1098,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.65 loaded (pure C ctor, ball on _UISystemGestureWindow; ios-mcp event struct; system HID dispatch)");
+    syslog(LOG_ERR, "FloatingTap v1.0.66 loaded (pure C ctor, ball on _UISystemGestureWindow; fixed finger event signature; system HID dispatch)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.65 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; ios-mcp event struct; system HID dispatch)\n");
+            fprintf(mk, "FloatingTap v1.0.66 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; fixed finger event signature; system HID dispatch)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
