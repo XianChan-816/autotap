@@ -522,27 +522,43 @@ void FT_HIDDispatchUp(double normalizedX, double normalizedY, uint32_t index) {
                      normalizedX, normalizedY, index, false);
 }
 
-// v1.0.83：连点停止时强制「抬全手」——派发一个 hand-only up 事件
-// （parent: hand index=99, Range=0/Touch=0, EventMask=0x02，无子事件），
-// 让系统把该合成 hand 的所有残留子手指一次抬起。
-// ⚠️ v1.0.85 修正（ctor-57）：parent-only 事件 ret=0x2cf4000/0x880000 全失败（系统不认），
-// 改为派发【正常 up 事件】（带 finger 子事件，与 per-tap 相同的构造）覆盖 index 1~8，
-// 用首选 senderID（captured[0]）——只有被送达的 up 才能闭合残留的合成手指。
+// v1.0.83：连点停止时「抬全手」——派发一个 hand-only up 事件
+// （parent: hand index=99, Range=0/Touch=0, EventMask=0x02，无子事件），尝试抬起合成 hand。
+// ⚠️ v1.0.87 回归（ctor-59 铁证）：v1.0.85 改为派发 8 个【正常 up 事件】（index 1~8、
+// 屏幕中心 0.5,0.5）后，用户所有 App 全部收不到点击（备忘录无笔点、计数器不计数、
+// 桌面无反应）——SEND 日志显示合成触摸只到 SB 手势窗口、不透传到前台 App；
+// 而 v1.0.83 用 parent-only（ret=0x2cf4000 失败但无害）时点击有效（计数器 41+ 下）。
+// 8-up 事件（中心坐标 + 无匹配 down）会破坏系统触摸路由。恢复 parent-only 单事件。
 void FT_HIDRaiseAllSyntheticUp(void) {
-    if (!FT_HIDConnect()) return;
+    if (!g_hidClient) return;
+    if (!FT_HIDLoadSymbols()) return;
+    if (!p_IOHIDEventCreateDigitizerEvent) return;
+    uint64_t ts = mach_absolute_time();
+    // 15 参签名：alloc, ts, type=Hand(3), index=99, identity=1, eventMask=0, buttonMask=0,
+    // x=0, y=0, z=0, tipPressure=0, barrelPressure=0, range=0, touch=0, options=0
+    FT_IOHIDEventRef ev = p_IOHIDEventCreateDigitizerEvent(
+        kCFAllocatorDefault, ts,
+        3, 99, 1,
+        0, 0,
+        0.0, 0.0, 0.0,
+        0.0, 0.0,
+        0, 0, 0);
+    if (!ev) return;
+    if (p_IOHIDEventSetIntegerValue) {
+        p_IOHIDEventSetIntegerValue(ev, 0x0B0017, 1); // DisplayIntegrated
+        p_IOHIDEventSetIntegerValue(ev, 0x0B0019, 1);
+        p_IOHIDEventSetIntegerValue(ev, 0x4, 1);
+        p_IOHIDEventSetIntegerValue(ev, 0x0B0007, 0x02); // EventMask = Touch-only（up 态）
+        p_IOHIDEventSetIntegerValue(ev, 0x0B0006, 0);    // Range = 0
+        p_IOHIDEventSetIntegerValue(ev, 0x0B0008, 0);    // Touch = 0
+    }
     uint64_t sid = g_WorkingSID;
     if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
     if (!sid) sid = 0x1000007adULL;
-    int sent = 0;
-    for (uint32_t i = 1; i <= 8; i++) {
-        FT_IOHIDEventRef ev = FT_HIDCreateDigitizerEvent(false, 0.5, 0.5, i);
-        if (!ev) continue;
-        p_IOHIDEventSetSenderID(ev, sid);
-        p_IOHIDEventSystemClientDispatchEvent(g_hidClient, ev);
-        CFRelease(ev);
-        sent++;
-    }
+    p_IOHIDEventSetSenderID(ev, sid);
+    FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, ev);
+    CFRelease(ev);
     char dbg[96];
-    snprintf(dbg, sizeof(dbg), "raise all synthetic up: %d ups (SID=0x%llx)", sent, (unsigned long long)sid);
+    snprintf(dbg, sizeof(dbg), "hand-up raise all (SID=0x%llx) ret=0x%x", (unsigned long long)sid, (unsigned)ret);
     FTHIDLog(dbg);
 }
