@@ -310,18 +310,26 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
     return parent;
 }
 
-static void FT_DispatchEvent(FT_IOHIDEventRef event) {
+static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint32_t index, bool down) {
     if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
-    // 先用当前 senderID（优先捕获到的真实设备值，兜底硬编码 0x8000000817371935）
-    p_IOHIDEventSetSenderID(event, FT_HIDSenderID());
+    // v1.0.70：优先用社区通用硬编码 senderID（kIOHIDEventDigitizerSenderID=0x8000000817371935），
+    // 动态捕获的设备 senderID 仅作兜底（ctor-40 实测捕获值 0x1000007af 派发 0x1 被拒）。
+    p_IOHIDEventSetSenderID(event, 0x8000000817371935ULL);
     FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, event);
     if (ret != FT_kIOReturnSuccess && g_OverrideSenderID != 0) {
-        // 捕获到的 senderID 派发失败 → 自动回退到社区通用硬编码值再试一次（诊断用）
-        p_IOHIDEventSetSenderID(event, 0x8000000817371935ULL);
-        ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, event);
-        char dbg[96];
-        snprintf(dbg, sizeof(dbg), "DispatchEvent retry(hardcoded SID) ret=0x%x", (unsigned)ret);
-        FTHIDLog(dbg);
+        // ⚠️ 首次派发即便失败也可能已"消耗/失效"该事件对象，重试必须重建全新事件，
+        // 否则对同一 event ref 二次派发必然再失败（ctor-40 硬编码 retry 也 0x1 的真凶）。
+        CFRelease(event);
+        FT_IOHIDEventRef ev2 = FT_HIDCreateDigitizerEvent(down, nx, ny, index);
+        if (ev2) {
+            p_IOHIDEventSetSenderID(ev2, g_OverrideSenderID);
+            ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, ev2);
+            char dbg[96];
+            snprintf(dbg, sizeof(dbg), "DispatchEvent retry(captured) ret=0x%x", (unsigned)ret);
+            FTHIDLog(dbg);
+            CFRelease(ev2);
+            return;
+        }
     }
     if (ret != FT_kIOReturnSuccess) {
         char dbg[96];
@@ -335,8 +343,8 @@ static void FT_DispatchEvent(FT_IOHIDEventRef event) {
 
 void FT_HIDTapAt(double normalizedX, double normalizedY) {
     if (!g_hidClient) return;
-    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(true, normalizedX, normalizedY, 1));
-    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(false, normalizedX, normalizedY, 1));
+    FT_HIDDispatchDown(normalizedX, normalizedY, 1);
+    FT_HIDDispatchUp(normalizedX, normalizedY, 1);
 }
 
 // v1.0.62：down/up 单独派发到系统 HID 服务（供 Tweak.xm 的 down-now/up-延迟 模式复用）。
@@ -347,7 +355,8 @@ void FT_HIDDispatchDown(double normalizedX, double normalizedY, uint32_t index) 
         syslog(LOG_ERR, "FloatingTap HID dispatch down: not connected");
         return;
     }
-    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(true, normalizedX, normalizedY, index));
+    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(true, normalizedX, normalizedY, index),
+                     normalizedX, normalizedY, index, true);
 }
 
 void FT_HIDDispatchUp(double normalizedX, double normalizedY, uint32_t index) {
@@ -355,5 +364,6 @@ void FT_HIDDispatchUp(double normalizedX, double normalizedY, uint32_t index) {
         syslog(LOG_ERR, "FloatingTap HID dispatch up: not connected");
         return;
     }
-    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(false, normalizedX, normalizedY, index));
+    FT_DispatchEvent(FT_HIDCreateDigitizerEvent(false, normalizedX, normalizedY, index),
+                     normalizedX, normalizedY, index, false);
 }

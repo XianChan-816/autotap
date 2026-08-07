@@ -119,7 +119,7 @@ static double  gClickLockY = 0.5;
 static dispatch_source_t gClickTimer = NULL; // 连点定时器（SB 端直接注入用）
 
 // v1.0.50：AutoTap App 配置（位置/间隔）——定义在 FTIntervalMs 之前（它要读）
-static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 12.0;
+static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 10.0;
 static int  gCfgLoaded = 0;
 
 // MARK: - 诊断日志（append 到标记文件，Filza 可见；带单调时间戳）
@@ -197,14 +197,14 @@ static double FTIntervalMs(void) {
     if (gCfgLoaded && gCfgMs >= 1.0) return gCfgMs;
     FILE *f = fopen("/var/mobile/Library/Preferences/com.floatingtap.cfg", "r");
     if (f) {
-        double v = 12.0;
+        double v = 10.0;
         if (fscanf(f, "%lf", &v) == 1 && v >= 1.0 && v <= 60000.0) {
             fclose(f);
             return v;
         }
         fclose(f);
     }
-    return 12.0;
+    return 10.0;
 }
 
 // MARK: - App 通信（v1.0.53：CFPreferences 共享偏好，cfprefsd 守护进程跨进程共享）
@@ -255,7 +255,7 @@ static void FTAppsListDeferredCallback(void *ctx);
 // 应用共享偏好里的 config（CoreFoundation CFDictionary，纯 C，无 ObjC）
 static void FTApplyConfigFromPrefs(CFDictionaryRef dict) {
     if (!dict || CFGetTypeID(dict) != CFDictionaryGetTypeID()) return;
-    double nx = 0.5, ny = 0.5, ms = 400.0;
+    double nx = 0.5, ny = 0.5, ms = 10.0;
     CFStringRef kX = FTCreateCFStr("ClickX");
     CFStringRef kY = FTCreateCFStr("ClickY");
     CFStringRef kMs = FTCreateCFStr("IntervalMs");
@@ -269,7 +269,7 @@ static void FTApplyConfigFromPrefs(CFDictionaryRef dict) {
     if (kX) CFRelease(kX); if (kY) CFRelease(kY); if (kMs) CFRelease(kMs);
     if (nx < 0) nx = 0; if (nx > 1) nx = 1;
     if (ny < 0) ny = 0; if (ny > 1) ny = 1;
-    if (ms < 1) ms = 400;
+    if (ms < 1) ms = 10;
     gCfgX = nx; gCfgY = ny; gCfgMs = ms;
     gCfgLoaded = 1;
     FTMoveBallToConfig();
@@ -468,11 +468,49 @@ static void FTSendHIDUpCallback(void *ctx) {
 }
 
 // 在屏幕像素点 (px,py) 发一次合成点击（down 立即 + up 延迟 50ms；每次 tap index 递增）
+// 取当前界面方向（UIInterfaceOrientation：1=竖屏 2=竖屏倒 3=横屏左(home左) 4=横屏右(home右)）
+static NSInteger FTGetOrientation(void) {
+    // 优先用活跃 windowScene 的 interfaceOrientation（iOS 13+ 现代 API，最可靠）
+    id scene = FTGetActiveWindowScene();
+    if (scene) {
+        NSInteger o = ((Msg_Int)objc_msgSend)(scene, sel_registerName("interfaceOrientation"));
+        if (o >= 1 && o <= 4) return o;
+    }
+    // 兜底：UIApplication.statusBarOrientation
+    Class ClsApp = objc_getClass("UIApplication");
+    if (ClsApp) {
+        id app = ((Msg_Send)objc_msgSend)((id)ClsApp, sel_registerName("sharedApplication"));
+        if (app) {
+            NSInteger o = ((Msg_Int)objc_msgSend)(app, sel_registerName("statusBarOrientation"));
+            if (o >= 1 && o <= 4) return o;
+        }
+    }
+    return 1; // 默认竖屏
+}
+
+// v1.0.70：UIKit 归一化坐标（当前界面方向，UIScreen.bounds 得出）转 HID digitizer 原生（竖屏）坐标。
+// iPad 横屏游戏下 bounds 是横屏尺寸，但 IOHIDEvent 的 digitizer 坐标走硬件原生竖屏空间，
+// 不转换会导致点击点旋转 90° 偏移（"真实点击点不在标记处"的根因）。
+static void FTOrientForHID(double ox, double oy, double *nx, double *ny) {
+    NSInteger o = FTGetOrientation();
+    switch (o) {
+        case 2: *nx = 1 - ox; *ny = 1 - oy; break;        // 竖屏倒
+        case 3: *nx = 1 - oy; *ny = 1 - ox; break;         // 横屏左（home 左）
+        case 4: *nx = oy;     *ny = ox;     break;         // 横屏右（home 右）
+        case 1:
+        default: *nx = ox; *ny = oy; break;                // 竖屏
+    }
+}
+
 static void FTSyntheticTap(double px, double py) {
-    double nx = (gScreenW > 0) ? px / gScreenW : 0.5;
-    double ny = (gScreenH > 0) ? py / gScreenH : 0.5;
-    if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
-    if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
+    double ux = (gScreenW > 0) ? px / gScreenW : 0.5;
+    double uy = (gScreenH > 0) ? py / gScreenH : 0.5;
+    if (ux < 0.001) ux = 0.001; if (ux > 0.999) ux = 0.999;
+    if (uy < 0.001) uy = 0.001; if (uy > 0.999) uy = 0.999;
+
+    // 转换到 HID 原生竖屏坐标空间
+    double nx = ux, ny = uy;
+    FTOrientForHID(ux, uy, &nx, &ny);
 
     // 每次 tap 递增 index（v1.0.45：避免系统把连续注入事件串成同一触摸流）
     gTapIndex = (gTapIndex % 19) + 1;
@@ -494,39 +532,23 @@ static void FTSyntheticTap(double px, double py) {
 // 旧版（v1.0.41~61）用 SpringBoard 的 UIApplication._handleHIDEvent: 只喂 SB 自身 UI 队列，
 // 前台 App 收不到 → 注入日志有、但无点击反馈。
 
-static void FTRestoreBallVisibilityCallback(void *ctx);
-
-// 连点回调：在锁定坐标发一次合成点击。
-// ⚠️ 注入点 = 球心（球所在即点击目标）。注入瞬间把球 alpha 设为 0 → hitTest 穿透到下层
-// （图标/按钮），合成点击真正打到目标上。
-// 关键：不能用 setUserInteractionEnabled:NO —— 关交互会让 iOS 把球上的「长按手势」判为
-// Cancelled，导致 FTStopClicking 立即被调、连点只点 1 下就停。alpha 变化不会取消手势，
-// 所以长按能一直活到松手，连点循环持续跑。恢复窗口 50ms（小于连点间隔，且足以让
-// runloop 处理完注入事件）。
+// 连点回调：在点击点标记坐标发一次合成点击。
+// v1.0.70：不再把球设为 alpha=0——实测 iOS 15.5 下改 alpha 会让长按手势被判 Cancelled，
+// 导致连点定时器被立刻取消（只点 1 下就停、10s 仅数下）。点击点已独立成「标记视图」，
+// 连击模式下 marker 的 userInteractionEnabled=NO → 合成点击直接穿透到下层 App，无需隐藏球。
 static void FTClickCallback(void *ctx) {
     (void)ctx;
     if (!gBallView || !gIsClicking) return;
 
-    // 注入前：球变透明 → 注入触摸穿透到下层目标
-    ((Msg_SetAlpha)objc_msgSend)(gBallView, sel_registerName("setAlpha:"), 0.0);
-
     FTSyntheticTap(gClickLockX * gScreenW, gClickLockY * gScreenH);
     gClickCount++;
 
-    char diag[96];
-    snprintf(diag, sizeof(diag), "inject tap nx=%.2f ny=%.2f", gClickLockX, gClickLockY);
+    double hx = gClickLockX, hy = gClickLockY;
+    FTOrientForHID(gClickLockX, gClickLockY, &hx, &hy);
+    char diag[160];
+    snprintf(diag, sizeof(diag), "inject tap uik=%.2f,%.2f hid=%.2f,%.2f orient=%ld",
+             gClickLockX, gClickLockY, hx, hy, (long)FTGetOrientation());
     FTLog(diag);
-
-    // 50ms 后恢复可见（连点间隔一般 >=100ms，恢复后用户可松手停止）
-    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
-                     dispatch_get_main_queue(), NULL, FTRestoreBallVisibilityCallback);
-}
-
-static void FTRestoreBallVisibilityCallback(void *ctx) {
-    (void)ctx;
-    if (gBallView) {
-        ((Msg_SetAlpha)objc_msgSend)(gBallView, sel_registerName("setAlpha:"), 1.0);
-    }
 }
 
 // 诊断：dump UIEvent 的 ivar 名（已确认有 _hidEvent/_gsEvent）
@@ -1225,14 +1247,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.69 loaded (decoupled click-point marker; double-tap=move ball+click-point; long-press=combo at click point; 12ms default)");
+    syslog(LOG_ERR, "FloatingTap v1.0.70 loaded (decoupled click-point marker; orientation-aware HID coord; long-press combo no-alpha; 10ms default)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.67 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; corrected 13-param finger event sig; system HID dispatch)\n");
+            fprintf(mk, "FloatingTap v1.0.70 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; orientation-aware HID coord; system HID dispatch)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
