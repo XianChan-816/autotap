@@ -73,7 +73,11 @@ static void (*p_IOHIDEventSetIntegerValue)(FT_IOHIDEventRef, uint32_t, int64_t);
 static void (*p_IOHIDEventSetFloatValue)(FT_IOHIDEventRef, uint32_t, double);
 static uint32_t (*p_IOHIDEventGetType)(FT_IOHIDEventRef);
 static uint64_t (*p_IOHIDEventGetSenderID)(FT_IOHIDEventRef);
-// 注：client 级 senderID 设置符号 (IOHIDEventSystemClientSetSenderID) 已弃用（v1.0.64）——设错会致 DispatchEvent 0x1。
+// v1.0.89 实验：client 级 senderID（v1.0.64 弃用）——设成【真实捕获的设备 senderID】后，
+// 系统可能认为本 client 就是真实 digitizer → 注入不被当「未知设备」→ 不触发触摸上下文
+// 重置 → 用户按住的手指不再被注入顶掉（Ended）→ 连点可持续（ctor-62：每轮 400ms 就
+// hold-release 停，因为注入第一个 down 就把用户手指 Ended 且系统不重发 Began）。
+static void (*p_IOHIDEventSystemClientSetSenderID)(FT_IOHIDEventSystemClientRef, uint64_t);
 // ⚠️ 子事件签名铁律（v1.0.67，来自 SimulateTouch 对系统函数的 hook 反编译，权威）：
 //   IOHIDEventCreateDigitizerFingerEvent(allocator, ts, index, identity, eventMask,
 //       IOHIDFloat x, IOHIDFloat y, IOHIDFloat z,
@@ -147,6 +151,9 @@ static bool FT_HIDLoadSymbols(void) {
         (void (*)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef))dlsym(handle, "IOHIDEventSystemClientScheduleWithRunLoop");
     p_IOHIDEventSetSenderID =
         (void (*)(FT_IOHIDEventRef, uint64_t))dlsym(handle, "IOHIDEventSetSenderID");
+    // v1.0.89：client 级 senderID（可选符号）
+    p_IOHIDEventSystemClientSetSenderID =
+        (void (*)(FT_IOHIDEventSystemClientRef, uint64_t))dlsym(handle, "IOHIDEventSystemClientSetSenderID");
     p_IOHIDEventSetIntegerValue =
         (void (*)(FT_IOHIDEventRef, uint32_t, int64_t))dlsym(handle, "IOHIDEventSetIntegerValue");
     // v1.0.64：float 字段设置 + 事件类型读取（筛选 digitizer 事件）
@@ -287,12 +294,22 @@ bool FT_HIDConnect(void) {
     }
     // v1.0.64：不再设置 client 级 senderID——zxtouch 经验是只设事件的 senderID，
     // client 设错误的 senderID 反而导致 DispatchEvent 返回 0x1（系统拒绝）。
+    // ⚠️ v1.0.89 实验：设【真实捕获的设备 senderID】而非硬编码——让系统认为本 client
+    // 就是真实 digitizer，注入不被当未知设备、不触发触摸上下文重置（用户手指不再被顶掉）。
     // 部分 iOS 版本需要 client 挂 runloop 才会真正派发事件（符号存在则挂，失败无害）
     if (p_IOHIDEventSystemClientScheduleWithRunLoop) {
         p_IOHIDEventSystemClientScheduleWithRunLoop(g_hidClient, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
     }
     // v1.0.79：枚举服务收 senderID 候选（sendEvent 捕获不到系统接受的 SID）
     FT_HIDEnumerateServices();
+    // v1.0.89：client 级 senderID = 真实捕获设备值（captured[0] 或硬编码兜底）
+    if (p_IOHIDEventSystemClientSetSenderID) {
+        uint64_t csid = g_CapturedSIDCount > 0 ? g_CapturedSIDs[0] : FT_HIDSenderID();
+        p_IOHIDEventSystemClientSetSenderID(g_hidClient, csid);
+        char dbg2[128];
+        snprintf(dbg2, sizeof(dbg2), "client senderID set: 0x%llx", (unsigned long long)csid);
+        FTHIDLog(dbg2);
+    }
     char dbg[128];
     snprintf(dbg, sizeof(dbg), "HID connected (senderID=0x%llx override=%d)",
              (unsigned long long)FT_HIDSenderID(), g_OverrideSenderID ? 1 : 0);
@@ -367,6 +384,14 @@ void FT_HIDCaptureSenderIDFromUIEvent(void *event) {
         char dbg[96];
         snprintf(dbg, sizeof(dbg), "senderID candidate #%d: 0x%llx", g_CapturedSIDCount, (unsigned long long)sid);
         FTHIDLog(dbg);
+        // v1.0.89：首个捕获的真实设备 SID 立即同步到 client 级（系统认领本 client
+        // 为真实 digitizer → 注入不再触发触摸上下文重置 → 用户按住的手指不被顶掉）
+        if (g_CapturedSIDCount == 1 && g_hidClient && p_IOHIDEventSystemClientSetSenderID) {
+            p_IOHIDEventSystemClientSetSenderID(g_hidClient, sid);
+            char dbg2[96];
+            snprintf(dbg2, sizeof(dbg2), "client senderID updated: 0x%llx", (unsigned long long)sid);
+            FTHIDLog(dbg2);
+        }
     }
 }
 
