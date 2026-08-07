@@ -508,32 +508,17 @@ static NSInteger FTGetOrientation(void) {
     return 1; // 默认竖屏
 }
 
-// v1.0.74：曾判定「窗口坐标 = digitizer 原生空间，直接透传」——仅竖屏成立。
-// v1.0.84 实测修正（ctor-56 横屏微信）：_UISystemGestureWindow 的 bounds 是【横屏尺寸】
-// （球 frame=569,389 证实 gScreenW=1194, gScreenH=834），但系统把注入的 digitizer 归一化
-// 坐标按【竖屏基准（短边×长边）】换算后放进窗口 → 横屏下注入点与标记错位约 52°/240px
-// （注入 0.40,0.52 → 窗口 329.5,624.0；标记在 477.6,433.7）。修正：横屏时把窗口归一化
-// 按 W/H 缩放换算回 digitizer 竖屏空间；竖屏保持透传（v1.0.74 验证正确）。
+// v1.0.86 定案：**恒透传**（恢复 v1.0.74 设计）。
+// 证据链（ctor-56/58）：_UISystemGestureWindow bounds 恒=竖屏基准 834×1194（SB 用
+// transform 旋转显示）；IOHID digitizer 归一化坐标按竖屏基准换算（注入 0.43,0.66 →
+// 窗口 358.5,790.5 = 0.43×834, 0.66×1194，SEND 实测）；标记/球 frame 同在此空间
+// （gScreenW/H 已锁竖屏基准）。注入透传 → SB 层命中标记 → 系统把触摸路由到 App 时与
+// 标记显示共用同一旋转 → App 层同样命中。横竖屏都不需要额外换算。
+// ⚠️ v1.0.84 的横屏缩放（nx=ox×W/H）是错的——它基于「gScreenW/H=方向尺寸」的错误前提，
+// 与竖屏基准窗口冲突；v1.0.70 的旋转公式同样基于错误前提。
 static void FTOrientForHID(double ox, double oy, double *nx, double *ny) {
-    NSInteger o = FTGetOrientation();
-    if (o == 3 || o == 4) { // 横屏：窗口(横屏 W×H) → digitizer(竖屏 H×W) 换算
-        double Ww = gScreenW, Hw = gScreenH;
-        if (Ww > 0 && Hw > 0 && Ww != Hw) {
-            // 注入 digitizer 归一化 nx×Hw = ox×Ww → nx = ox×Ww/Hw；ny 同理反向
-            *nx = ox * (Ww / Hw);
-            *ny = oy * (Hw / Ww);
-        } else {
-            *nx = ox; *ny = oy;
-        }
-    } else if (o == 2) { // 竖屏倒：上下翻转
-        *nx = 1 - ox;
-        *ny = 1 - oy;
-    } else { // 竖屏：透传（v1.0.74 验证正确）
-        *nx = ox;
-        *ny = oy;
-    }
-    if (*nx < 0.001) *nx = 0.001; if (*nx > 0.999) *nx = 0.999;
-    if (*ny < 0.001) *ny = 0.001; if (*ny > 0.999) *ny = 0.999;
+    *nx = ox;
+    *ny = oy;
 }
 
 static void FTSyntheticTap(double px, double py) {
@@ -1028,10 +1013,20 @@ static void FTSetupBall(void) {
     // 主屏尺寸
     id mainScreen = ((Msg_Send)objc_msgSend)((id)ClsScreen, sel_registerName("mainScreen"));
     CGRect sb = ((Msg_Bounds)objc_msgSend)(mainScreen, sel_registerName("bounds"));
-    gScreenW = sb.size.width;
-    gScreenH = sb.size.height;
+    // v1.0.86 关键修正：gScreenW/H 必须恒为【竖屏基准】（短边×长边）！
+    // 实测（ctor-56/58）：_UISystemGestureWindow 的 bounds 恒为竖屏 834×1194（SB 窗口用
+    // transform 旋转显示），IOHID digitizer 归一化换算也是此基准。若用「当前方向尺寸」
+    // （横屏启动时 1194×834）快照，标记 frame 与注入坐标基准错位 → 点击偏离标记
+    // （竖屏偏左下 ~286pt、横屏偏右下 50°/4cm，ctor-58 实测）。统一竖屏基准后透传即命中。
+    if (sb.size.width < sb.size.height) {
+        gScreenW = sb.size.width;
+        gScreenH = sb.size.height;
+    } else {
+        gScreenW = sb.size.height;
+        gScreenH = sb.size.width;
+    }
     CGFloat d = 56.0;
-    CGRect ballFrame = CGRectMake(sb.size.width / 2 - d / 2, sb.size.height / 2 - d / 2, d, d);
+    CGRect ballFrame = CGRectMake(gScreenW / 2 - d / 2, gScreenH / 2 - d / 2, d, d);
 
     // v1.0.60：球必须挂到 _UISystemGestureWindow（系统手势层，始终在所有 App 之上），
     // 游戏/前台 App 内才可见可点。但它是 internal window，[UIApplication windows] 枚举不到，
@@ -1442,14 +1437,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.85 loaded (senderID captured-first; normal-up cleanup; landscape coord conversion)");
+    syslog(LOG_ERR, "FloatingTap v1.0.86 loaded (portrait-base coords; passthrough orient; captured-first SID)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.85 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; senderID captured-first; normal-up cleanup; landscape coord conversion)\n");
+            fprintf(mk, "FloatingTap v1.0.86 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; portrait-base coords; passthrough orient; captured-first SID)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
