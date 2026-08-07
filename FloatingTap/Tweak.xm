@@ -123,6 +123,7 @@ static void FTStopGraceTimer(void *ctx);
 // （无规律可循），按住球时逐个候选 SID 注入探测 tap，双重判定（sendEvent 回流=送达、
 // 用户手指存活=不顶掉）后锁定 g_LockedSID；失败则等用户重按再试下一个候选。
 static BOOL   g_Probing = NO;        // 探测进行中（球变橙色提示）
+static BOOL   g_ProbeNeedMain = NO;  // v1.0.103：候选全失败 → 球变紫，提示先点屏幕别处
 static int    g_ProbeIdx = 0;        // 当前候选序号
 static BOOL   g_ProbeTouchEnded = NO; // 探测期间用户手指被顶掉（SID 无效）
 static BOOL   g_ProbeDelivered = NO;  // 探测期间合成触摸回流 sendEvent（SID 送达）
@@ -811,13 +812,14 @@ static void FTGRClickPanHandler(id self, SEL _cmd, id gr) {
     }
 }
 
-// 根据模式刷新小球外观：蓝色=连击模式，红色=拖动模式，橙色=探测校准中（v1.0.101）
+// 根据模式刷新小球外观：蓝色=连击模式，红色=拖动模式，橙色=探测校准中，紫色=需要主屏 SID
 static void FTApplyBallAppearance(void) {
     if (!gBallView) return;
     Class ClsColor = objc_getClass("UIColor");
     if (!ClsColor) return;
     CGFloat r, g, b, a;
-    if (g_Probing) { r = 1.0; g = 0.6; b = 0.0; a = 0.9; }     // 橙（SID 校准中）
+    if (g_ProbeNeedMain) { r = 0.6; g = 0.0; b = 1.0; a = 0.9; } // 紫（需点屏幕别处）
+    else if (g_Probing) { r = 1.0; g = 0.6; b = 0.0; a = 0.9; }     // 橙（SID 校准中）
     else if (gDragMode) { r = 1.0;  g = 0.231; b = 0.188; a = 0.9; }  // 红（拖动模式）
     else           { r = 0.0;  g = 0.478; b = 1.0;   a = 0.9; }  // 蓝（连击模式）
     id color = ((Msg_ColorWithRGBA)objc_msgSend)((id)ClsColor,
@@ -890,13 +892,15 @@ static void FTBuildProbeCandidates(void) {
     FTLog(dbg);
 }
 
-// 开始探测（从当前 g_ProbeIdx 继续；失败后用户重按会再进这里）
+// 开始探测（v1.0.103：每次重建候选集——用户点过屏幕别处后 g_MainSID 更新，必须重新纳入）
 static void FTStartProbing(void) {
     if (g_Probing) return;
-    if (g_ProbeSIDCount == 0) FTBuildProbeCandidates();
+    FTBuildProbeCandidates();
     g_Probing = YES;
+    g_ProbeIdx = 0;
     g_ProbeTouchEnded = NO;
     g_ProbeDelivered = NO;
+    g_ProbeNeedMain = NO; // 重新探测时清除紫色提示
     FTApplyBallAppearance(); // 橙色 = 校准中
     FTLog("probing: looking for a working senderID");
     FTProbeNext();
@@ -908,8 +912,10 @@ static void FTProbeNext(void) {
     if (g_ProbeIdx >= g_ProbeSIDCount) {
         g_Probing = NO;
         g_ProbeIdx = 0;
-        FTApplyBallAppearance(); // 回蓝色
-        FTLog("probe exhausted - no working SID; hold again to retry");
+        // v1.0.103：候选全失败 → 球变紫，提示用户先点屏幕别处（捕获真正的主屏 SID）
+        g_ProbeNeedMain = YES;
+        FTApplyBallAppearance();
+        FTLog("probe exhausted - please touch the screen somewhere NOT on the ball (app/desktop area), then hold the ball again");
         return;
     }
     g_ProbeSID = g_ProbeSIDs[g_ProbeIdx++];
@@ -1505,9 +1511,15 @@ static void FTTweakInitCallback(void *ctx) {
             BOOL onBall = (loc.x >= bf.origin.x && loc.x <= bf.origin.x + bf.size.width &&
                           loc.y >= bf.origin.y && loc.y <= bf.origin.y + bf.size.height);
             void *tp = (__bridge void *)t;
-            // v1.0.100：非球上触摸（主屏/App 窗口）→ 捕获其 SID 为 g_MainSID（注入首选）。
-            // 球上触摸是手势服务翻译值（0x1000007af 类，注入顶掉用户手指），绝不捕获。
-            if (!onBall) {
+            // ⚠️ v1.0.103：捕获【真正的主屏/App 窗口】触摸——判断触摸所在 window 是否
+            // 手势窗口（_UISystemGestureWindow）。球/点击点标记/红圈都是手势窗口 subview，
+            // 触摸全部被手势服务翻译成 0x1000007xx 无效值（注入顶掉用户手指，ctor-72 铁证）。
+            // v1.0.100 用「!onBall」判断不够——点击点标记附近的触摸（loc≈331,591，离球仅
+            // ~90px）也在手势窗口内、同样是翻译值（ctor.log：main SID=0x1000007b1 无效）。
+            // 只有 window != 手势窗口 的触摸才是主屏 digitizer 直通 SID（0x100000709 类）。
+            id tw = ((Msg_Send)objc_msgSend)(t, sel_registerName("window"));
+            BOOL inGestureWin = (tw && gGestureWin && tw == gGestureWin);
+            if (!inGestureWin) {
                 FT_HIDCaptureMainSIDFromUIEvent((__bridge void *)event);
             }
             // v1.0.101：探测期间检测「送达」——合成触摸回流 sendEvent 且落在点击点附近
@@ -1630,14 +1642,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.102 loaded (probe tap delayed-up fix; 400ms check)");
+    syslog(LOG_ERR, "FloatingTap v1.0.103 loaded (capture true main-window SID - exclude gesture-window touches; purple hint)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.102 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; probe delayed-up; 400ms check)\n");
+            fprintf(mk, "FloatingTap v1.0.103 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; main-window-only capture; purple hint)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
