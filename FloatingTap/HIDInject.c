@@ -603,9 +603,13 @@ uint64_t FT_HIDGetCapturedAt(int i) {
     return g_CapturedSIDs[i];
 }
 
-// 探测成功后锁定有效 SID（后续派发直接用它，绕过随机捕获）
+// 探测成功后锁定有效 SID（后续派发直接用它，绕过随机捕获）。
+// v1.0.112：传 0 = 清除锁定（自愈验证失败后重新探测前清旧 SID，防继续用假送达值）
 void FT_HIDLockSenderID(uint64_t sid) {
-    if (!sid) return;
+    if (!sid) {
+        g_WorkingSID = 0;
+        return;
+    }
     g_WorkingSID = sid;
     char dbg[96];
     snprintf(dbg, sizeof(dbg), "SID locked (probe OK): 0x%llx", (unsigned long long)sid);

@@ -167,6 +167,13 @@ static dispatch_source_t gClickTimer = NULL; // 连点定时器（SB 端直接�
 // 每个 down 记录 index，up 回调清除；连点停止时对【仍残留的 index】在点击点补发 up。
 static bool g_PendingUpIdx[16] = {false}; // index 2-9 用（1 留给用户手指，勿动）
 
+// v1.0.112：连点「送达自愈验证」——锁定 SID 后若连点期间 SEND 无合成触摸回流
+//（点击点附近 !onBall 触摸）→ 锁定的 SID 假送达（顶掉型 C 类）→ 停止连点、记录跳过、
+// 自动重新探测。防止「锁定假送达型 → 连点空跑」（ctor-8：0x100000661 连点 540 次空跑）。
+static BOOL   g_VerifyDelivering = NO;
+static BOOL   g_VerifySawSynthetic = NO;
+static void FTVerifyDeliveryTimer(void *ctx);
+
 // v1.0.50：AutoTap App 配置（位置/间隔）——定义在 FTIntervalMs 之前（它要读）
 static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 10.0;
 static int  gCfgLoaded = 0;
@@ -721,6 +728,12 @@ static void FTStartClicking(void) {
     }
     // v1.0.75：连点中禁用全部手势识别器（防 GR 取消手指/触发双击掐断连点）
     FTApplyGRModes();
+    // v1.0.112：连点送达自愈验证——300ms 内 SEND 无合成触摸回流 → 锁定 SID 假送达
+    // → FTVerifyDeliveryTimer 停止连点 + 记录跳过 + 自动重新探测（防空跑）
+    g_VerifyDelivering = YES;
+    g_VerifySawSynthetic = NO;
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), NULL, FTVerifyDeliveryTimer);
     // v1.0.88 验证：连点期间隐藏点击点标记（alpha=0 不参与 hitTest）——
     // 怀疑手势窗口把落在自身 subview（标记/红圈）上的注入触摸「收口」不透传 App
     if (gClickPointView) {
@@ -770,6 +783,7 @@ static void FTStopClicking(const char *reason) {
     if (!gIsClicking) return;
     gIsClicking = NO;
     gStopGracePending = NO; // 取消任何待决的松手宽限
+    g_VerifyDelivering = NO; // v1.0.112：取消送达验证（正常停止）
     if (gClickTimer) {
         dispatch_source_cancel(gClickTimer);
         gClickTimer = NULL;
@@ -1074,13 +1088,14 @@ static void FTCheckProbe(void *ctx) {
             }
             if (!dup) g_ProbeEndingSIDs[g_ProbeEndingCount++] = g_ProbeSID;
         }
-        // v1.0.111：顶掉型 = 该 SID 能送达（事件被系统处理才会顶掉手指）→ 也是「送达型」，
-        // 记入保底（B 类连点断续但可用）——避免整个会话只有 B 类时「变不了蓝」（ctor-7）。
-        // 锁定的保底 SID 用户重按时会因已在跳过列表而被换掉（精化到 A 类）。
-        if (g_ProbeDeliveredSID == 0) g_ProbeDeliveredSID = g_ProbeSID;
+        // v1.0.112 修正：顶掉 ≠ 送达！系统对任何注入都会重置触摸上下文顶掉手指
+        //（ctor-8 实锤：0x100000661 顶掉型锁定后连点 540 次空跑——顶掉但无 SEND 回流）。
+        // 只有「本 tap 有真送达回流（g_ProbeDelivered）」的顶掉型（B 类）才记保底；
+        // 纯顶掉（C 类，无回流）只记跳过列表，绝不保底（否则锁定假送达型 → 空跑）。
+        if (g_ProbeDelivered && g_ProbeDeliveredSID == 0) g_ProbeDeliveredSID = g_ProbeSID;
         char dbg[96];
-        snprintf(dbg, sizeof(dbg), "probe SID=0x%llx ended finger - recorded, auto next (fallback kept)",
-                 (unsigned long long)g_ProbeSID);
+        snprintf(dbg, sizeof(dbg), "probe SID=0x%llx ended finger (delivered=%d) - recorded, auto next",
+                 (unsigned long long)g_ProbeSID, g_ProbeDelivered ? 1 : 0);
         FTLog(dbg);
         g_ProbeTouchEnded = NO;
         if (gBallTouch == NULL) {
@@ -1129,6 +1144,30 @@ static void FTStopGraceTimer(void *ctx) {
     if (!gStopGracePending) return; // 已被重绑取消（用户手指仍在按着，系统重发了 Began）
     gStopGracePending = NO;
     FTStopClicking("touches-ended");
+}
+
+// v1.0.112：连点送达自愈验证——锁定 SID 后 300ms 内 SEND 无合成触摸回流（点击点附近
+// !onBall 触摸）→ 锁定的 SID 假送达（顶掉型 C 类，ctor-8 实锤：0x100000661 连点 540 次
+// 空跑）→ 停止连点、记录跳过列表、清锁定、自动重新探测。
+static void FTVerifyDeliveryTimer(void *ctx) {
+    (void)ctx;
+    if (!g_VerifyDelivering) return;
+    g_VerifyDelivering = NO;
+    if (g_VerifySawSynthetic) return; // 有回流 → SID 真送达，验证通过
+    FTLog("verify: locked SID not delivering - reverting to probe");
+    if (g_LockedSID) {
+        bool dup = false;
+        for (int k = 0; k < g_ProbeEndingCount; k++) {
+            if (g_ProbeEndingSIDs[k] == g_LockedSID) { dup = true; break; }
+        }
+        if (!dup && g_ProbeEndingCount < 64) {
+            g_ProbeEndingSIDs[g_ProbeEndingCount++] = g_LockedSID;
+        }
+    }
+    FTStopClicking("verify-fail");
+    g_LockedSID = 0;
+    FT_HIDLockSenderID(0);
+    FTStartProbing(); // 用户仍按着球 → 从跳过列表后继续探测
 }
 
 // Tap 回调：双击 → 切换「拖动模式」与「连击模式」（不再隐藏球）。
@@ -1695,6 +1734,15 @@ static void FTTweakInitCallback(void *ctx) {
                     g_ProbeDelivered = YES;
                 }
             }
+            // v1.0.112：连点送达自愈验证——锁定后连点期间，点击点附近出现 !onBall 合成
+            // 触摸回流 → 真送达（300ms 内任一即通过；用户手指在球上 onBall 排除）
+            if (g_VerifyDelivering && !g_VerifySawSynthetic && !onBall) {
+                double vcx = gClickLockX * gScreenW;
+                double vcy = gClickLockY * gScreenH;
+                if (fabs(loc.x - vcx) < 90 && fabs(loc.y - vcy) < 90) {
+                    g_VerifySawSynthetic = YES;
+                }
+            }
             if (ph == 0) {                                   // Began
                 if (onBall && gBallTouch == NULL) {
                     gBallTouch = tp;
@@ -1832,14 +1880,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.111 loaded (full-scan 0x600-0x8ff; ending SIDs also fallback - always turns blue if deliverable)");
+    syslog(LOG_ERR, "FloatingTap v1.0.112 loaded (delivery self-verify - fake-delivering SID auto-reverts; ending-only SIDs not fallback)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.111 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; scan 0x600-0x8ff; ending-fallback)\n");
+            fprintf(mk, "FloatingTap v1.0.112 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; scan 0x600-0x8ff; delivery self-verify)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
