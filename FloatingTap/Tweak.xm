@@ -124,7 +124,10 @@ static void FTStopGraceTimer(void *ctx);
 // 用户手指存活=不顶掉）后锁定 g_LockedSID；失败则等用户重按再试下一个候选。
 static BOOL   g_Probing = NO;        // 探测进行中（球变橙色提示）
 static BOOL   g_ProbeNeedMain = NO;  // v1.0.103：候选全失败 → 球变紫，提示先点屏幕别处
-static int    g_ProbeIdx = 0;        // 当前候选序号
+static BOOL   g_ProbeFullScan = NO;  // v1.0.105：全扫模式（候选耗尽后扫 0x100000700-0x7ff）
+static int    g_ProbeIdx = 0;        // 当前候选序号（全扫时 = 扫描偏移，跨轮保留）
+static uint64_t g_ProbeEndingSIDs[64]; // v1.0.105：已验证「顶掉用户手指」的 SID（全扫跳过）
+static int    g_ProbeEndingCount = 0;
 static BOOL   g_ProbeTouchEnded = NO; // 探测期间用户手指被顶掉（SID 无效）
 static BOOL   g_ProbeDelivered = NO;  // 探测期间合成触摸回流 sendEvent（SID 送达）
 static uint64_t g_ProbeSID = 0;      // 当前探测的 SID
@@ -892,12 +895,13 @@ static void FTBuildProbeCandidates(void) {
     FTLog(dbg);
 }
 
-// 开始探测（v1.0.103：每次重建候选集——用户点过屏幕别处后 g_MainSID 更新，必须重新纳入）
+// 开始探测（v1.0.103：每次重建候选集——用户点过屏幕别处后 g_MainSID 更新，必须重新纳入。
+// v1.0.105：全扫模式下保留 g_ProbeIdx 进度（顶掉后重按继续扫描，不从头来））
 static void FTStartProbing(void) {
     if (g_Probing) return;
     FTBuildProbeCandidates();
     g_Probing = YES;
-    g_ProbeIdx = 0;
+    if (!g_ProbeFullScan) g_ProbeIdx = 0; // 全扫中保留进度
     g_ProbeTouchEnded = NO;
     g_ProbeDelivered = NO;
     g_ProbeNeedMain = NO; // 重新探测时清除紫色提示
@@ -906,27 +910,58 @@ static void FTStartProbing(void) {
     FTProbeNext();
 }
 
-// 注入下一个候选 SID 的探测 tap，250ms 后检查结果
+// 注入下一个候选 SID 的探测 tap，稍后检查结果。
+// v1.0.105：候选（≤10）耗尽后自动进入【全扫】模式——遍历 0x100000700-0x1000007ff，
+// 跳过已验证「顶掉用户手指」的 SID；每 SID 200ms（送达/顶掉信号均在内），找到即停。
 static void FTProbeNext(void) {
     if (!g_Probing) return;
-    if (g_ProbeIdx >= g_ProbeSIDCount) {
-        g_Probing = NO;
-        g_ProbeIdx = 0;
-        // v1.0.103：候选全失败 → 球变紫，提示用户先点屏幕别处（捕获真正的主屏 SID）
-        g_ProbeNeedMain = YES;
-        FTApplyBallAppearance();
-        FTLog("probe exhausted - please touch the screen somewhere NOT on the ball (app/desktop area), then hold the ball again");
-        return;
+    uint64_t sid = 0;
+    if (g_ProbeFullScan) {
+        while (g_ProbeIdx < 256) {
+            uint64_t cand = 0x100000700ULL + (uint64_t)g_ProbeIdx;
+            g_ProbeIdx++;
+            bool skip = false;
+            for (int k = 0; k < g_ProbeEndingCount; k++) {
+                if (g_ProbeEndingSIDs[k] == cand) { skip = true; break; }
+            }
+            if (skip) continue;
+            sid = cand;
+            break;
+        }
+        if (sid == 0) {
+            g_Probing = NO;
+            g_ProbeFullScan = NO;
+            g_ProbeIdx = 0;
+            g_ProbeNeedMain = YES;
+            FTApplyBallAppearance(); // 紫
+            FTLog("full scan complete - no working SID; touch non-ball area and retry");
+            return;
+        }
+        if ((g_ProbeIdx % 32) == 0) {
+            char dbg2[96];
+            snprintf(dbg2, sizeof(dbg2), "full scan: 0x%llx (%d/256)", (unsigned long long)sid, g_ProbeIdx);
+            FTLog(dbg2);
+        }
+    } else {
+        if (g_ProbeIdx >= g_ProbeSIDCount) {
+            // 候选耗尽 → 进入全扫
+            g_ProbeFullScan = YES;
+            g_ProbeIdx = 0;
+            FTLog("candidates exhausted - full scanning 0x100000700..0x1000007ff (hold)");
+            FTProbeNext();
+            return;
+        }
+        sid = g_ProbeSIDs[g_ProbeIdx++];
     }
-    g_ProbeSID = g_ProbeSIDs[g_ProbeIdx++];
+    g_ProbeSID = sid;
     g_ProbeTouchEnded = NO;
     g_ProbeDelivered = NO;
     double nx = gClickLockX, ny = gClickLockY;
     if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
     if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
     // v1.0.102：探测 tap 用「down + 25ms 延迟 up」（同正式连点）——立即 up 无可见窗口
-    FT_HIDProbeTapDelayed(nx, ny, g_ProbeSID);
-    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+    FT_HIDProbeTapDelayed(nx, ny, sid);
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
                      dispatch_get_main_queue(), NULL, FTCheckProbe);
 }
 
@@ -935,13 +970,16 @@ static void FTCheckProbe(void *ctx) {
     (void)ctx;
     if (!g_Probing) return;
     if (g_ProbeTouchEnded) {
-        // 该 SID 顶掉了用户手指 → 无效；等用户重按（重按的 hold timer 会试下一个）
+        // 该 SID 顶掉了用户手指 → 无效；记录为顶掉类（全扫跳过），等用户重按（进度保留）
+        if (g_ProbeEndingCount < 64 && g_ProbeSID) {
+            g_ProbeEndingSIDs[g_ProbeEndingCount++] = g_ProbeSID;
+        }
         char dbg[96];
-        snprintf(dbg, sizeof(dbg), "probe SID=0x%llx ENDED user finger - invalid", (unsigned long long)g_ProbeSID);
+        snprintf(dbg, sizeof(dbg), "probe SID=0x%llx ENDED user finger - invalid (recorded)", (unsigned long long)g_ProbeSID);
         FTLog(dbg);
         g_Probing = NO;
         g_ProbeTouchEnded = NO;
-        FTApplyBallAppearance(); // 回蓝色，提示重新按住
+        FTApplyBallAppearance(); // 回蓝，提示重新按住
         return;
     }
     if (g_ProbeDelivered) {
@@ -949,7 +987,9 @@ static void FTCheckProbe(void *ctx) {
         g_LockedSID = g_ProbeSID;
         FT_HIDLockSenderID(g_ProbeSID);
         g_Probing = NO;
+        g_ProbeFullScan = NO;
         g_ProbeIdx = 0;
+        g_ProbeEndingCount = 0;
         FTApplyBallAppearance(); // 回蓝色
         FTLog("probe OK - SID locked, starting combo");
         gBallTouchClicking = YES;
@@ -957,9 +997,6 @@ static void FTCheckProbe(void *ctx) {
         return;
     }
     // 没送达也没顶掉（可能是 0x8000... 类被丢弃）→ 试下一个
-    char dbg[96];
-    snprintf(dbg, sizeof(dbg), "probe SID=0x%llx not delivered - next", (unsigned long long)g_ProbeSID);
-    FTLog(dbg);
     FTProbeNext();
 }
 
@@ -1642,14 +1679,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.104 loaded (dispatch uses probed SID - registryID primary removed)");
+    syslog(LOG_ERR, "FloatingTap v1.0.105 loaded (full-range SID scan after candidates; skip ending SIDs)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.104 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; dispatch=probed SID; main-window capture)\n");
+            fprintf(mk, "FloatingTap v1.0.105 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; full-range scan; dispatch=probed SID)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
