@@ -957,12 +957,15 @@ static void FTStartProbing(void) {
 // 注入下一个候选 SID 的探测 tap，稍后检查结果。
 // v1.0.105：候选（≤10）耗尽后自动进入【全扫】模式——遍历 0x100000700-0x1000007ff，
 // 跳过已验证「顶掉用户手指」的 SID；每 SID 200ms（送达/顶掉信号均在内），找到即停。
+// v1.0.111：全扫范围扩到 0x100000600-0x1000008ff（768 个）——有效 SID 会话随机，
+// 可能落在 6xx/8xx 段（ctor-7 实测 7xx 全扫 256 个仅 2 个送达型、无 A 类 → 变不了蓝）；
+// 检查窗口 80ms→60ms（Began 回流 10-30ms，顶掉信号 <60ms 内）；分段进度日志。
 static void FTProbeNext(void) {
     if (!g_Probing) return;
     uint64_t sid = 0;
     if (g_ProbeFullScan) {
-        while (g_ProbeIdx < 256) {
-            uint64_t cand = 0x100000700ULL + (uint64_t)g_ProbeIdx;
+        while (g_ProbeIdx < 768) {
+            uint64_t cand = 0x100000600ULL + (uint64_t)g_ProbeIdx;
             g_ProbeIdx++;
             bool skip = false;
             for (int k = 0; k < g_ProbeEndingCount; k++) {
@@ -1000,9 +1003,15 @@ static void FTProbeNext(void) {
             }
             return;
         }
-        if ((g_ProbeIdx % 32) == 0) {
+        // v1.0.111：段切换提示（6xx/7xx/8xx）+ 每 64 个进度（768 总数）
+        if (g_ProbeIdx == 1 || g_ProbeIdx == 257 || g_ProbeIdx == 513) {
             char dbg2[96];
-            snprintf(dbg2, sizeof(dbg2), "full scan: 0x%llx (%d/256)", (unsigned long long)sid, g_ProbeIdx);
+            snprintf(dbg2, sizeof(dbg2), "full scan: entering 0x%llx range (%d/768)",
+                     (unsigned long long)(0x100000600ULL + (uint64_t)(g_ProbeIdx - 1)), g_ProbeIdx);
+            FTLog(dbg2);
+        } else if ((g_ProbeIdx % 64) == 0) {
+            char dbg2[96];
+            snprintf(dbg2, sizeof(dbg2), "full scan: 0x%llx (%d/768)", (unsigned long long)sid, g_ProbeIdx);
             FTLog(dbg2);
         }
     } else {
@@ -1018,10 +1027,10 @@ static void FTProbeNext(void) {
             break;
         }
         if (sid == 0) {
-            // 候选耗尽 → 进入全扫
+            // 候选耗尽 → 进入全扫（v1.0.111：范围扩到 0x100000600-0x1000008ff）
             g_ProbeFullScan = YES;
             g_ProbeIdx = 0;
-            FTLog("candidates exhausted - full scanning 0x100000700..0x1000007ff (hold)");
+            FTLog("candidates exhausted - full scanning 0x100000600..0x1000008ff (hold)");
             FTProbeNext();
             return;
         }
@@ -1043,8 +1052,9 @@ static void FTProbeNext(void) {
     g_PendingUpIdx[2] = true;
     // v1.0.102：探测 tap 用「down + 25ms 延迟 up」（同正式连点）——立即 up 无可见窗口
     FT_HIDProbeTapDelayed(nx, ny, sid);
-    // v1.0.108：全扫提速 200ms→80ms（送达回流/顶掉信号均在 <60ms 内出现；256 全扫 51s→20s）
-    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)),
+    // v1.0.111：全扫检查窗口 80ms→60ms（Began 回流 10-30ms、顶掉信号 <60ms 内；
+    // 768 全扫 46s→35s 最坏）
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)),
                      dispatch_get_main_queue(), NULL, FTCheckProbe);
 }
 
@@ -1064,8 +1074,12 @@ static void FTCheckProbe(void *ctx) {
             }
             if (!dup) g_ProbeEndingSIDs[g_ProbeEndingCount++] = g_ProbeSID;
         }
+        // v1.0.111：顶掉型 = 该 SID 能送达（事件被系统处理才会顶掉手指）→ 也是「送达型」，
+        // 记入保底（B 类连点断续但可用）——避免整个会话只有 B 类时「变不了蓝」（ctor-7）。
+        // 锁定的保底 SID 用户重按时会因已在跳过列表而被换掉（精化到 A 类）。
+        if (g_ProbeDeliveredSID == 0) g_ProbeDeliveredSID = g_ProbeSID;
         char dbg[96];
-        snprintf(dbg, sizeof(dbg), "probe SID=0x%llx ended finger - recorded, auto next",
+        snprintf(dbg, sizeof(dbg), "probe SID=0x%llx ended finger - recorded, auto next (fallback kept)",
                  (unsigned long long)g_ProbeSID);
         FTLog(dbg);
         g_ProbeTouchEnded = NO;
@@ -1818,14 +1832,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.110 loaded (up-delay back to 25ms - combo continuity; serial residual-up cleanup)");
+    syslog(LOG_ERR, "FloatingTap v1.0.111 loaded (full-scan 0x600-0x8ff; ending SIDs also fallback - always turns blue if deliverable)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.110 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; up-delay 25ms; serial residual cleanup)\n");
+            fprintf(mk, "FloatingTap v1.0.111 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; scan 0x600-0x8ff; ending-fallback)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
