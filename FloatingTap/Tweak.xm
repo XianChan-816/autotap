@@ -57,6 +57,8 @@ typedef void       (*Msg_AddGestureRecognizer)(id, SEL, id);
 typedef void       (*Msg_SetEnabled)(id, SEL, BOOL);
 typedef void       (*Msg_RequireToFail)(id, SEL, id);
 typedef void       (*Msg_AddSubview)(id, SEL, id);
+typedef void       (*Msg_SetTag)(id, SEL, NSInteger);
+typedef id         (*Msg_ViewWithTag)(id, SEL, NSInteger);
 typedef void       (*Msg_MakeKeyAndVisible)(id, SEL);
 typedef void       (*Msg_SetNumberOfTapsRequired)(id, SEL, NSUInteger);
 typedef void       (*Msg_SetWindowScene)(id, SEL, id);
@@ -94,9 +96,15 @@ static id gBallContainer = nil;   // 球的父窗口（v1.0.58：优先 _UISyste
 static id gBallView      = nil;   // 球 UIView 本身
 static id gGestureWin    = nil;   // v1.0.61：从 sendEvent 事件流直接捕获到的系统手势窗口实例（最可靠的定位方式）
 static id gTapGR      = nil;
+static id gTapGR2     = nil;   // 点击点标记上的双击手势（同样触发模式切换，避免标记盖住球时双击失效）
 static id gLongGR     = nil;
-static id gPanGR      = nil;   // 拖动手势（仅「红色拖动模式」生效）
+static id gPanGR      = nil;   // 拖动手势（仅「红色拖动模式」生效，移动球本身）
+static id gClickPointView = nil; // 点击点标记（独立视图，仅「红色拖动模式」可拖动；蓝色连击模式不可交互→点击穿透到下层 App）
+static id gClickPanGR = nil;   // 点击点拖动手势（仅红色模式生效，移动点击点，与球解耦）
 static BOOL gDragMode = NO;    // NO=蓝色连击模式（长按触发连点）；YES=红色拖动模式（拖动定位）
+
+static CGPoint gClickPanStartLoc;   // 点击点拖动起点（窗口坐标）
+static CGPoint gClickPanOrigin0;    // 点击点拖动起点 frame.origin
 
 static CGPoint gPanStartLoc;   // 触摸起始点（窗口坐标）
 static CGPoint gPanOrigin0;    // 触摸起始时窗口 frame.origin
@@ -106,12 +114,12 @@ static double  gScreenH = 0;
 
 static BOOL    gIsClicking = NO;            // 连点进行中
 static uint32_t gTapIndex = 0;              // 每次 tap 递增的 index（区分触摸，避免被串流）
-static double  gClickLockX = 0;             // 连点锁定坐标（长按开始时球心，拖动不改变）
-static double  gClickLockY = 0;
+static double  gClickLockX = 0.5;           // 连点锁定坐标 = 点击点标记位置（与球解耦，由标记拖动/App 配置设定）
+static double  gClickLockY = 0.5;
 static dispatch_source_t gClickTimer = NULL; // 连点定时器（SB 端直接注入用）
 
 // v1.0.50：AutoTap App 配置（位置/间隔）——定义在 FTIntervalMs 之前（它要读）
-static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 400.0;
+static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 12.0;
 static int  gCfgLoaded = 0;
 
 // MARK: - 诊断日志（append 到标记文件，Filza 可见；带单调时间戳）
@@ -183,21 +191,20 @@ static BOOL FTUIReady(void) {
 
 static unsigned long gClickCount = 0; // 本次连点周期内的点击次数（诊断）
 
-// 读取连点间隔（毫秒）：优先 App 配置（v1.0.50），兜底 cfg 文件，默认 400ms。
-// ⚠️ v1.0.46：默认 400ms——iOS 双击识别窗口约 350ms，间隔小于它会触发 tapCount 累积
-// （v1.0.45 实测 tap=4），图标被当成多击不启动。400ms 以上每次点击独立 tapCount=1。
+// 读取连点间隔（毫秒）：优先 App 配置（v1.0.50），兜底 cfg 文件，默认 12ms。
+// 12ms ≈ 83 次/秒；HID 事件每次递增 index 区分触摸，避免被系统串成同一触摸流。
 static double FTIntervalMs(void) {
     if (gCfgLoaded && gCfgMs >= 1.0) return gCfgMs;
     FILE *f = fopen("/var/mobile/Library/Preferences/com.floatingtap.cfg", "r");
     if (f) {
-        double v = 400.0;
+        double v = 12.0;
         if (fscanf(f, "%lf", &v) == 1 && v >= 1.0 && v <= 60000.0) {
             fclose(f);
             return v;
         }
         fclose(f);
     }
-    return 400.0;
+    return 12.0;
 }
 
 // MARK: - App 通信（v1.0.53：CFPreferences 共享偏好，cfprefsd 守护进程跨进程共享）
@@ -555,18 +562,10 @@ static void FTStartClicking(void) {
     gIsClicking = YES;
     gClickCount = 0;
     gTapIndex = 0;
-    // 点击点 = 当前球心（拖动模式移动球后此处自动跟随；App 配置经 FTMoveBallToConfig 已先把球移到该位置）
-    if (gBallView) {
-        CGRect f = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
-        double cx = f.origin.x + f.size.width * 0.5;
-        double cy = f.origin.y + f.size.height * 0.5;
-        gClickLockX = (gScreenW > 0) ? cx / gScreenW : 0.5;
-        gClickLockY = (gScreenH > 0) ? cy / gScreenH : 0.5;
-        if (gClickLockX < 0.001) gClickLockX = 0.001; if (gClickLockX > 0.999) gClickLockX = 0.999;
-        if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
-    } else {
-        gClickLockX = 0.5; gClickLockY = 0.5;
-    }
+    // 点击点 = gClickLockX/Y（由点击点标记拖动 / App 配置设定，与球位置解耦）。
+    // 这里只做归一化钳制，不再把点击点锁回球心——否则「点击点独立于球」的设计失效。
+    if (gClickLockX < 0.001) gClickLockX = 0.001; if (gClickLockX > 0.999) gClickLockX = 0.999;
+    if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
     double ms = FTIntervalMs();
     // 一碰到球立即点一次（不等第一个 timer tick，短按也有一次点击）
     FTClickCallback(NULL);
@@ -613,7 +612,7 @@ static void FTGRLongHandler(id self, SEL _cmd, id gr) {
     }
 }
 
-// Pan 回调：仅「红色拖动模式」生效——拖动小球重新定位（点击点同步更新到新球心）。
+// Pan 回调：仅「红色拖动模式」生效——拖动小球重新定位（点击点独立，不受影响）。
 // 连击模式下忽略，保证长按只连点、拖动只定位，互不干扰。
 static void FTGRPanHandler(id self, SEL _cmd, id gr) {
     (void)self; (void)_cmd;
@@ -630,8 +629,27 @@ static void FTGRPanHandler(id self, SEL _cmd, id gr) {
             CGRectMake(gPanOrigin0.x + (cur.x - gPanStartLoc.x),
                        gPanOrigin0.y + (cur.y - gPanStartLoc.y),
                        f.size.width, f.size.height));
-        // 同步更新连点锁定坐标（拖动后点击点跟随球心）
-        CGRect nf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
+    }
+}
+
+// 点击点拖动：仅「红色拖动模式」生效——拖动点击点标记，更新连点坐标（与球独立）。
+// 连击模式下 gClickPointView 不可交互，此 GR 被禁用，标记只作位置指示。
+static void FTGRClickPanHandler(id self, SEL _cmd, id gr) {
+    (void)self; (void)_cmd;
+    if (!gr || !gClickPointView) return;
+    if (!gDragMode) return; // 连击模式：不响应点击点拖动
+    NSUInteger st = ((Msg_State)objc_msgSend)(gr, sel_registerName("state"));
+    if (st == 1) { // Began
+        gClickPanStartLoc = ((Msg_LocationInView)objc_msgSend)(gr, sel_registerName("locationInView:"), gClickPointView);
+        gClickPanOrigin0  = ((Msg_Frame)objc_msgSend)(gClickPointView, sel_registerName("frame")).origin;
+    } else if (st == 2) { // Changed → 拖动点击点
+        CGPoint cur = ((Msg_LocationInView)objc_msgSend)(gr, sel_registerName("locationInView:"), gClickPointView);
+        CGRect f = ((Msg_Frame)objc_msgSend)(gClickPointView, sel_registerName("frame"));
+        ((Msg_SetFrame)objc_msgSend)(gClickPointView, sel_registerName("setFrame:"),
+            CGRectMake(gClickPanOrigin0.x + (cur.x - gClickPanStartLoc.x),
+                       gClickPanOrigin0.y + (cur.y - gClickPanStartLoc.y),
+                       f.size.width, f.size.height));
+        CGRect nf = ((Msg_Frame)objc_msgSend)(gClickPointView, sel_registerName("frame"));
         if (gScreenW > 0 && gScreenH > 0) {
             gClickLockX = (nf.origin.x + nf.size.width * 0.5) / gScreenW;
             gClickLockY = (nf.origin.y + nf.size.height * 0.5) / gScreenH;
@@ -654,6 +672,24 @@ static void FTApplyBallAppearance(void) {
     if (color) ((Msg_SetBackgroundColor)objc_msgSend)(gBallView, sel_registerName("setBackgroundColor:"), color);
 }
 
+// 点击点标记外观：拖动模式（红）高亮橙、可拖动；连击模式（蓝）暗显绿（仅指示点击位置、不挡触摸）
+static void FTApplyClickPointAppearance(void) {
+    if (!gClickPointView) return;
+    Class ClsColor = objc_getClass("UIColor");
+    if (!ClsColor) return;
+    CGFloat r, g, b;
+    if (gDragMode) { r = 1.0;  g = 0.84; b = 0.0; }   // 橙（可拖动）
+    else           { r = 0.2;  g = 1.0;  b = 0.4; }   // 绿（暗显指示）
+    id color = ((Msg_ColorWithRGBA)objc_msgSend)((id)ClsColor,
+        sel_registerName("colorWithRed:green:blue:alpha:"), r, g, b, 1.0);
+    id layer = ((Msg_Layer)objc_msgSend)(gClickPointView, sel_registerName("layer"));
+    ((Msg_SetCGFloat)objc_msgSend)(layer, sel_registerName("setBorderWidth:"), (CGFloat)(gDragMode ? 3.5 : 2.5));
+    ((Msg_SetBorderColor)objc_msgSend)(layer, sel_registerName("setBorderColor:"),
+                                       ((Msg_CGColor)objc_msgSend)(color, sel_registerName("CGColor")));
+    id dot = ((Msg_ViewWithTag)objc_msgSend)(gClickPointView, sel_registerName("viewWithTag:"), (NSInteger)101);
+    if (dot) ((Msg_SetBackgroundColor)objc_msgSend)(dot, sel_registerName("setBackgroundColor:"), color);
+}
+
 // Tap 回调：双击 → 切换「拖动模式」与「连击模式」（不再隐藏球）。
 //   蓝色（连击模式）：长按触发连点；红色（拖动模式）：拖动小球重新定位点击点。
 static void FTGRTapHandler(id self, SEL _cmd, id gr) {
@@ -666,8 +702,16 @@ static void FTGRTapHandler(id self, SEL _cmd, id gr) {
         // 模式切换：仅启用当前模式对应的手势，禁用另一个，避免长按/拖动手势识别冲突
         ((Msg_SetEnabled)objc_msgSend)(gLongGR, sel_registerName("setEnabled:"), gDragMode ? NO : YES);
         ((Msg_SetEnabled)objc_msgSend)(gPanGR,  sel_registerName("setEnabled:"), gDragMode ? YES : NO);
+        // 点击点标记：拖动模式可拖动、可见；连击模式不可交互（点击穿透到下层 App）
+        if (gClickPointView) {
+            ((Msg_SetUserInteractionEnabled)objc_msgSend)(gClickPointView, sel_registerName("setUserInteractionEnabled:"), gDragMode ? YES : NO);
+        }
+        if (gClickPanGR) {
+            ((Msg_SetEnabled)objc_msgSend)(gClickPanGR, sel_registerName("setEnabled:"), gDragMode ? YES : NO);
+        }
         FTApplyBallAppearance();
-        FTLog(gDragMode ? "double tap -> drag mode ON (red)" : "double tap -> combo mode ON (blue)");
+        FTApplyClickPointAppearance();
+        FTLog(gDragMode ? "double tap -> drag mode ON (red): drag ball / click-point to position" : "double tap -> combo mode ON (blue)");
     }
 }
 
@@ -681,6 +725,7 @@ static BOOL FTMakeGRTarget(void) {
     class_addMethod(gGRTargetClass, sel_registerName("handleLong:"), (IMP)FTGRLongHandler, "v@:@");
     class_addMethod(gGRTargetClass, sel_registerName("handleTap:"),  (IMP)FTGRTapHandler,  "v@:@");
     class_addMethod(gGRTargetClass, sel_registerName("handlePan:"),  (IMP)FTGRPanHandler,  "v@:@");
+    class_addMethod(gGRTargetClass, sel_registerName("handleClickPan:"), (IMP)FTGRClickPanHandler, "v@:@");
     objc_registerClassPair(gGRTargetClass);
     gGRTarget = FTAlloc(gGRTargetClass);
     if (gGRTarget) {
@@ -822,6 +867,14 @@ static void FTReparentBallToGestureWin(void *ctx) {
     if (sup) ((Msg_Send)objc_msgSend)(gBallView, sel_registerName("removeFromSuperview"));
     ((Msg_AddSubview)objc_msgSend)(gGestureWin, sel_registerName("addSubview:"), gBallView);
     gBallContainer = gGestureWin;
+    // 点击点标记一并重挂到正确窗口
+    if (gClickPointView) {
+        id csup = ((Msg_Send)objc_msgSend)(gClickPointView, sel_registerName("superview"));
+        if (csup != gGestureWin) {
+            if (csup) ((Msg_Send)objc_msgSend)(gClickPointView, sel_registerName("removeFromSuperview"));
+            ((Msg_AddSubview)objc_msgSend)(gGestureWin, sel_registerName("addSubview:"), gClickPointView);
+        }
+    }
     const char *oldCls = sup ? object_getClassName(sup) : "?";
     char diag[160];
     snprintf(diag, sizeof(diag), "ball reparented: %s -> %s", oldCls, object_getClassName(gGestureWin));
@@ -945,6 +998,50 @@ static void FTSetupBall(void) {
     // 这样球在游戏 / 前台 App 内也可见、可触摸；点击注入本身是绝对坐标，跟前台 App 无关。
     ((Msg_AddSubview)objc_msgSend)(targetWin, sel_registerName("addSubview:"), ball);
 
+    // 点击点标记（独立视图，与球解耦）：默认位置 = gClickLockX/Y（初始屏幕中心 / App 配置点）。
+    // 仅「红色拖动模式」可拖动；蓝色连击模式 userInteractionEnabled=NO → 点击穿透到下层 App。
+    {
+        CGFloat m = 30.0;
+        CGRect mf = CGRectMake(gClickLockX * gScreenW - m / 2, gClickLockY * gScreenH - m / 2, m, m);
+        gClickPointView = FTAllocInitWithFrame(ClsView, mf);
+        if (gClickPointView) {
+            ((Msg_SetUserInteractionEnabled)objc_msgSend)(gClickPointView, sel_registerName("setUserInteractionEnabled:"), gDragMode ? YES : NO);
+            id mlayer = ((Msg_Layer)objc_msgSend)(gClickPointView, sel_registerName("layer"));
+            ((Msg_SetCGFloat)objc_msgSend)(mlayer, sel_registerName("setCornerRadius:"), (CGFloat)(m / 2));
+            ((Msg_SetCGFloat)objc_msgSend)(mlayer, sel_registerName("setBorderWidth:"), (CGFloat)2.5);
+            id mcol = ((Msg_ColorWithRGBA)objc_msgSend)((id)ClsColor, sel_registerName("colorWithRed:green:blue:alpha:"), 0.2, 1.0, 0.4, 1.0);
+            ((Msg_SetBorderColor)objc_msgSend)(mlayer, sel_registerName("setBorderColor:"),
+                ((Msg_CGColor)objc_msgSend)(mcol, sel_registerName("CGColor")));
+            // 中心圆点（指示精确点击位置），tag=101 便于外观刷新时定位
+            id dot = FTAllocInitWithFrame(ClsView, CGRectMake(m / 2 - 4, m / 2 - 4, 8, 8));
+            if (dot) {
+                id dlayer = ((Msg_Layer)objc_msgSend)(dot, sel_registerName("layer"));
+                ((Msg_SetCGFloat)objc_msgSend)(dlayer, sel_registerName("setCornerRadius:"), (CGFloat)4);
+                ((Msg_SetBackgroundColor)objc_msgSend)(dot, sel_registerName("setBackgroundColor:"), mcol);
+                ((Msg_SetTag)objc_msgSend)(dot, sel_registerName("setTag:"), (NSInteger)101);
+                ((Msg_AddSubview)objc_msgSend)(gClickPointView, sel_registerName("addSubview:"), dot);
+            }
+            gClickPanGR = FTMakeGR(ClsPanGR, "handleClickPan:");
+            if (gClickPanGR) {
+                ((Msg_RequireToFail)objc_msgSend)(gClickPanGR, sel_registerName("requireGestureRecognizerToFail:"), gTapGR);
+                ((Msg_SetEnabled)objc_msgSend)(gClickPanGR, sel_registerName("setEnabled:"), gDragMode ? YES : NO);
+                ((Msg_AddGestureRecognizer)objc_msgSend)(gClickPointView, sel_registerName("addGestureRecognizer:"), gClickPanGR);
+            }
+            // 点击点标记上也挂一个双击手势（同一 toggle handler）——避免编辑模式下标记盖住球时，
+            // 双击球无法命中、导致切不回连击模式。双击始终局部命中单一视图，不会双触发。
+            gTapGR2 = FTMakeGR(ClsTapGR, "handleTap:");
+            if (gTapGR2) {
+                ((Msg_SetNumberOfTapsRequired)objc_msgSend)(gTapGR2, sel_registerName("setNumberOfTapsRequired:"), (NSUInteger)2);
+                ((Msg_RequireToFail)objc_msgSend)(gTapGR2, sel_registerName("requireGestureRecognizerToFail:"), gLongGR);
+                ((Msg_RequireToFail)objc_msgSend)(gTapGR2, sel_registerName("requireGestureRecognizerToFail:"), gClickPanGR);
+                ((Msg_RequireToFail)objc_msgSend)(gClickPanGR, sel_registerName("requireGestureRecognizerToFail:"), gTapGR2);
+                ((Msg_AddGestureRecognizer)objc_msgSend)(gClickPointView, sel_registerName("addGestureRecognizer:"), gTapGR2);
+            }
+            ((Msg_AddSubview)objc_msgSend)(targetWin, sel_registerName("addSubview:"), gClickPointView);
+            FTApplyClickPointAppearance();
+        }
+    }
+
     gBallContainer = targetWin;
     gBallView      = ball;
     FTApplyBallAppearance(); // 初始蓝色=连击模式
@@ -979,9 +1076,14 @@ static void FTMoveBallToConfig(void) {
     ((Msg_SetFrame)objc_msgSend)(gBallView, sel_registerName("setFrame:"),
         CGRectMake(px - f.size.width * 0.5, py - f.size.height * 0.5,
                    f.size.width, f.size.height));
-    // 同步锁定坐标（连点打在配置点）
+    // 同步点击点标记位置（连点打在配置点；与球解耦，二者可分别拖动）
     gClickLockX = gCfgX;
     gClickLockY = gCfgY;
+    if (gClickPointView) {
+        CGFloat m = 30.0;
+        ((Msg_SetFrame)objc_msgSend)(gClickPointView, sel_registerName("setFrame:"),
+            CGRectMake(gCfgX * gScreenW - m / 2, gCfgY * gScreenH - m / 2, m, m));
+    }
     char diag[96];
     snprintf(diag, sizeof(diag), "ball moved to config %.2f,%.2f", gCfgX, gCfgY);
     FTLog(diag);
@@ -1123,7 +1225,7 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.68 loaded (pure C ctor, ball on _UISystemGestureWindow; corrected 13-param finger event sig; system HID dispatch; reparent-to-gesture-win on capture)");
+    syslog(LOG_ERR, "FloatingTap v1.0.69 loaded (decoupled click-point marker; double-tap=move ball+click-point; long-press=combo at click point; 12ms default)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
