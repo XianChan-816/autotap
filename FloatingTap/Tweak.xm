@@ -1196,10 +1196,13 @@ static void FTTweakInitCallback(void *ctx) {
 
     if (gBallView && event && !gDragMode) {
         id tset = ((Msg_Send)objc_msgSend)(event, sel_registerName("allTouches"));
-        NSUInteger tn = tset ? ((Msg_Count)objc_msgSend)(tset, sel_registerName("count")) : 0;
+        // ⚠️ allTouches 返回 NSSet（非数组），必须用 allObjects 转成 NSArray 才能 objectAtIndex:
+        // 直接对 NSSet 调 objectAtIndex: 会抛 unrecognized selector → SB 崩溃 → Safe Mode（ctor-42 真凶）。
+        id tarr = tset ? ((Msg_Send)objc_msgSend)(tset, sel_registerName("allObjects")) : nil;
+        NSUInteger tn = tarr ? ((Msg_Count)objc_msgSend)(tarr, sel_registerName("count")) : 0;
         CGRect bf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
         for (NSUInteger i = 0; i < tn; i++) {
-            id t = ((Msg_ObjectAtIndex)objc_msgSend)(tset, sel_registerName("objectAtIndex:"), i);
+            id t = ((Msg_ObjectAtIndex)objc_msgSend)(tarr, sel_registerName("objectAtIndex:"), i);
             if (!t) continue;
             long ph = (long)((Msg_Int)objc_msgSend)(t, sel_registerName("phase"));
             CGPoint loc = ((Msg_LocationInView)objc_msgSend)(t, sel_registerName("locationInView:"), nil);
@@ -1287,14 +1290,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.71 loaded (touch-identity-driven combo; senderID captured-first; orientation-aware HID; 10ms)");
+    syslog(LOG_ERR, "FloatingTap v1.0.72 loaded (touch-identity-driven combo; fixed NSSet objectAtIndex crash; senderID captured-first; orientation-aware HID; 10ms)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.71 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; touch-identity combo; captured-first senderID; system HID dispatch)\n");
+            fprintf(mk, "FloatingTap v1.0.72 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; touch-identity combo; fixed NSSet objectAtIndex crash; captured-first senderID; system HID dispatch)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
