@@ -903,10 +903,10 @@ static void FTSetupBall(void) {
         FTLog("setup failed: make GR");
     }
     ((Msg_SetNumberOfTapsRequired)objc_msgSend)(gTapGR, sel_registerName("setNumberOfTapsRequired:"), (NSUInteger)2);
-    // 长按：minimumPressDuration=0.4 → 真正的「长按」才触发连点（duration=0 会在手指一碰就
-    // Began，抢走触摸导致双击手势被迫失败，v1.0.55 实测双击切换永不触发）。
+    // 长按：minimumPressDuration=0.25 → 稍微按住即触发连点（更跟手）。仍保留 require 双击
+    // 失败，确保双击切换优先级；0.25s 足够短于双击间隔，不会抢双击。
     // allowableMovement=200：宽松容差，iPad 上手指自然抖动/微小移动不会误判失败
-    ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setMinimumPressDuration:"), 0.4);
+    ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setMinimumPressDuration:"), 0.25);
     ((Msg_SetCGFloat)objc_msgSend)(gLongGR, sel_registerName("setAllowableMovement:"), 200.0);
     // 让「双击」手势优先：长按/拖动都 require 双击失败后才识别。
     // 这样双击必然触发模式切换，长按/拖动只在「不是双击」时才生效，二者不再抢触摸。
@@ -1026,6 +1026,21 @@ static void FTTweakInitCallback(void *ctx) {
             FTLog("captured system gesture window from sendEvent");
         }
     }
+    // v1.0.63：从真实触摸事件的 _hidEvent 动态捕获设备 senderID。
+    // 这是让系统认领合成事件、产生真实点击的关键——硬编码 senderID 在 Dopamine
+    // rootless + iOS 15.5 上会被系统静默丢弃（派发 ret=success 但无触摸）。
+    // 持续用真实设备值覆盖即可（FT_HIDSetSenderID 内部只在非零时更新）。
+    if (event) {
+        Ivar hidIvar = class_getInstanceVariable(object_getClass(event), "_hidEvent");
+        if (hidIvar) {
+            FT_IOHIDEventRef hid = NULL;
+            object_getInstanceVariable(event, "_hidEvent", (void **)&hid);
+            if (hid) {
+                uint64_t sid = FT_HIDGetSenderIDFromEvent(hid);
+                if (sid) FT_HIDSetSenderID(sid);
+            }
+        }
+    }
     static double sLastDiag = 0;
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1090,14 +1105,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.62 loaded (pure C ctor, ball on _UISystemGestureWindow; system HID dispatch for in-app clicks)");
+    syslog(LOG_ERR, "FloatingTap v1.0.63 loaded (pure C ctor, ball on _UISystemGestureWindow; dynamic senderID capture; system HID dispatch)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.62 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; system HID dispatch for in-app clicks)\n");
+            fprintf(mk, "FloatingTap v1.0.63 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; dynamic senderID capture; system HID dispatch)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

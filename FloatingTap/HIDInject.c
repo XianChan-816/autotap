@@ -66,6 +66,9 @@ static FT_IOReturn (*p_IOHIDEventSystemClientDispatchEvent)(FT_IOHIDEventSystemC
 static void (*p_IOHIDEventSystemClientScheduleWithRunLoop)(FT_IOHIDEventSystemClientRef, CFRunLoopRef, CFStringRef);
 static void (*p_IOHIDEventSetSenderID)(FT_IOHIDEventRef, uint64_t);
 static void (*p_IOHIDEventSetIntegerValue)(FT_IOHIDEventRef, uint32_t, int64_t);
+// v1.0.63：client 级 senderID 设置 + 从事件读 senderID（动态捕获真实设备值）
+static void (*p_IOHIDEventSystemClientSetSenderID)(FT_IOHIDEventSystemClientRef, uint64_t);
+static uint64_t (*p_IOHIDEventGetSenderID)(FT_IOHIDEventRef);
 static FT_IOHIDEventRef (*p_IOHIDEventCreateDigitizerFingerEvent)(CFAllocatorRef,
                                                                   uint64_t timeStamp,
                                                                   uint32_t index,
@@ -84,6 +87,8 @@ static void (*p_IOHIDEventAppendEvent)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IO
 
 static FT_IOHIDEventSystemClientRef g_hidClient = NULL;
 static bool g_hidLoaded = false;
+// v1.0.63：动态捕获的真实设备 senderID（0 表示未捕获，用兜底硬编码）
+static uint64_t g_OverrideSenderID = 0;
 
 // MARK: - 符号解析（C 静态 flag 代替 dispatch_once）
 
@@ -112,6 +117,11 @@ static bool FT_HIDLoadSymbols(void) {
         (void (*)(FT_IOHIDEventRef, uint64_t))dlsym(handle, "IOHIDEventSetSenderID");
     p_IOHIDEventSetIntegerValue =
         (void (*)(FT_IOHIDEventRef, uint32_t, int64_t))dlsym(handle, "IOHIDEventSetIntegerValue");
+    // v1.0.63：client 级 senderID 设置 + 从事件读 senderID（动态捕获真实设备值）
+    p_IOHIDEventSystemClientSetSenderID =
+        (void (*)(FT_IOHIDEventSystemClientRef, uint64_t))dlsym(handle, "IOHIDEventSystemClientSetSenderID");
+    p_IOHIDEventGetSenderID =
+        (uint64_t (*)(FT_IOHIDEventRef))dlsym(handle, "IOHIDEventGetSenderID");
     p_IOHIDEventCreateDigitizerFingerEvent =
         (FT_IOHIDEventRef (*)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t,
                               double, double, double, double, double, Boolean, Boolean, FT_IOOptionBits))
@@ -133,17 +143,28 @@ static bool FT_HIDLoadSymbols(void) {
 
 bool FT_HIDConnect(void) {
     if (g_hidClient) return true;
-    if (!FT_HIDLoadSymbols()) return false;
+    if (!FT_HIDLoadSymbols()) {
+        FTHIDLog("HID connect failed: symbols");
+        return false;
+    }
     g_hidClient = p_IOHIDEventSystemClientCreate(kCFAllocatorDefault);
     if (!g_hidClient) {
-        syslog(LOG_ERR, "FloatingTap HID client create failed");
+        FTHIDLog("HID connect failed: client create NULL");
         return false;
+    }
+    // v1.0.63：client 级 senderID 必须与真实设备一致，否则 iOS 会静默丢弃派发事件。
+    // 优先用动态捕获的真实 senderID，兜底硬编码。
+    if (p_IOHIDEventSystemClientSetSenderID) {
+        p_IOHIDEventSystemClientSetSenderID(g_hidClient, FT_HIDSenderID());
     }
     // 部分 iOS 版本需要 client 挂 runloop 才会真正派发事件（符号存在则挂，失败无害）
     if (p_IOHIDEventSystemClientScheduleWithRunLoop) {
         p_IOHIDEventSystemClientScheduleWithRunLoop(g_hidClient, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
     }
-    syslog(LOG_ERR, "FloatingTap HID connected");
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg), "HID connected (senderID=0x%llx override=%d)",
+             (unsigned long long)FT_HIDSenderID(), g_OverrideSenderID ? 1 : 0);
+    FTHIDLog(dbg);
     return true;
 }
 
@@ -165,7 +186,22 @@ static void FTHIDLog(const char *msg) {
 // 是 Safe Mode 元凶，实测两次崩；直接用 zxtouch 社区通用硬编码兜底值）
 
 uint64_t FT_HIDSenderID(void) {
+    if (g_OverrideSenderID) return g_OverrideSenderID;
     return 0x8000000817371935ULL;
+}
+
+// v1.0.63：由 Tweak.xm 从真实触摸事件的 _hidEvent 读到的设备 senderID 写入，
+// 覆盖硬编码值，使系统认领合成事件。
+void FT_HIDSetSenderID(uint64_t sid) {
+    if (sid) g_OverrideSenderID = sid;
+}
+
+// v1.0.63：从 IOHIDEvent 读 senderID（0 表示无效）
+uint64_t FT_HIDGetSenderIDFromEvent(FT_IOHIDEventRef event) {
+    if (!event) return 0;
+    if (!FT_HIDLoadSymbols()) return 0;
+    if (!p_IOHIDEventGetSenderID) return 0;
+    return (uint64_t)p_IOHIDEventGetSenderID(event);
 }
 
 // MARK: - 事件构造
@@ -243,6 +279,9 @@ static void FT_DispatchEvent(FT_IOHIDEventRef event) {
     FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, event);
     if (ret != FT_kIOReturnSuccess) {
         syslog(LOG_ERR, "FloatingTap DispatchEvent failed 0x%x", (unsigned)ret);
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg), "DispatchEvent failed 0x%x", (unsigned)ret);
+        FTHIDLog(dbg);
     }
     CFRelease(event);
 }

@@ -1,6 +1,6 @@
 Package: com.floatingtap.tweak
 Name: FloatingTap
-Version: 1.0.62
+Version: 1.0.63
 Architecture: iphoneos-arm64
 Description: 全局悬浮球自动点击器（IOHIDEvent 注入），长按触发点击，拖动调位置，捏合调大小
 Maintainer: FloatingTap

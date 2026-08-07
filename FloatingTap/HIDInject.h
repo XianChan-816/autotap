@@ -43,9 +43,17 @@ void FT_HIDDispatchUp(double normalizedX, double normalizedY, uint32_t index);
 // 返回 +1 的 IOHIDEvent（调用方负责 CFRelease）。
 FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double normalizedX, double normalizedY, uint32_t index);
 
-// 返回 senderID（v1.0.53：直接用硬编码兜底值；原捕获机制在 arm64e SB 里
-// 注册 IOHID 事件回调 = Safe Mode 元凶，已废弃）
+// 返回 senderID。v1.0.63：优先返回动态捕获的真实设备 senderID（从真实触摸事件读，
+// 系统必然认领），未捕获到才用硬编码兜底。硬编码值在 Dopamine rootless + iOS 15.5 上
+// 可能被系统静默丢弃（事件派发 ret=success 但无触摸）。
 uint64_t FT_HIDSenderID(void);
+
+// v1.0.63：覆盖 senderID（由 Tweak.xm 从真实触摸事件的 _hidEvent 动态捕获后写入）。
+// 这是让系统认领合成事件、产生真实点击的关键。
+void FT_HIDSetSenderID(uint64_t sid);
+
+// v1.0.63：从 IOHIDEvent 读取 senderID（返回 0 表示无效 / 无法读取）。
+uint64_t FT_HIDGetSenderIDFromEvent(FT_IOHIDEventRef event);
 
 #ifdef __cplusplus
 }
