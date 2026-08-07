@@ -66,6 +66,16 @@ void FT_HIDCaptureSenderIDFromUIEvent(void *event);
 // 【确认该事件不含球上触摸】时调用（如触摸 window != _UISystemGestureWindow）。
 void FT_HIDCaptureMainSIDFromUIEvent(void *event);
 
+// ⚠️ v1.0.101：SID 运行时自动探测接口——Dopamine 上「送达且不顶掉」的 SID 会话随机
+// （ctor-69: 0x100000709 有效；ctor-71/72/73: 0x1000007b1/7af 顶掉），无规律可循。
+// Tweak.xm 按住球时逐个候选 SID 注入探测 tap，双重判定（sendEvent 回流=送达、用户手指
+// 存活=不顶掉）后锁定 g_WorkingSID，此后连点稳定。
+uint64_t FT_HIDGetMainSID(void);
+int     FT_HIDGetCapturedCount(void);
+uint64_t FT_HIDGetCapturedAt(int i);
+void    FT_HIDLockSenderID(uint64_t sid);
+void    FT_HIDProbeTap(double nx, double ny, uint64_t sid);
+
 // v1.0.83：连点停止时强制「抬全手」——派发一个 hand-only up 事件（hand index=99,
 // Range=0/Touch=0），让系统把该合成 hand 的所有残留子手指一次抬起。
 // 背景：高频连点（10ms）会残留未闭合的合成触摸，污染系统触摸状态机 →

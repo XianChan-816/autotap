@@ -608,6 +608,50 @@ void FT_HIDTapAt(double normalizedX, double normalizedY) {
     FT_HIDDispatchUp(normalizedX, normalizedY, 1);
 }
 
+// ⚠️ v1.0.101：SID 运行时自动探测——Dopamine 上有效 SID（送达且不顶掉用户手指）是
+// 会话随机的（ctor-69: 0x100000709 有效；ctor-71/72/73: 0x1000007b1/7af 顶掉；无规律）。
+// Tweak.xm 按住球时逐个候选 SID 注入探测 tap，通过 sendEvent 回流（送达）+ 用户手指
+// 存活（不顶掉）双重判定锁定 g_WorkingSID。以下为探测配套接口。
+uint64_t FT_HIDGetMainSID(void) { return g_MainSID; }
+
+int  FT_HIDGetCapturedCount(void) { return g_CapturedSIDCount; }
+uint64_t FT_HIDGetCapturedAt(int i) {
+    if (i < 0 || i >= g_CapturedSIDCount) return 0;
+    return g_CapturedSIDs[i];
+}
+
+// 探测成功后锁定有效 SID（后续派发直接用它，绕过随机捕获）
+void FT_HIDLockSenderID(uint64_t sid) {
+    if (!sid) return;
+    g_WorkingSID = sid;
+    char dbg[96];
+    snprintf(dbg, sizeof(dbg), "SID locked (probe OK): 0x%llx", (unsigned long long)sid);
+    FTHIDLog(dbg);
+}
+
+// 用【指定 SID】注入一次探测 tap（down + up 立即）——探测阶段专用，
+// 不走 g_WorkingSID 逻辑；0x0B0018 字段与正式派发一致。
+void FT_HIDProbeTap(double nx, double ny, uint64_t sid) {
+    if (!g_hidClient || !FT_HIDLoadSymbols() || !sid) return;
+    FT_IOHIDEventRef d = FT_HIDCreateDigitizerEvent(true, nx, ny, 2);
+    if (d) {
+        p_IOHIDEventSetSenderID(d, sid);
+        if (p_IOHIDEventSetIntegerValue) p_IOHIDEventSetIntegerValue(d, 0x0B0018, (int64_t)sid);
+        p_IOHIDEventSystemClientDispatchEvent(g_hidClient, d);
+        CFRelease(d);
+    }
+    FT_IOHIDEventRef u = FT_HIDCreateDigitizerEvent(false, nx, ny, 2);
+    if (u) {
+        p_IOHIDEventSetSenderID(u, sid);
+        if (p_IOHIDEventSetIntegerValue) p_IOHIDEventSetIntegerValue(u, 0x0B0018, (int64_t)sid);
+        p_IOHIDEventSystemClientDispatchEvent(g_hidClient, u);
+        CFRelease(u);
+    }
+    char dbg[96];
+    snprintf(dbg, sizeof(dbg), "probe tap SID=0x%llx", (unsigned long long)sid);
+    FTHIDLog(dbg);
+}
+
 // v1.0.62：down/up 单独派发到系统 HID 服务（供 Tweak.xm 的 down-now/up-延迟 模式复用）。
 // 关键：走 IOHIDEventSystemClientDispatchEvent，事件由系统路由到前台 App，
 // 而不是 SpringBoard 的 _handleHIDEvent:（那只能喂 SB 自身 UI，App 收不到）。
