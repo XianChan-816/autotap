@@ -75,6 +75,9 @@ int     FT_HIDGetCapturedCount(void);
 uint64_t FT_HIDGetCapturedAt(int i);
 void    FT_HIDLockSenderID(uint64_t sid);
 void    FT_HIDProbeTap(double nx, double ny, uint64_t sid);
+// v1.0.102：探测 tap 带 25ms 延迟 up（同正式连点）——v1.0.101 的立即 up 让合成触摸
+// 无可见窗口、送达检测永远失败（ctor-74）。探测统一走这个版本。
+void    FT_HIDProbeTapDelayed(double nx, double ny, uint64_t sid);
 
 // v1.0.83：连点停止时强制「抬全手」——派发一个 hand-only up 事件（hand index=99,
 // Range=0/Touch=0），让系统把该合成 hand 的所有残留子手指一次抬起。

@@ -652,6 +652,48 @@ void FT_HIDProbeTap(double nx, double ny, uint64_t sid) {
     FTHIDLog(dbg);
 }
 
+// ⚠️ v1.0.102 修正：探测 tap 必须 down + 25ms 延迟 up（与正式连点一致）——
+// v1.0.101 的「立即 up」导致合成触摸还没进入 sendEvent 就被抬起（无可见窗口），
+// g_ProbeDelivered 永远检测不到 → 所有 SID 误判 not delivered（ctor-74 橙蓝循环）。
+typedef struct {
+    double x, y;
+    uint64_t sid;
+    uint32_t index;
+} FTHIDProbeCtx;
+static void FTHIDProbeUpCallback(void *ctx) {
+    FTHIDProbeCtx *c = (FTHIDProbeCtx *)ctx;
+    if (c) {
+        FT_IOHIDEventRef u = FT_HIDCreateDigitizerEvent(false, c->x, c->y, c->index);
+        if (u && g_hidClient) {
+            p_IOHIDEventSetSenderID(u, c->sid);
+            if (p_IOHIDEventSetIntegerValue) p_IOHIDEventSetIntegerValue(u, 0x0B0018, (int64_t)c->sid);
+            p_IOHIDEventSystemClientDispatchEvent(g_hidClient, u);
+            CFRelease(u);
+        }
+        free(c);
+    }
+}
+void FT_HIDProbeTapDelayed(double nx, double ny, uint64_t sid) {
+    if (!g_hidClient || !FT_HIDLoadSymbols() || !sid) return;
+    FT_IOHIDEventRef d = FT_HIDCreateDigitizerEvent(true, nx, ny, 2);
+    if (d) {
+        p_IOHIDEventSetSenderID(d, sid);
+        if (p_IOHIDEventSetIntegerValue) p_IOHIDEventSetIntegerValue(d, 0x0B0018, (int64_t)sid);
+        p_IOHIDEventSystemClientDispatchEvent(g_hidClient, d);
+        CFRelease(d);
+    }
+    // up 延迟 25ms（同正式连点）——给 sendEvent 留出合成触摸可见窗口
+    FTHIDProbeCtx *c = (FTHIDProbeCtx *)malloc(sizeof(FTHIDProbeCtx));
+    if (c) {
+        c->x = nx; c->y = ny; c->sid = sid; c->index = 2;
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.025 * NSEC_PER_SEC)),
+                         dispatch_get_main_queue(), NULL, FTHIDProbeUpCallback);
+    }
+    char dbg[96];
+    snprintf(dbg, sizeof(dbg), "probe tap (delayed up) SID=0x%llx", (unsigned long long)sid);
+    FTHIDLog(dbg);
+}
+
 // v1.0.62：down/up 单独派发到系统 HID 服务（供 Tweak.xm 的 down-now/up-延迟 模式复用）。
 // 关键：走 IOHIDEventSystemClientDispatchEvent，事件由系统路由到前台 App，
 // 而不是 SpringBoard 的 _handleHIDEvent:（那只能喂 SB 自身 UI，App 收不到）。

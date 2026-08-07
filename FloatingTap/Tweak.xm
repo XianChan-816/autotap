@@ -876,8 +876,8 @@ static void FTBuildProbeCandidates(void) {
         }
         if (!dup) g_ProbeSIDs[g_ProbeSIDCount++] = v;
     }
-    uint64_t hist[] = { 0x100000709ULL, 0x1000007adULL, 0x1000007afULL };
-    for (int k = 0; k < 3 && g_ProbeSIDCount < 10; k++) {
+    uint64_t hist[] = { 0x100000709ULL, 0x1000007adULL, 0x1000007afULL, 0x1000006f0ULL };
+    for (int k = 0; k < 4 && g_ProbeSIDCount < 10; k++) {
         v = hist[k];
         bool dup = false;
         for (int j = 0; j < g_ProbeSIDCount; j++) {
@@ -918,8 +918,9 @@ static void FTProbeNext(void) {
     double nx = gClickLockX, ny = gClickLockY;
     if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
     if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
-    FT_HIDProbeTap(nx, ny, g_ProbeSID);
-    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+    // v1.0.102：探测 tap 用「down + 25ms 延迟 up」（同正式连点）——立即 up 无可见窗口
+    FT_HIDProbeTapDelayed(nx, ny, g_ProbeSID);
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                      dispatch_get_main_queue(), NULL, FTCheckProbe);
 }
 
@@ -1629,14 +1630,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.101 loaded (auto SID probe on first hold - orange = calibrating)");
+    syslog(LOG_ERR, "FloatingTap v1.0.102 loaded (probe tap delayed-up fix; 400ms check)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.101 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; auto SID probe; cleanup start+stop)\n");
+            fprintf(mk, "FloatingTap v1.0.102 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; probe delayed-up; 400ms check)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
