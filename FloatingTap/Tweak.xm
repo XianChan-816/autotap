@@ -1386,6 +1386,10 @@ static void FTTweakInitCallback(void *ctx) {
                 if (onBall && gBallTouch == NULL) {
                     gBallTouch = tp;
                     gBallTouchDownTime = now;
+                    // v1.0.98：注入 SID 动态跟随用户手指（同源 → 不顶掉）。
+                    // Dopamine 重启后设备 SID 会变（ctor-70：captured[0] 从 0x100000709
+                    // 变 0x1000006f0 → 顶掉回归），必须用用户手指当前触摸的 SID 注入。
+                    FT_HIDCaptureUserFingerSIDFromUIEvent((__bridge void *)event);
                     // v1.0.80：若正在连点且系统因注入把上一根手指 Ended 后重发了 Began
                     // （用户仍物理按着），重绑并【取消松手宽限】，连点继续。
                     if (gIsClicking) {
@@ -1490,14 +1494,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.97 loaded (residual-up cleanup on stop - Home indicator fix)");
+    syslog(LOG_ERR, "FloatingTap v1.0.98 loaded (inject SID follows user finger - reboot-stable combo)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.97 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; residual-up cleanup; registryID primary + fallback)\n");
+            fprintf(mk, "FloatingTap v1.0.98 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; user-finger SID; residual-up cleanup)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

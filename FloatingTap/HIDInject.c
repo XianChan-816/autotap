@@ -402,6 +402,31 @@ void FT_HIDCaptureSenderIDFromUIEvent(void *event) {
     }
 }
 
+// v1.0.98：注入 SID 动态跟随【用户手指】——顶掉用户手指的机制与 SID 是否「同源」强相关：
+// 注入 SID 与用户手指当前触摸的 SID 相同 → 系统当「同源第二根手指」→ 不重置触摸上下文
+// （不顶掉）；不同源 → 当「新触摸源」→ 重置（顶掉）。Dopamine 每次重新激活分配的设备
+// SID 会变（ctor-69 重启前 captured[0]=0x100000709 不顶掉、clicks 155；ctor-70 重启后
+// captured[0]=0x1000006f0 顶掉、clicks 25）——captured[0] 是「首个捕获」未必是用户手指。
+// 此函数在 sendEvent 检测到【球上用户手指 Began】时调用，把该事件的 senderID 存为
+// g_UserSID，FT_DispatchEvent 首选它（保证与用户手指同源）。
+static uint64_t g_UserSID = 0;
+void FT_HIDCaptureUserFingerSIDFromUIEvent(void *event) {
+    if (!event) return;
+    if (!FT_HIDLoadSymbols()) return;
+    if (!p_IOHIDEventGetSenderID) return;
+    Ivar hidIvar = class_getInstanceVariable(object_getClass((id)event), "_hidEvent");
+    if (!hidIvar) return;
+    FT_IOHIDEventRef hid = NULL;
+    object_getInstanceVariable((id)event, "_hidEvent", (void **)&hid);
+    if (!hid) return;
+    uint64_t sid = (uint64_t)p_IOHIDEventGetSenderID(hid);
+    if (!sid || sid == g_UserSID) return;
+    g_UserSID = sid;
+    char dbg[96];
+    snprintf(dbg, sizeof(dbg), "user finger SID: 0x%llx", (unsigned long long)sid);
+    FTHIDLog(dbg);
+}
+
 // MARK: - 事件构造
 
 // v1.0.67：彻底修正子事件函数签名（权威来源 SimulateTouch 对系统函数的 hook）。
@@ -515,9 +540,13 @@ static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint3
     if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
     uint64_t sid;
     if (!g_PrimarySIDFellBack && g_PrimarySID) {
-        sid = g_PrimarySID;
+        sid = g_PrimarySID; // registryID（真实服务 SID）——若送达且同源则理想
     } else {
         sid = g_WorkingSID;
+        // v1.0.98：首选【用户手指同源 SID】——顶掉与否取决于注入 SID 是否与用户手指同源
+        // （ctor-69 vs ctor-70：重启后 captured[0] 变了导致顶掉回归）。g_UserSID 在 sendEvent
+        // 检测到球上用户手指 Began 时动态更新，保证注入与用户手指同源 → 不重置触摸上下文。
+        if (!sid && g_UserSID) sid = g_UserSID;
         if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
         if (!sid) sid = 0x1000007adULL;
     }

@@ -60,6 +60,11 @@ uint64_t FT_HIDGetSenderIDFromEvent(FT_IOHIDEventRef event);
 // 由 Tweak.xm 的 sendEvent: hook 调用，参数传 (__bridge void *)event。
 void FT_HIDCaptureSenderIDFromUIEvent(void *event);
 
+// v1.0.98：捕获【球上用户手指】所在 UIEvent 的 senderID 存为 g_UserSID（注入首选）——
+// 保证注入 SID 与用户手指同源 → 系统当「同源第二指」不重置触摸上下文（不顶掉）。
+// 由 Tweak.xm 在 sendEvent 追踪到 onBall Began 的用户手指时调用。
+void FT_HIDCaptureUserFingerSIDFromUIEvent(void *event);
+
 // v1.0.83：连点停止时强制「抬全手」——派发一个 hand-only up 事件（hand index=99,
 // Range=0/Touch=0），让系统把该合成 hand 的所有残留子手指一次抬起。
 // 背景：高频连点（10ms）会残留未闭合的合成触摸，污染系统触摸状态机 →
