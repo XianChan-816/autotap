@@ -112,9 +112,10 @@ static void *gBallTouch = NULL;          // 用户手指对应的 UITouch 对象
 static double gBallTouchDownTime = 0;    // 该触摸 Began 的单调时间
 static BOOL   gBallTouchClicking = NO;   // 是否已据此触摸开始连点（避免重复 start）
 static BOOL   gBallTouchTimerPending = NO; // 120ms 长按计时器是否已排队（避免重复排）
-// v1.0.80：松手宽限——注入合成触摸会让系统把按住球的手指 Ended（touch ph=3），但用户手指
-// 仍物理按着，digitizer 会为同一手指重发 Began。故触摸结束时【不立即停止】，排 400ms 宽限
-// 计时器：宽限内系统重发 Began → 重绑继续连点；宽限过无新 Began → 确认真松手 → 停止。
+// v1.0.94：松手宽限（豆包方案）——v1.0.94 起注入用 zxtouch 官方 SID 0x8000... + digitizer
+// SenderID 字段（0x0B0018），目标是不再「顶掉」用户按住的手指 → 用户手指全程 alive →
+// touchesEnded/Cancelled 是真实松手信号。宽限从 400ms 缩到 120ms：touchesEnded（抬起）/
+// touchesCancelled（滑出/系统打断）后 120ms 内无新 Began 即停止连点（接近「立刻终止」）。
 static BOOL   gStopGracePending = NO;
 static void FTStopGraceTimer(void *ctx);
 
@@ -132,7 +133,6 @@ static uint32_t gTapIndex = 0;              // 每次 tap 递增的 index（区�
 static double  gClickLockX = 0.5;           // 连点锁定坐标 = 点击点标记位置（与球解耦，由标记拖动/App 配置设定）
 static double  gClickLockY = 0.5;
 static dispatch_source_t gClickTimer = NULL; // 连点定时器（SB 端直接注入用）
-static dispatch_source_t gBallSimTimer = NULL; // v1.0.93：模拟手指定时器（球上注入触摸，让连点持续）
 
 // v1.0.50：AutoTap App 配置（位置/间隔）——定义在 FTIntervalMs 之前（它要读）
 static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 10.0;
@@ -550,40 +550,10 @@ static void FTSyntheticTap(double px, double py) {
     }
 }
 
-// v1.0.93：模拟手指——在【球中心】注入 down/up（60ms 周期），让系统/触摸追踪持续看到
-// "球上有手指活动"。背景：注入点击会顶掉用户按住球的手指（系统机制，试遍 senderID 无法
-// 避免），静止时系统不重发 Began → 400ms 宽限停（连点每 ~40 次断一轮）。用户提议"自动
-// 模拟手指动"：定期在球上注入触摸 → sendEvent 追踪看到"球上 Began"（重绑、取消宽限）→
-// 连点持续不断（用户手指动/不动都不再中断）。停止 = 双击切模式（现有）。模拟触摸落在
-// 球上（subview）会被手势窗口收口、不透传 App，仅用于驱动我们的追踪，不影响点击注入。
-static void FTSyntheticBallSimTap(void) {
-    if (!gBallView) return;
-    CGRect bf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
-    double cx = bf.origin.x + bf.size.width * 0.5;
-    double cy = bf.origin.y + bf.size.height * 0.5;
-    double ux = (gScreenW > 0) ? cx / gScreenW : 0.5;
-    double uy = (gScreenH > 0) ? cy / gScreenH : 0.5;
-    if (ux < 0.001) ux = 0.001; if (ux > 0.999) ux = 0.999;
-    if (uy < 0.001) uy = 0.001; if (uy > 0.999) uy = 0.999;
-    double nx = ux, ny = uy;
-    FTOrientForHID(ux, uy, &nx, &ny);
-    gTapIndex = (gTapIndex % 19) + 1;
-    uint32_t idx = gTapIndex;
-    FT_HIDDispatchDown(nx, ny, idx);
-    FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
-    if (c) {
-        c->x = nx; c->y = ny; c->index = idx;
-        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)),
-                         dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
-    }
-}
-
-// v1.0.93：模拟手指定时器回调（60ms 周期）
-static void FTBallSimTimerCB(void *ctx) {
-    (void)ctx;
-    if (!gIsClicking) return;
-    FTSyntheticBallSimTap();
-}
+// v1.0.94：移除 v1.0.93 的「模拟手指」——它每 60ms 注入球心触摸让追踪持续重绑，
+// 连点虽不断但【松手停不了】（只能双击停，用户拒绝）。v1.0.94 改注入 zxtouch 官方
+// senderID 0x8000... + digitizer SenderID 字段（0x0B0018），目标是不顶掉用户手指 →
+// 用户手指全程 alive → 松手 touchesEnded 真实到达 → Ended/Cancelled 即停（豆包方案）。
 
 // MARK: - SB 端注入（v1.0.62 起走系统 HID 服务，可命中前台 App）
 // v1.0.62：改为 IOHIDEventSystemClientDispatchEvent 系统级派发（HIDInject.c 的
@@ -693,16 +663,6 @@ static void FTStartClicking(void) {
     if (gClickPointView) {
         ((Msg_SetAlpha)objc_msgSend)(gClickPointView, sel_registerName("setAlpha:"), 0.0);
     }
-    // v1.0.93：启动模拟手指定时器——注入点击会顶掉用户按住的手指（系统机制），
-    // 静止时系统不重发 Began → 连点每 ~40 次断一轮。模拟手指让追踪持续重绑 → 连点不断。
-    gBallSimTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-    if (gBallSimTimer) {
-        dispatch_source_set_timer(gBallSimTimer,
-                                  dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)),
-                                  (uint64_t)(0.06 * NSEC_PER_SEC), 0);
-        dispatch_source_set_event_handler_f(gBallSimTimer, FTBallSimTimerCB);
-        dispatch_resume(gBallSimTimer);
-    }
     FTLog("clicking started");
 }
 
@@ -714,10 +674,6 @@ static void FTStopClicking(const char *reason) {
     if (gClickTimer) {
         dispatch_source_cancel(gClickTimer);
         gClickTimer = NULL;
-    }
-    if (gBallSimTimer) { // v1.0.93：停止模拟手指定时器
-        dispatch_source_cancel(gBallSimTimer);
-        gBallSimTimer = NULL;
     }
     if (gClickFlashView) {
         ((Msg_SetAlpha)objc_msgSend)(gClickFlashView, sel_registerName("setAlpha:"), 0.0); // 灭光圈
@@ -842,12 +798,13 @@ static void FTBallHoldTimer(void *ctx) {
     }
 }
 
-// v1.0.80：松手宽限计时器——400ms 内没有重发的 Began（重绑会清 gStopGracePending）才真停止。
+// v1.0.94：松手宽限计时器（豆包方案）——touchesEnded/Cancelled 后 120ms 内没有重发的
+// Began（重绑会清 gStopGracePending）才真停止（手指抬起/滑出/打断 → 停止连点）。
 static void FTStopGraceTimer(void *ctx) {
     (void)ctx;
     if (!gStopGracePending) return; // 已被重绑取消（用户手指仍在按着，系统重发了 Began）
     gStopGracePending = NO;
-    FTStopClicking("hold-release");
+    FTStopClicking("touches-ended");
 }
 
 // Tap 回调：双击 → 切换「拖动模式」与「连击模式」（不再隐藏球）。
@@ -1423,14 +1380,15 @@ static void FTTweakInitCallback(void *ctx) {
                 if (gBallTouch == tp) {
                     gBallTouch = NULL;
                     gBallTouchTimerPending = NO;
-                    // v1.0.80：触摸结束【不立即停连点】——注入合成触摸会让系统把按住的手指
-                    // Ended（ctor-53 铁证：clicking started 与 stopped 同戳、SEND 同时显示
-                    // 用户手指仍在球上）。用户仍物理按着时系统会重发 Began（重绑已取消宽限）。
-                    // 只有宽限 400ms 内没有新 Began（真松手）才停止。
+                    // v1.0.94（豆包方案）：touchesEnded（手指抬起）/ touchesCancelled（滑出球/
+                    // 系统手势打断）→ 排 120ms 短宽限，无新 Began 即停止连点（接近立刻终止）。
+                    // 前提：注入已改用 0x8000... + 0x0B0018 字段不再顶掉用户手指，因此这里的
+                    // Ended/Cancelled 是真实松手信号；120ms 仅吸收「顶掉后系统重发 Began」的
+                    // 边界情况（若重发 → Began 分支取消宽限、连点继续）。
                     gBallTouchClicking = NO;
                     if (gIsClicking && !gStopGracePending) {
                         gStopGracePending = YES;
-                        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
                                          dispatch_get_main_queue(), NULL, FTStopGraceTimer);
                     }
                 }
@@ -1500,14 +1458,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.93 loaded (ball-sim finger keeps combo continuous)");
+    syslog(LOG_ERR, "FloatingTap v1.0.94 loaded (digitizer SID field 0x0B0018; official SID 0x8000...; touchesEnded/Cancelled stop combo)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.93 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; ball-sim finger; portrait-base coords)\n");
+            fprintf(mk, "FloatingTap v1.0.94 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; digitizer SID field 0x0B0018; official SID; touchesEnded/Cancelled stop)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

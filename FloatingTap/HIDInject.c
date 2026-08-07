@@ -521,20 +521,29 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
 // 在 10ms 连点下 = 每秒 ~2000 次系统事件注入，严重污染系统触摸/手势状态机——
 // 实测后果：连点之后 Home indicator（小白条）上滑手势失效（什么位置都触发、息屏才恢复）。
 // 且 ret=0x1 是假阴性（ctor-54 证据：全候选 0x1 但 41 下真实点击照常），循环无收益。
-// v1.0.85 首选修正（ctor-57 铁证）：captured[0]（0x1000007xx）事件实际送达、点击有效；
-// registryID（0x8de4/0x9114...）完全不送达 → 只留候选。
-// ⚠️ v1.0.91 实测：0x8000000817371935（zxtouch 官方值）在 Dopamine 上也【不送达】
-// （ctor-65：SEND 无合成触摸、点击无反馈；但连点因手指没被顶掉持续 350 次）。
-// v1.0.92：首选顺序 = g_WorkingSID → g_OriginalSenderID（回调提取的硬件原始值，
-// 可能"送达且不顶掉"）→ captured[0]（送达、顶掉）→ 0x1000007ad。
+// ⚠️ v1.0.94 定案（综合 ctor-65 关键数据）：
+//   · 0x8000000817371935（zxtouch 官方 kIOHIDEventDigitizerSenderID）——【不顶掉】用户手指
+//     （ctor-65：连点 350 次用户手指全程 ball=1 phase=1 未被系统 Ended）但之前【不送达】；
+//   · captured[0]（0x1000007xx 翻译 ID）——【送达】但【顶掉】用户手指 → 松手检测死；
+//   · 结论：送达 ⇔ 顶掉；不顶掉 ⇔ 不送达。要「送达且不顶掉」必须让 0x8000... 被系统认领。
+//   · 缺的一环：只设了事件级 IOHIDEventSetSenderID，没设 digitizer 字段
+//     kIOHIDEventFieldDigitizerSenderID（0x0B0018）——系统可能从字段找事件源，缺失则丢弃。
+//   v1.0.94：补 0x0B0018 字段 + 首选 0x8000...（若送达且不顶掉 → 用户手指全程 alive →
+//   松手 touchesEnded 真实到达 → 豆包方案「Ended/Cancelled 即停」成立）。
 static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint32_t index, bool down) {
     (void)nx; (void)ny; (void)index; (void)down;
     if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
     uint64_t sid = g_WorkingSID;
-    if (!sid && g_OriginalSenderID) sid = g_OriginalSenderID;
+    if (!sid) sid = 0x8000000817371935ULL; // zxtouch 官方 digitizer SID（v1.0.94 首选：不顶掉）
     if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
     if (!sid) sid = 0x1000007adULL;
     p_IOHIDEventSetSenderID(event, sid);
+    // v1.0.94 关键：digitizer 事件字段里的 SenderID（0x0B0018 = kIOHIDEventFieldDigitizerSenderID）。
+    // 仅设顶层 senderID 时系统可能无法把事件归属到 digitizer 服务 → 当未知设备丢弃（0x8000...
+    // 不送达的疑因）。字段级 senderID 与顶层一致，让系统按「官方 digitizer」路由事件。
+    if (p_IOHIDEventSetIntegerValue) {
+        p_IOHIDEventSetIntegerValue(event, 0x0B0018, (int64_t)sid);
+    }
     FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, event);
     if (ret == FT_kIOReturnSuccess && !g_WorkingSID) {
         g_WorkingSID = sid; // 首次 ret=0 锁定（后续直用）
