@@ -130,6 +130,17 @@ static uint64_t g_ProbeEndingSIDs[64]; // v1.0.105：已验证「顶掉用户手
 static int    g_ProbeEndingCount = 0;
 static BOOL   g_ProbeTouchEnded = NO; // 探测期间用户手指被顶掉（SID 无效）
 static BOOL   g_ProbeDelivered = NO;  // 探测期间合成触摸回流 sendEvent（SID 送达）
+// v1.0.106：探测期间用户手指已被顶掉且未重绑（无法再验证「不顶掉」）→ 送达型 SID 只记录
+// 保底不锁定；手指重新 Began（系统重发/用户重按）时复位，恢复完整验证。
+static BOOL   g_ProbeFingerDead = NO;
+// v1.0.106：手指死后第一个「送达型」SID（扫描耗尽时保底锁定开始连点，保证有点击）
+static uint64_t g_ProbeDeliveredSID = 0;
+// v1.0.106：探测 tap 注入【屏幕角落固定点】（远离球和点击点）——送达检测只看角落，
+// 排除用户手指/球/点击点标记的干扰（ctor-3 实锤：探测点=点击点时，用户手指滑出球或
+// 第二根手指经过点击点附近 90px 内 → 误判「送达」→ 锁定不送达的 SID → 连点空跑）。
+#define FT_PROBE_PX 0.93
+#define FT_PROBE_PY 0.07
+static double g_ProbeDetectX = 0, g_ProbeDetectY = 0; // 角落探测点窗口坐标（锁定后清 0）
 static uint64_t g_ProbeSID = 0;      // 当前探测的 SID
 static uint64_t g_LockedSID = 0;     // 探测成功锁定的有效 SID（会话内稳定）
 static uint64_t g_ProbeSIDs[10];     // 候选集（构建后去重）
@@ -896,7 +907,8 @@ static void FTBuildProbeCandidates(void) {
 }
 
 // 开始探测（v1.0.103：每次重建候选集——用户点过屏幕别处后 g_MainSID 更新，必须重新纳入。
-// v1.0.105：全扫模式下保留 g_ProbeIdx 进度（顶掉后重按继续扫描，不从头来））
+// v1.0.105：全扫模式下保留 g_ProbeIdx 进度（顶掉后重按继续扫描，不从头来）。
+// v1.0.106：按住一次自动连续扫描——顶掉/不送达都自动试下一个，不再要求每次重按）
 static void FTStartProbing(void) {
     if (g_Probing) return;
     FTBuildProbeCandidates();
@@ -904,9 +916,12 @@ static void FTStartProbing(void) {
     if (!g_ProbeFullScan) g_ProbeIdx = 0; // 全扫中保留进度
     g_ProbeTouchEnded = NO;
     g_ProbeDelivered = NO;
+    g_ProbeFingerDead = NO;      // v1.0.106：新探测会话，手指按着 = 活着
+    g_ProbeDeliveredSID = 0;     // v1.0.106：清保底
+    g_ProbeDetectX = 0; g_ProbeDetectY = 0; // v1.0.106：清角落探测点
     g_ProbeNeedMain = NO; // 重新探测时清除紫色提示
     FTApplyBallAppearance(); // 橙色 = 校准中
-    FTLog("probing: looking for a working senderID");
+    FTLog("probing: looking for a working senderID (auto-continue on fail)");
     FTProbeNext();
 }
 
@@ -929,12 +944,30 @@ static void FTProbeNext(void) {
             break;
         }
         if (sid == 0) {
-            g_Probing = NO;
-            g_ProbeFullScan = NO;
-            g_ProbeIdx = 0;
-            g_ProbeNeedMain = YES;
-            FTApplyBallAppearance(); // 紫
-            FTLog("full scan complete - no working SID; touch non-ball area and retry");
+            // v1.0.106：全扫耗尽——若找到过「送达型」SID（哪怕手指已被顶掉），
+            // 保底锁定它开始连点（保证有点击）；完全没有送达型才紫色提示。
+            if (g_ProbeDeliveredSID != 0) {
+                g_LockedSID = g_ProbeDeliveredSID;
+                FT_HIDLockSenderID(g_ProbeDeliveredSID);
+                g_Probing = NO;
+                g_ProbeFullScan = NO;
+                g_ProbeIdx = 0;
+                g_ProbeEndingCount = 0;
+                FTApplyBallAppearance(); // 回蓝色
+                char dbg2[128];
+                snprintf(dbg2, sizeof(dbg2), "scan done - locked fallback SID 0x%llx (delivered); if combo is choppy, release and hold again to skip bad SIDs",
+                         (unsigned long long)g_ProbeDeliveredSID);
+                FTLog(dbg2);
+                gBallTouchClicking = YES;
+                FTStartClicking();
+            } else {
+                g_Probing = NO;
+                g_ProbeFullScan = NO;
+                g_ProbeIdx = 0;
+                g_ProbeNeedMain = YES;
+                FTApplyBallAppearance(); // 紫
+                FTLog("full scan complete - no working SID; touch non-ball area and retry");
+            }
             return;
         }
         if ((g_ProbeIdx % 32) == 0) {
@@ -956,44 +989,74 @@ static void FTProbeNext(void) {
     g_ProbeSID = sid;
     g_ProbeTouchEnded = NO;
     g_ProbeDelivered = NO;
-    double nx = gClickLockX, ny = gClickLockY;
-    if (nx < 0.001) nx = 0.001; if (nx > 0.999) nx = 0.999;
-    if (ny < 0.001) ny = 0.001; if (ny > 0.999) ny = 0.999;
+    // v1.0.106：探测 tap 注入【屏幕角落固定点】（远离球/点击点）——送达判定只看角落，
+    // 排除用户手指干扰（ctor-3 实锤：探测点=点击点时，球与点击点仅 ~57px，用户手指
+    // 滑出球边或第二根手指经过点击点附近 90px 内 → 误判送达 → 锁定不送达 SID → 空跑）。
+    // 送达性由 SID 决定、与注入位置无关，角落探测不影响结论。
+    double nx = FT_PROBE_PX, ny = FT_PROBE_PY;
+    if (gScreenW > 0 && gScreenH > 0) {
+        g_ProbeDetectX = nx * gScreenW;
+        g_ProbeDetectY = ny * gScreenH;
+    }
     // v1.0.102：探测 tap 用「down + 25ms 延迟 up」（同正式连点）——立即 up 无可见窗口
     FT_HIDProbeTapDelayed(nx, ny, sid);
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
                      dispatch_get_main_queue(), NULL, FTCheckProbe);
 }
 
-// 探测结果检查：送达（sendEvent 回流点击点触摸）且用户手指存活（未被顶掉）→ 锁定成功
+// 探测结果检查：送达（sendEvent 回流点击点触摸）且用户手指存活（未被顶掉）→ 锁定成功。
+// v1.0.106：顶掉型 SID 记录后【自动继续扫下一个】（不再要求用户重按）——按住一次扫到底；
+// 手指被顶掉后无法再验证「不顶掉」→ 送达型只记保底，等手指复活（系统重发 Began）再验证。
 static void FTCheckProbe(void *ctx) {
     (void)ctx;
     if (!g_Probing) return;
     if (g_ProbeTouchEnded) {
-        // 该 SID 顶掉了用户手指 → 无效；记录为顶掉类（全扫跳过），等用户重按（进度保留）
+        // 该 SID 顶掉了用户手指 → 记录为顶掉类（全扫跳过），自动试下一个
         if (g_ProbeEndingCount < 64 && g_ProbeSID) {
-            g_ProbeEndingSIDs[g_ProbeEndingCount++] = g_ProbeSID;
+            bool dup = false;
+            for (int k = 0; k < g_ProbeEndingCount; k++) {
+                if (g_ProbeEndingSIDs[k] == g_ProbeSID) { dup = true; break; }
+            }
+            if (!dup) g_ProbeEndingSIDs[g_ProbeEndingCount++] = g_ProbeSID;
         }
         char dbg[96];
-        snprintf(dbg, sizeof(dbg), "probe SID=0x%llx ENDED user finger - invalid (recorded)", (unsigned long long)g_ProbeSID);
+        snprintf(dbg, sizeof(dbg), "probe SID=0x%llx ENDED user finger - recorded, auto next",
+                 (unsigned long long)g_ProbeSID);
         FTLog(dbg);
-        g_Probing = NO;
         g_ProbeTouchEnded = NO;
-        FTApplyBallAppearance(); // 回蓝，提示重新按住
+        // 手指是否已重绑复活（系统重发 Began）？若没有 → 后续无法验证「不顶掉」
+        if (gBallTouch == NULL) {
+            g_ProbeFingerDead = YES;
+            FTLog("probe: finger ended & not re-bound -> can't verify non-ending SIDs this hold");
+        } else {
+            g_ProbeFingerDead = NO; // 已重绑 → 手指还活着，可继续完整验证
+        }
+        FTProbeNext(); // 自动继续（球保持橙色）
         return;
     }
     if (g_ProbeDelivered) {
-        // 送达且没顶掉 → 锁定
-        g_LockedSID = g_ProbeSID;
-        FT_HIDLockSenderID(g_ProbeSID);
-        g_Probing = NO;
-        g_ProbeFullScan = NO;
-        g_ProbeIdx = 0;
-        g_ProbeEndingCount = 0;
-        FTApplyBallAppearance(); // 回蓝色
-        FTLog("probe OK - SID locked, starting combo");
-        gBallTouchClicking = YES;
-        FTStartClicking();
+        if (!g_ProbeFingerDead) {
+            // 送达且没顶掉（手指活着）→ 锁定
+            g_LockedSID = g_ProbeSID;
+            FT_HIDLockSenderID(g_ProbeSID);
+            g_Probing = NO;
+            g_ProbeFullScan = NO;
+            g_ProbeIdx = 0;
+            g_ProbeEndingCount = 0;
+            FTApplyBallAppearance(); // 回蓝色
+            FTLog("probe OK - SID locked, starting combo");
+            gBallTouchClicking = YES;
+            FTStartClicking();
+            return;
+        }
+        // 手指已死：记录第一个送达型为保底（扫描耗尽时用它开始连点），继续扫
+        if (g_ProbeDeliveredSID == 0) g_ProbeDeliveredSID = g_ProbeSID;
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg), "probe SID=0x%llx delivered but finger dead - fallback kept, auto next",
+                 (unsigned long long)g_ProbeSID);
+        FTLog(dbg);
+        g_ProbeDelivered = NO;
+        FTProbeNext();
         return;
     }
     // 没送达也没顶掉（可能是 0x8000... 类被丢弃）→ 试下一个
@@ -1559,12 +1622,13 @@ static void FTTweakInitCallback(void *ctx) {
             if (!inGestureWin) {
                 FT_HIDCaptureMainSIDFromUIEvent((__bridge void *)event);
             }
-            // v1.0.101：探测期间检测「送达」——合成触摸回流 sendEvent 且落在点击点附近
+            // v1.0.101：探测期间检测「送达」——合成触摸回流 sendEvent 且落在角落探测点附近
             // （非球上）→ 当前探测 SID 送达成功。
-            if (g_Probing && !g_ProbeDelivered && !onBall) {
-                double cx = gClickLockX * gScreenW;
-                double cy = gClickLockY * gScreenH;
-                if (fabs(loc.x - cx) < 90 && fabs(loc.y - cy) < 90) {
+            // v1.0.106：判定坐标从「点击点」改为「角落探测点」（探测 tap 实际注入处），
+            // 半径 90→60——旧方案球与点击点仅 ~57px，用户手指滑出球边/第二根手指经过
+            // 点击点附近会误判送达（ctor-3：锁定不送达 SID 0x100000741 → 连点空跑）。
+            if (g_Probing && !g_ProbeDelivered && !onBall && g_ProbeDetectX > 0) {
+                if (fabs(loc.x - g_ProbeDetectX) < 60 && fabs(loc.y - g_ProbeDetectY) < 60) {
                     g_ProbeDelivered = YES;
                 }
             }
@@ -1572,6 +1636,9 @@ static void FTTweakInitCallback(void *ctx) {
                 if (onBall && gBallTouch == NULL) {
                     gBallTouch = tp;
                     gBallTouchDownTime = now;
+                    // v1.0.106：探测期间系统重发 Began（用户手指被顶掉后重绑复活）
+                    // → 恢复「不顶掉」验证能力，后续送达型 SID 可直接锁定
+                    if (g_Probing) g_ProbeFingerDead = NO;
                     // v1.0.80：若正在连点且系统因注入把上一根手指 Ended 后重发了 Began
                     // （用户仍物理按着），重绑并【取消松手宽限】，连点继续。
                     if (gIsClicking) {
@@ -1679,14 +1746,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.105 loaded (full-range SID scan after candidates; skip ending SIDs)");
+    syslog(LOG_ERR, "FloatingTap v1.0.106 loaded (corner-probe tap - reliable delivery; auto-continue scan)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.105 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; full-range scan; dispatch=probed SID)\n");
+            fprintf(mk, "FloatingTap v1.0.106 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; corner-probe; auto-continue scan)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
