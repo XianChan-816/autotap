@@ -1365,14 +1365,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.77 loaded (parent hand index=99; DisplayIntegrated=0x0B0017; explicit child fields; per-SID dispatch log)");
+    syslog(LOG_ERR, "FloatingTap v1.0.78 loaded (UP event parent Range/Touch=0 fixes long-press-selection; hand index=99; DisplayIntegrated=0x0B0017)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.77 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; hand index=99; DisplayIntegrated=0x0B0017; explicit child fields; per-SID dispatch log)\n");
+            fprintf(mk, "FloatingTap v1.0.78 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; UP parent Range/Touch=0; hand index=99; DisplayIntegrated=0x0B0017)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

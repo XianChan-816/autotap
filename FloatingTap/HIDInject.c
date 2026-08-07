@@ -278,8 +278,8 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
     }
     uint64_t ts = mach_absolute_time();
     uint32_t mask = down
-        ? (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventTouch | FT_kIOHIDDigitizerEventPosition)
-        : (FT_kIOHIDDigitizerEventTouch | FT_kIOHIDDigitizerEventPosition); // up: range=0
+        ? (FT_kIOHIDDigitizerEventRange | FT_kIOHIDDigitizerEventTouch | FT_kIOHIDDigitizerEventPosition) // down=0x07
+        : FT_kIOHIDDigitizerEventTouch;                                                                  // up=0x02（仅 Touch 状态变更，v1.0.78）
     Boolean range = down ? 1 : 0;
     Boolean touch = down ? 1 : 0;
 
@@ -330,14 +330,15 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
         // ZXTouch 验证生效的关键字段：
         //   DisplayIntegrated(0x0B0017)=1 → 内置屏幕集成触摸（v1.0.77 权威值修正）
         //   Identity(0x0B0019)=1 + Type(0x4)=1 → 认作真实屏幕集成触摸
-        //   EventMask(0x0B0007)=0x23 → 父事件 composite touch state
-        //   Range(0x0B0006)=1 + Touch(0x0B0008)=1 → 接触状态（与子事件一致）
+        // ⚠️ v1.0.78 关键：Range/Touch/EventMask 必须按 down/up 区分！
+        //   旧代码无条件 Range=1/Touch=1 → UP 事件父手仍显示"在触摸"→ 系统认为手指从未抬起
+        //   → 长按选中/上下文菜单（ctor-50 实测），且松手后触摸仍挂着。
         p_IOHIDEventSetIntegerValue(parent, 0x0B0017, 1); // DisplayIntegrated（0x0B0017，非 0x0B0005）
         p_IOHIDEventSetIntegerValue(parent, 0x0B0019, 1);
         p_IOHIDEventSetIntegerValue(parent, 0x4, 1);
-        p_IOHIDEventSetIntegerValue(parent, 0x0B0007, 0x23);
-        p_IOHIDEventSetIntegerValue(parent, 0x0B0006, 1); // Range
-        p_IOHIDEventSetIntegerValue(parent, 0x0B0008, 1); // Touch
+        p_IOHIDEventSetIntegerValue(parent, 0x0B0007, down ? 0x23 : 0x02); // EventMask: down=composite 0x23, up=Touch 0x02
+        p_IOHIDEventSetIntegerValue(parent, 0x0B0006, down ? 1 : 0);      // Range（up=0）
+        p_IOHIDEventSetIntegerValue(parent, 0x0B0008, down ? 1 : 0);      // Touch（up=0）← 关键
     }
 
     p_IOHIDEventAppendEvent(parent, child, 0);
