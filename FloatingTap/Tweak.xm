@@ -643,6 +643,9 @@ static void FTApplyGRModes(void) {
     ((Msg_SetEnabled)objc_msgSend)(gClickPanGR, sel_registerName("setEnabled:"), gIsClicking ? NO : (gDragMode ? YES : NO));
 }
 
+// v1.0.99：清残留合成手指（定义在 FTStopClicking 之前；FTStartClicking 先调用需前向声明）
+static void FTRaiseResidualUps(void);
+
 // v1.0.48：SB 端恢复直接注入（不再写任务文件）。坐标锁定 = App 配置点（v1.0.50）
 // 或长按开始时球心（无配置时）。
 static void FTStartClicking(void) {
