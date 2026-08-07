@@ -657,7 +657,7 @@ static void FTHIDProbeUpCallback(void *ctx) {
         // 防残留合成手指堆积污染系统触摸状态（连点 down 不送达 → 空跑，ctor(1)(1) 铁证：
         // SEND 残留 tap=3/28/43/71 合成手指）
         extern void FT_ProbeUpDoneHook(void);
-        if (FT_ProbeUpDoneHook) FT_ProbeUpDoneHook();
+        FT_ProbeUpDoneHook();
         free(c);
     }
 }
