@@ -1033,7 +1033,16 @@ static void FTProbeNext(void) {
     uint64_t sid = 0;
     if (g_ProbeFullScan) {
         while (g_ProbeIdx < 768) {
-            uint64_t cand = 0x100000600ULL + (uint64_t)g_ProbeIdx;
+            // v1.0.114：段顺序 7xx → 6xx → 8xx——历史有效 SID 大多在 7xx（709/716/741/7f3
+            // 等），优先扫 7xx 段可大幅缩短「变蓝」时间（ctor-11 每轮全扫 49 秒太长）。
+            uint64_t cand;
+            if (g_ProbeIdx < 256) {
+                cand = 0x100000700ULL + (uint64_t)g_ProbeIdx;        // 7xx（256 个）
+            } else if (g_ProbeIdx < 512) {
+                cand = 0x100000600ULL + (uint64_t)(g_ProbeIdx - 256); // 6xx（256 个）
+            } else {
+                cand = 0x100000800ULL + (uint64_t)(g_ProbeIdx - 512); // 8xx（256 个）
+            }
             g_ProbeIdx++;
             bool skip = false;
             for (int k = 0; k < g_ProbeEndingCount; k++) {
@@ -1071,11 +1080,14 @@ static void FTProbeNext(void) {
             }
             return;
         }
-        // v1.0.111：段切换提示（6xx/7xx/8xx）+ 每 64 个进度（768 总数）
+        // v1.0.111：段切换提示（7xx/6xx/8xx）+ 每 64 个进度（768 总数）
         if (g_ProbeIdx == 1 || g_ProbeIdx == 257 || g_ProbeIdx == 513) {
+            uint64_t segbase = (g_ProbeIdx <= 256) ? 0x100000700ULL
+                             : (g_ProbeIdx <= 512) ? 0x100000600ULL
+                                                   : 0x100000800ULL;
             char dbg2[96];
             snprintf(dbg2, sizeof(dbg2), "full scan: entering 0x%llx range (%d/768)",
-                     (unsigned long long)(0x100000600ULL + (uint64_t)(g_ProbeIdx - 1)), g_ProbeIdx);
+                     (unsigned long long)segbase, g_ProbeIdx);
             FTLog(dbg2);
         } else if ((g_ProbeIdx % 64) == 0) {
             char dbg2[96];
@@ -1120,6 +1132,13 @@ static void FTProbeNext(void) {
     g_PendingUpIdx[2] = true;
     // v1.0.102：探测 tap 用「down + 25ms 延迟 up」（同正式连点）——立即 up 无可见窗口
     FT_HIDProbeTapDelayed(nx, ny, sid);
+    // v1.0.114：探测期间也定期清残留（每 ~16 个 ≈ 1s）——探测 tap up 丢失同样会堆积
+    // 残留合成手指 → 污染系统触摸状态 → 后续探测 tap 全部不送达（ctor-11 多轮全扫
+    // 768 个零送达的疑似根因；v1.0.113 的清残留只在连点期间生效，探测期间漏了）
+    static int sProbeResidual = 0;
+    if ((sProbeResidual++ % 16) == 0) {
+        FTCheckResidualDuringCombo();
+    }
     // v1.0.111：全扫检查窗口 80ms→60ms（Began 回流 10-30ms、顶掉信号 <60ms 内；
     // 768 全扫 46s→35s 最坏）
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)),
@@ -1936,14 +1955,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.113 loaded (periodic residual cleanup during combo; 50ms release grace)");
+    syslog(LOG_ERR, "FloatingTap v1.0.114 loaded (probe-time residual cleanup; 7xx-first scan order)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.113 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; periodic residual cleanup; 50ms grace)\n");
+            fprintf(mk, "FloatingTap v1.0.114 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; probe cleanup; 7xx-first scan)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
