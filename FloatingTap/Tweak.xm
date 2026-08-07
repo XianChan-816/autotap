@@ -524,7 +524,10 @@ static void FTSendHIDUpCallback(void *ctx) {
 
 // v1.0.108：探测 tap 的 up 已派发完成（HIDInject.c 回调）→ 清除残留位图 index=2
 //（探测 tap 固定 index 2）。防残留合成手指堆积污染触摸状态 → 连点 down 不送达（空跑）。
-void FT_ProbeUpDoneHook(void) {
+// ⚠️ 必须 extern "C"——Tweak.xm 是 ObjC++（.mm），普通函数定义会被 C++ name-mangle
+// 成 _Z18FT_ProbeUpDoneHookv，HIDInject.c（纯 C）引用的 _FT_ProbeUpDoneHook 找不到
+//（CI 链接 Undefined symbols 实锤）。
+extern "C" void FT_ProbeUpDoneHook(void) {
     g_PendingUpIdx[2] = false;
 }
 
