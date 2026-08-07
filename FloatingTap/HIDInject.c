@@ -114,10 +114,10 @@ static uint64_t g_OverrideSenderID = 0;
 static uint64_t g_CapturedSIDs[12] = {0};
 static int      g_CapturedSIDCount = 0;
 static uint64_t g_WorkingSID = 0;   // 已验证可用（ret=0）的 senderID（锁定后优先使用）
-// v1.0.84：服务枚举拿到的第一个 digitizer 服务 registryID（0x8de4... 形态，与 zxtouch
-// 的 kIOHIDEventDigitizerSenderID 0x8000... 同段）——sendEvent 捕获的 0x1000007xx 全是
-// 「翻译后」ID、系统不认领（ret=0x1，ctor-56 实测），服务 registryID 才可能是被接受的。
-static uint64_t g_ServiceSID = 0;
+// v1.0.84 教训（ctor-57）：服务枚举的 digitizer registryID（0x8de4/0x9114... 形态）不是
+// 系统接受的 senderID——用它派发事件【完全不送达】（日志连点期间无合成触摸、计数器零点击）。
+// sendEvent 捕获的 0x1000007xx（「翻译后」ID）虽然 ret=0x1（假阴性）但事件实际送达、点击有效。
+// → 首选必须是 captured[0]（sendEvent 捕获值）；registryID 只入候选不做首选。
 
 // 前向声明（定义在文件后部「诊断日志」段，但 FT_HIDConnect 等前面函数要用）
 static void FTHIDLog(const char *msg);
@@ -253,17 +253,11 @@ static void FT_HIDEnumerateServices(void) {
             }
             break; // 该服务取到一个就下一个
         }
-        // registryID 路径（v1.0.83）：独立 API，最可能命中系统接受的 digitizer senderID
+        // registryID 路径（v1.0.83）：独立 API。⚠️ v1.0.84 实测（ctor-57）registryID
+        // 派发事件【不送达】——只入候选做诊断，不做首选（首选必须 sendEvent 捕获值）。
         if (p_IOHIDServiceClientGetRegistryID) {
             uint64_t rid = p_IOHIDServiceClientGetRegistryID(svc);
             if (rid) {
-                // v1.0.84：第一个【确认 digitizer】的服务 registryID 设为首选派发 SID
-                // （PrimaryUsagePage 可读且==0x0D 才收；读不到的无关服务不收，避免误选）
-                if (!g_ServiceSID && gotUsage && usagePage == 0x0D) {
-                    g_ServiceSID = rid;
-                    snprintf(dbg, sizeof(dbg), "preferred service SID (digitizer): 0x%llx", (unsigned long long)rid);
-                    FTHIDLog(dbg);
-                }
                 bool dup = false;
                 for (int j = 0; j < g_CapturedSIDCount; j++) {
                     if (g_CapturedSIDs[j] == rid) { dup = true; break; }
@@ -471,14 +465,13 @@ FT_IOHIDEventRef FT_HIDCreateDigitizerEvent(bool down, double x, double y, uint3
 // 在 10ms 连点下 = 每秒 ~2000 次系统事件注入，严重污染系统触摸/手势状态机——
 // 实测后果：连点之后 Home indicator（小白条）上滑手势失效（什么位置都触发、息屏才恢复）。
 // 且 ret=0x1 是假阴性（ctor-54 证据：全候选 0x1 但 41 下真实点击照常），循环无收益。
-// 现固定首选 SID 只派发 1 次：g_WorkingSID（已锁定）→ g_ServiceSID（v1.0.84 服务枚举的
-// digitizer registryID，0x8de4... 形态与 zxtouch 的 0x8000... 同段，可能才是系统认领的）
-// → captured[0]（sendEvent 翻译后的真实设备值）→ 0x1000007ad → 硬编码。不再重建重试。
+// v1.0.85 首选修正（ctor-57 铁证）：首选必须是 sendEvent 捕获的 captured[0]（0x1000007xx，
+// ret=0x1 假阴性但事件实际送达、点击有效）；服务枚举 registryID（0x8de4/0x9114...）派发
+// 事件完全不送达（v1.0.84 实测零点击）→ 只留候选。单次派发、不再重建重试。
 static void FT_DispatchEvent(FT_IOHIDEventRef event, double nx, double ny, uint32_t index, bool down) {
     (void)nx; (void)ny; (void)index; (void)down;
     if (!event || !g_hidClient) { if (event) CFRelease(event); return; }
     uint64_t sid = g_WorkingSID;
-    if (!sid && g_ServiceSID) sid = g_ServiceSID;
     if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
     if (!sid) sid = 0x1000007adULL;
     p_IOHIDEventSetSenderID(event, sid);
@@ -532,40 +525,24 @@ void FT_HIDDispatchUp(double normalizedX, double normalizedY, uint32_t index) {
 // v1.0.83：连点停止时强制「抬全手」——派发一个 hand-only up 事件
 // （parent: hand index=99, Range=0/Touch=0, EventMask=0x02，无子事件），
 // 让系统把该合成 hand 的所有残留子手指一次抬起。
-// 背景：10ms 高频连点的 down/up 若有未闭合（up 迟到/被过滤）的合成触摸残留，
-// 系统会认为屏幕上有手指一直按着 → Home indicator 上滑手势无法开始（连点后小白条失效，
-// 息屏重置触摸状态才恢复）。停止连点时立即清场，模拟息屏的触摸重置效果。
+// ⚠️ v1.0.85 修正（ctor-57）：parent-only 事件 ret=0x2cf4000/0x880000 全失败（系统不认），
+// 改为派发【正常 up 事件】（带 finger 子事件，与 per-tap 相同的构造）覆盖 index 1~8，
+// 用首选 senderID（captured[0]）——只有被送达的 up 才能闭合残留的合成手指。
 void FT_HIDRaiseAllSyntheticUp(void) {
-    if (!g_hidClient) return;
-    if (!FT_HIDLoadSymbols()) return;
-    if (!p_IOHIDEventCreateDigitizerEvent) return;
-    uint64_t ts = mach_absolute_time();
-    // 15 参签名：alloc, ts, type=Hand(3), index=99, identity=1, eventMask=0, buttonMask=0,
-    // x=0, y=0, z=0, tipPressure=0, barrelPressure=0, range=0, touch=0, options=0
-    FT_IOHIDEventRef ev = p_IOHIDEventCreateDigitizerEvent(
-        kCFAllocatorDefault, ts,
-        3, 99, 1,
-        0, 0,
-        0.0, 0.0, 0.0,
-        0.0, 0.0,
-        0, 0, 0);
-    if (!ev) return;
-    if (p_IOHIDEventSetIntegerValue) {
-        p_IOHIDEventSetIntegerValue(ev, 0x0B0017, 1); // DisplayIntegrated
-        p_IOHIDEventSetIntegerValue(ev, 0x0B0019, 1);
-        p_IOHIDEventSetIntegerValue(ev, 0x4, 1);
-        p_IOHIDEventSetIntegerValue(ev, 0x0B0007, 0x02); // EventMask = Touch-only（up 态）
-        p_IOHIDEventSetIntegerValue(ev, 0x0B0006, 0);    // Range = 0
-        p_IOHIDEventSetIntegerValue(ev, 0x0B0008, 0);    // Touch = 0 ← hand 无触摸，抬全部
-    }
+    if (!FT_HIDConnect()) return;
     uint64_t sid = g_WorkingSID;
-    if (!sid && g_ServiceSID) sid = g_ServiceSID;
     if (!sid && g_CapturedSIDCount > 0) sid = g_CapturedSIDs[0];
     if (!sid) sid = 0x1000007adULL;
-    p_IOHIDEventSetSenderID(ev, sid);
-    FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_hidClient, ev);
-    CFRelease(ev);
+    int sent = 0;
+    for (uint32_t i = 1; i <= 8; i++) {
+        FT_IOHIDEventRef ev = FT_HIDCreateDigitizerEvent(false, 0.5, 0.5, i);
+        if (!ev) continue;
+        p_IOHIDEventSetSenderID(ev, sid);
+        p_IOHIDEventSystemClientDispatchEvent(g_hidClient, ev);
+        CFRelease(ev);
+        sent++;
+    }
     char dbg[96];
-    snprintf(dbg, sizeof(dbg), "hand-up raise all (SID=0x%llx) ret=0x%x", (unsigned long long)sid, (unsigned)ret);
+    snprintf(dbg, sizeof(dbg), "raise all synthetic up: %d ups (SID=0x%llx)", sent, (unsigned long long)sid);
     FTHIDLog(dbg);
 }

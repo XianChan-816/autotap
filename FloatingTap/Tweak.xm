@@ -1442,14 +1442,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.84 loaded (landscape coord conversion; preferred service SID)");
+    syslog(LOG_ERR, "FloatingTap v1.0.85 loaded (senderID captured-first; normal-up cleanup; landscape coord conversion)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.84 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; landscape coord conversion; preferred service SID; single-shot dispatch)\n");
+            fprintf(mk, "FloatingTap v1.0.85 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; senderID captured-first; normal-up cleanup; landscape coord conversion)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
