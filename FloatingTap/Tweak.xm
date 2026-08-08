@@ -2400,7 +2400,7 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.135 loaded (return-ratio eviction - enders have <50% return, stable >90%); residual rebuild-ctx");
+    syslog(LOG_ERR, "FloatingTap v1.0.135 loaded (return-ratio eviction - enders <50%% return, stable >90%%; residual rebuild-ctx)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
