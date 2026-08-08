@@ -139,6 +139,9 @@ static double g_ProbeTapT0 = 0;
 static BOOL   g_ProbeFingerDead = NO;
 // v1.0.108：手指死后第一个「送达型」SID（全扫耗尽时保底锁定开始连点，保证有点击）
 static uint64_t g_ProbeDeliveredSID = 0;
+// v1.0.115：锁定成功时的全扫位置——自愈验证失败（verify-fail）后从该位置继续扫，
+// 不再从头全扫 49 秒（ctor-12：「至少三次按很久才变蓝」的根因之一）
+static int g_ProbeLockIdx = 0;
 static uint64_t g_ProbeSID = 0;      // 当前探测的 SID
 static uint64_t g_LockedSID = 0;     // 探测成功锁定的有效 SID（会话内稳定）
 static uint64_t g_ProbeSIDs[10];     // 候选集（构建后去重）
@@ -1033,15 +1036,16 @@ static void FTProbeNext(void) {
     uint64_t sid = 0;
     if (g_ProbeFullScan) {
         while (g_ProbeIdx < 768) {
-            // v1.0.114：段顺序 7xx → 6xx → 8xx——历史有效 SID 大多在 7xx（709/716/741/7f3
-            // 等），优先扫 7xx 段可大幅缩短「变蓝」时间（ctor-11 每轮全扫 49 秒太长）。
+            // v1.0.115：段顺序 7xx → 8xx → 6xx——历史有效 SID 在 7xx（709/716/741/7f3）
+            // 和 8xx（8fe/8a9/8b5/854）都出现过（ctor-12 有效值 8fe 在 8xx），6xx 最后。
+            // 7xx+8xx 共 512 个 ≈ 30s 内大概率命中。
             uint64_t cand;
             if (g_ProbeIdx < 256) {
                 cand = 0x100000700ULL + (uint64_t)g_ProbeIdx;        // 7xx（256 个）
             } else if (g_ProbeIdx < 512) {
-                cand = 0x100000600ULL + (uint64_t)(g_ProbeIdx - 256); // 6xx（256 个）
+                cand = 0x100000800ULL + (uint64_t)(g_ProbeIdx - 256); // 8xx（256 个）
             } else {
-                cand = 0x100000800ULL + (uint64_t)(g_ProbeIdx - 512); // 8xx（256 个）
+                cand = 0x100000600ULL + (uint64_t)(g_ProbeIdx - 512); // 6xx（256 个）
             }
             g_ProbeIdx++;
             bool skip = false;
@@ -1080,11 +1084,11 @@ static void FTProbeNext(void) {
             }
             return;
         }
-        // v1.0.111：段切换提示（7xx/6xx/8xx）+ 每 64 个进度（768 总数）
+        // v1.0.111：段切换提示（7xx/8xx/6xx）+ 每 64 个进度（768 总数）
         if (g_ProbeIdx == 1 || g_ProbeIdx == 257 || g_ProbeIdx == 513) {
             uint64_t segbase = (g_ProbeIdx <= 256) ? 0x100000700ULL
-                             : (g_ProbeIdx <= 512) ? 0x100000600ULL
-                                                   : 0x100000800ULL;
+                             : (g_ProbeIdx <= 512) ? 0x100000800ULL
+                                                   : 0x100000600ULL;
             char dbg2[96];
             snprintf(dbg2, sizeof(dbg2), "full scan: entering 0x%llx range (%d/768)",
                      (unsigned long long)segbase, g_ProbeIdx);
@@ -1185,6 +1189,7 @@ static void FTCheckProbe(void *ctx) {
             // 送达且没顶掉（手指活着）→ 锁定完美
             g_LockedSID = g_ProbeSID;
             FT_HIDLockSenderID(g_ProbeSID);
+            g_ProbeLockIdx = g_ProbeIdx; // v1.0.115：记锁定位置（verify-fail 后从断点继续）
             g_Probing = NO;
             g_ProbeFullScan = NO;
             g_ProbeIdx = 0;
@@ -1240,6 +1245,14 @@ static void FTVerifyDeliveryTimer(void *ctx) {
     FTStopClicking("verify-fail");
     g_LockedSID = 0;
     FT_HIDLockSenderID(0);
+    // v1.0.115：从【锁定位置】继续全扫（跳过已记录的坏 SID），不再从头 49 秒
+    if (g_ProbeLockIdx > 0) {
+        g_ProbeIdx = g_ProbeLockIdx;
+        g_ProbeFullScan = YES;
+        char dbg2[96];
+        snprintf(dbg2, sizeof(dbg2), "verify-fail: resume full scan from %d/768", g_ProbeIdx);
+        FTLog(dbg2);
+    }
     FTStartProbing(); // 用户仍按着球 → 从跳过列表后继续探测
 }
 
@@ -1799,20 +1812,25 @@ static void FTTweakInitCallback(void *ctx) {
             // 90px，用户手指滑出球边（Moved，距点击点 <90px）或第二根手指经过点击点附近
             // 会被误判送达（ctor-3 锁定不送达 SID → 空跑）；Began+时间窗只认探测 tap 自己的
             // 合成触摸（注入后立即回流的 Began），用户手指的 Moved/已存在触摸不匹配。
+            // ⚠️ v1.0.115：半径 90→45px——ctor-12 实锤：点击点距球仅 ~85px，用户手指在球
+            // 边缘滑出/重绑 Began（<90px）被误判送达 → 锁定假送达型 → 连点空跑 →
+            // verify-fail 回退循环（「一瞬间变蓝+绿圈消失」闪烁）。45px 只认精确落点击点的
+            // 合成触摸，用户手指在球上（onBall 排除）且滑出球边 40px 内才可能误判（概率大降）。
             if (g_Probing && !g_ProbeDelivered && ph == 0 && !onBall && g_ProbeTapT0 > 0) {
                 double cx = gClickLockX * gScreenW;
                 double cy = gClickLockY * gScreenH;
-                if (fabs(loc.x - cx) < 90 && fabs(loc.y - cy) < 90 &&
+                if (fabs(loc.x - cx) < 45 && fabs(loc.y - cy) < 45 &&
                     (now - g_ProbeTapT0) < 0.06) {
                     g_ProbeDelivered = YES;
                 }
             }
             // v1.0.112：连点送达自愈验证——锁定后连点期间，点击点附近出现 !onBall 合成
             // 触摸回流 → 真送达（300ms 内任一即通过；用户手指在球上 onBall 排除）
+            // ⚠️ v1.0.115：半径 90→45px（同探测判定，防用户手指干扰误判验证通过）
             if (g_VerifyDelivering && !g_VerifySawSynthetic && !onBall) {
                 double vcx = gClickLockX * gScreenW;
                 double vcy = gClickLockY * gScreenH;
-                if (fabs(loc.x - vcx) < 90 && fabs(loc.y - vcy) < 90) {
+                if (fabs(loc.x - vcx) < 45 && fabs(loc.y - vcy) < 45) {
                     g_VerifySawSynthetic = YES;
                 }
             }
@@ -1955,14 +1973,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.114 loaded (probe-time residual cleanup; 7xx-first scan order)");
+    syslog(LOG_ERR, "FloatingTap v1.0.115 loaded (45px delivery radius - no false lock; 7xx-8xx-6xx order; verify-fail resumes scan)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.114 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; probe cleanup; 7xx-first scan)\n");
+            fprintf(mk, "FloatingTap v1.0.115 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; 45px radius; verify-fail resume)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
