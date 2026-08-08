@@ -190,6 +190,7 @@ static void FTVerifyDeliveryTimer(void *ctx);
 // + 断点续扫；窗口内稳定 → 验证通过，正式连点。
 static BOOL   g_StabTesting = NO;
 static BOOL   g_StabFail = NO;
+static BOOL   g_StabExtended = NO; // v1.0.120：裁决已延长一次（等系统重绑用户手指）
 
 // v1.0.50：AutoTap App 配置（位置/间隔）——定义在 FTIntervalMs 之前（它要读）
 static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 10.0;
@@ -1250,6 +1251,7 @@ static void FTCheckProbe(void *ctx) {
             // FTVerifyDeliveryTimer 400ms 窗口内顶掉+重绑 → stab-fail → 记跳过 + 续扫。
             g_StabTesting = YES;
             g_StabFail = NO;
+            g_StabExtended = NO; // v1.0.120：每轮锁定重置延长标志
             FTStartClicking();
             return;
         }
@@ -1295,12 +1297,24 @@ static void FTVerifyDeliveryTimer(void *ctx) {
         if (wasStab) FTLog("stab: SID stable - combo continues");
         return;
     }
-    // 用户手指未重绑（gBallTouch==NULL）→ 真松手 → 正常停止（回蓝），不续扫
+    // 有顶掉标记或无回流 → 看用户手指状态：
     if (gBallTouch == NULL) {
-        if (wasStab) FTLog("stab: touches-ended was real finger-up - stay stopped");
+        // ⚠️ v1.0.120：顶掉后系统重绑用户手指需 0.6~1.4s+（ctor-16/17 实测），首次
+        // 裁决（0.8s）时往往还没重绑——不能直接当「真松手」处理（ctor-17 实锤：
+        // 误判后坏 SID 0x100000716 不淘汰，每轮 10 次反复顶掉循环 → 不连续）。
+        // 延长等待一次（共 ~1.6s）：期间重绑 → 顶掉确认 → 记跳过 + 续扫；
+        // 1.6s 仍无重绑 → 才是真松手 → 保持停止（点击本身已在 touches-ended 时立即停）。
+        if (!g_StabExtended) {
+            g_StabExtended = YES;
+            g_VerifyDelivering = YES; // 保持验证进行，重排检查
+            dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                             dispatch_get_main_queue(), NULL, FTVerifyDeliveryTimer);
+            return;
+        }
+        if (wasStab) FTLog("stab: no rebind in 1.6s - real finger-up, stay stopped");
         return;
     }
-    // 走到这里 = 手指还按着（被顶掉后已重绑）：假送达 或 高频顶掉 → 记跳过 + 续扫
+    // 走到这里 = 手指已重绑（顶掉确认）：假送达 或 高频顶掉 → 记跳过 + 续扫
     const char *why = (!g_VerifySawSynthetic && !wasStab)
         ? "verify: locked SID not delivering - reverting to probe"
         : "stab-fail: high-freq combo ends user finger - reverting to probe";
@@ -2077,14 +2091,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.119 loaded (high-freq stability verify - skip SIDs that end user finger during combo)");
+    syslog(LOG_ERR, "FloatingTap v1.0.120 loaded (stab verdict waits for system finger rebind - correctly skips high-freq enders)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.119 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; high-freq stability verify)\n");
+            fprintf(mk, "FloatingTap v1.0.120 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; stab verdict waits for rebind)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
