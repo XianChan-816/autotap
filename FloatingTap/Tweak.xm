@@ -28,6 +28,7 @@
 #import <string.h>
 #import <syslog.h>
 #import <time.h>
+#import <math.h>
 #import <stdint.h>
 #import <stdbool.h>
 #import <unistd.h>
@@ -1008,6 +1009,22 @@ static void FTBuildProbeCandidates(void) {
 // v1.0.106：按住一次自动连续扫描——顶掉/不送达都自动试下一个，不再要求每次重按）
 static void FTStartProbing(void) {
     if (g_Probing) return;
+    // ⚠️ v1.0.116：点击点与球重叠保护（ctor-13 全扫 768 零送达的根因）——距离 <120px
+    // （球直径 56 + 边距）时，注入到点击点的合成触摸会被球（可交互手势窗口 subview）
+    // 拦截，任何 SID 都不会送达。紫球提示先拖动点击点/球分离，不再浪费 ~49s 全扫。
+    if (gBallView) {
+        CGRect bf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
+        double bcx = bf.origin.x + bf.size.width * 0.5;
+        double bcy = bf.origin.y + bf.size.height * 0.5;
+        double ddx = gClickLockX * gScreenW - bcx;
+        double ddy = gClickLockY * gScreenH - bcy;
+        if (ddx * ddx + ddy * ddy < 120.0 * 120.0) {
+            g_ProbeNeedMain = YES;
+            FTApplyBallAppearance();
+            FTLog("click-point overlaps ball; drag click-point away from ball, then retry");
+            return;
+        }
+    }
     FTBuildProbeCandidates();
     g_Probing = YES;
     if (!g_ProbeFullScan) g_ProbeIdx = 0; // 全扫中保留进度
@@ -1496,6 +1513,15 @@ static void FTSetupBall(void) {
     }
     CGFloat d = 56.0;
     CGRect ballFrame = CGRectMake(gScreenW / 2 - d / 2, gScreenH / 2 - d / 2, d, d);
+    // ⚠️ v1.0.116 定案（ctor-13 实锤）：默认点击点必须与球分离！
+    // 旧默认 gClickLock=(0.5,0.5)=屏幕中心=球位置：探测 tap 注入到点击点=注入到球上，
+    // 球是 userInteractionEnabled=YES 的手势窗口 subview → 合成触摸被球拦截永不路由 →
+    // 全扫 768 个 SID 零送达 → 变不了蓝。点击点标记 userInteractionEnabled=NO（穿透），
+    // 只要点击点不在球上，注入即可送达。无配置时默认放到球下方 ~1/6 屏（竖屏基准）。
+    if (!gCfgLoaded) {
+        gClickLockX = 0.5;
+        gClickLockY = 0.66; // 球下方 ~190px（1194×0.16）
+    }
 
     // v1.0.60：球必须挂到 _UISystemGestureWindow（系统手势层，始终在所有 App 之上），
     // 游戏/前台 App 内才可见可点。但它是 internal window，[UIApplication windows] 枚举不到，
@@ -1681,15 +1707,21 @@ static void FTSetupBall(void) {
 }
 
 // v1.0.50：移动球到 App 配置位置（球心 = 配置点击点；未加载配置则居中不动）
+// ⚠️ v1.0.116：球与点击点必须分离——球（可交互手势窗口 subview）盖住点击点会拦截
+// 注入到点击点的合成触摸 → 探测零送达（ctor-13 实锤）。配置点=点击点，球移到配置点
+// 必然重叠 → 把球放到点击点正上方 150px（用户可再拖球微调）。
 static void FTMoveBallToConfig(void) {
     if (!gBallView || !gCfgLoaded) return;
     if (gScreenW <= 0 || gScreenH <= 0) return;
     double px = gCfgX * gScreenW;
     double py = gCfgY * gScreenH;
     CGRect f = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
+    double bw = f.size.width, bh = f.size.height;
+    // 偏移：默认点击点上方 150px；上方越界（<60px）则改下方
+    double ox = 0.0, oy = -150.0;
+    if (py + oy < 60.0) oy = 150.0;
     ((Msg_SetFrame)objc_msgSend)(gBallView, sel_registerName("setFrame:"),
-        CGRectMake(px - f.size.width * 0.5, py - f.size.height * 0.5,
-                   f.size.width, f.size.height));
+        CGRectMake(px - bw * 0.5, py - bh * 0.5 + oy, bw, bh));
     // 同步点击点标记位置（连点打在配置点；与球解耦，二者可分别拖动）
     gClickLockX = gCfgX;
     gClickLockY = gCfgY;
@@ -1699,7 +1731,7 @@ static void FTMoveBallToConfig(void) {
             CGRectMake(gCfgX * gScreenW - m / 2, gCfgY * gScreenH - m / 2, m, m));
     }
     char diag[96];
-    snprintf(diag, sizeof(diag), "ball moved to config %.2f,%.2f", gCfgX, gCfgY);
+    snprintf(diag, sizeof(diag), "ball moved to config %.2f,%.2f (offset %.0f,%.0f)", gCfgX, gCfgY, ox, oy);
     FTLog(diag);
 }
 
@@ -1819,6 +1851,21 @@ static void FTTweakInitCallback(void *ctx) {
             if (g_Probing && !g_ProbeDelivered && ph == 0 && !onBall && g_ProbeTapT0 > 0) {
                 double cx = gClickLockX * gScreenW;
                 double cy = gClickLockY * gScreenH;
+                // v1.0.116 诊断：记录任何距点击点 <200px 的 !onBall Began（无论是否 45px
+                // 命中），节流每 32 条——若仍有「送达但判定 miss」可从此日志定位合成触摸
+                // 实际落点与偏移量（下一轮不再盲猜）。
+                if ((now - g_ProbeTapT0) < 0.06) {
+                    double dist = sqrt((loc.x - cx) * (loc.x - cx) + (loc.y - cy) * (loc.y - cy));
+                    if (dist < 200.0) {
+                        static int sProbeSaw = 0;
+                        if ((sProbeSaw++ % 32) == 0) {
+                            char dbg[128];
+                            snprintf(dbg, sizeof(dbg), "probe saw Began at %.0f,%.0f (clickPt %.0f,%.0f dist=%.0f)",
+                                     loc.x, loc.y, cx, cy, dist);
+                            FTLog(dbg);
+                        }
+                    }
+                }
                 if (fabs(loc.x - cx) < 45 && fabs(loc.y - cy) < 45 &&
                     (now - g_ProbeTapT0) < 0.06) {
                     g_ProbeDelivered = YES;
@@ -1973,14 +2020,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.115 loaded (45px delivery radius - no false lock; 7xx-8xx-6xx order; verify-fail resumes scan)");
+    syslog(LOG_ERR, "FloatingTap v1.0.116 loaded (click-point decoupled from ball - no more injected tap landing on ball; overlap guard; probe saw-log)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.115 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; 45px radius; verify-fail resume)\n");
+            fprintf(mk, "FloatingTap v1.0.116 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; click-point decoupled from ball; overlap guard)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
