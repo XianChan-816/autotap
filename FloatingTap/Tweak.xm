@@ -557,6 +557,17 @@ static void FTSendHIDUpCallback(void *ctx) {
     }
 }
 
+// ⚠️ v1.0.124：残留处理「移走」回调——对已存在的合成手指 index 注入同 index 的 down
+//（zxtouch 移动语义：系统按 index 匹配已有手指并更新位置）→ 把残留手指从点击点移到
+// 屏幕角落。即使后续 up 仍被系统吞掉，手指也已离开游戏按钮 → 停止持续触发/长按。
+static void FTSendHIDMoveCallback(void *ctx) {
+    FTHIDUpCtx *c = (FTHIDUpCtx *)ctx;
+    if (c) {
+        FT_HIDDispatchDown(c->x, c->y, c->index);
+        free(c);
+    }
+}
+
 // v1.0.108：探测 tap 的 up 已派发完成（HIDInject.c 回调）→ 清除残留位图 index=2
 //（探测 tap 固定 index 2）。防残留合成手指堆积污染触摸状态 → 连点 down 不送达（空跑）。
 // ⚠️ 必须 extern "C"——Tweak.xm 是 ObjC++（.mm），普通函数定义会被 C++ name-mangle
@@ -809,25 +820,30 @@ static void FTRaiseResidualUps(void) {
         }
     }
     if (np > 0) {
-        // ⚠️ v1.0.122：补发延迟 150ms 起步（原 0ms）——停止瞬间系统触摸上下文还在
-        // 处理连点流，立即补发 up 会被吞掉（ctor-19 实锤：残留 tap=799/91 Stationary
-        // 持续 3-8s，补发 up 未抬掉 → 小白条失效直到系统自行过期）。等系统稳定后再
-        // 逐个串行补发（25ms 间隔），确保每个 up 都被独立处理。
-        // ⚠️ v1.0.123：双保险——每个残留 index 补发 2 次 up（间隔 60ms）。ctor-20 实锤：
-        // 单次补发仍被吞（停止后残留 tap=1/5 持续 5s+）。首次可能被系统丢弃，第二次
-        // 在系统稳定后成功率更高（已抬起的 index 再 up 系统视为无操作，无害）。
+        // ⚠️ v1.0.124 定案（ctor-19/20/21 实锤）：停止后补发 up 一直无效（立即/串行/
+        // 延迟 150ms/x2 全被系统吞）——残留合成手指 Stationary 持续数秒 → 全自动枪
+        // 持续开火 + 小白条失效（用户：绿圈出现=已停止，枪还在开）。根因：up 事件
+        // 可能被系统当作「同一手指的重复抬起」忽略。
+        // **换思路：先「移走」再「抬起」**——延迟 150ms 等系统稳定后，对每个残留
+        // index 注入同 index 的 down（zxtouch 移动语义，位置=屏幕左上角 0.05,0.05），
+        // 把残留手指移离点击点（游戏按钮），60ms 后再 up 抬起。即使 up 仍被吞，
+        // 手指已移走 → 游戏停止持续触发、小白条恢复。角落远离按钮与 Home 区域。
         for (int k = 0; k < np; k++) {
-            for (int r = 0; r < 2; r++) {
-                FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
-                if (c) {
-                    c->x = rx; c->y = ry; c->index = pend[k];
-                    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.15 + (double)(k * 2 + r) * 0.06) * NSEC_PER_SEC)),
-                                     dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
-                }
+            FTHIDUpCtx *m = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
+            if (m) {
+                m->x = 0.05; m->y = 0.05; m->index = pend[k];
+                dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.15 + (double)k * 0.06) * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), NULL, FTSendHIDMoveCallback);
+            }
+            FTHIDUpCtx *u = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
+            if (u) {
+                u->x = 0.05; u->y = 0.05; u->index = pend[k];
+                dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.21 + (double)k * 0.06) * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
             }
         }
         char dbg2[96];
-        snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d (x2, delayed 150ms)", np);
+        snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d (move-to-corner + up, delayed 150ms)", np);
         FTLog(dbg2);
     }
 }
@@ -2143,14 +2159,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.123 loaded (skip-list persists across locks; residual-up x2; interval 15ms)");
+    syslog(LOG_ERR, "FloatingTap v1.0.124 loaded (residual fingers moved to corner before up - stops full-auto fire + white-bar break)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.123 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; skip-list persists; residual x2; 15ms)\n");
+            fprintf(mk, "FloatingTap v1.0.124 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; residual move-to-corner + up)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
