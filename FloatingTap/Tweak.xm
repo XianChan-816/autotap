@@ -851,10 +851,13 @@ static void FTRaiseResidualUps(void) {
     }
 }
 
-// v1.0.113：连点期间定期清残留——只补发「down 超 150ms 仍未 up」的 index（正常 25ms up
+// v1.0.113：连点期间定期清残留——只补发「down 超阈值仍未 up」的 index（正常 25ms up
 // 不受影响）。防残留合成手指累积（ctor-9 铁证：SBHomeScreenWindow 残留 tap 累积 40→481
 // → 小白条失效 + 游戏长按效果持续 + tapCount 无限累积）。串行补发（逐个 25ms 间隔）。
-// 由 FTClickCallback 每 ~50 次点击（约 500ms）调用一次。
+// 由 FTClickCallback 每 ~25 次点击（约 375ms）调用一次。
+// ⚠️ v1.0.126（ctor-23 实锤）：阈值 150ms → 50ms——探测 tap 的 up（25ms 延迟）丢失后
+// 残留 Stationary 会污染后续探测（0x716 送达但 phase=1 被 miss → 全扫 50s 白扫）。
+// 50ms 未 up = 已丢失（正常 up 25ms 内必到），立即补发防累积。
 static void FTCheckResidualDuringCombo(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -862,7 +865,7 @@ static void FTCheckResidualDuringCombo(void) {
     uint32_t pend[14];
     int n = 0;
     for (uint32_t i = 2; i < 16; i++) {
-        if (g_PendingUpIdx[i] && g_PendingUpT[i] > 0 && (now - g_PendingUpT[i]) > 0.15) {
+        if (g_PendingUpIdx[i] && g_PendingUpT[i] > 0 && (now - g_PendingUpT[i]) > 0.05) {
             g_PendingUpIdx[i] = false;
             g_PendingUpT[i] = 0;
             if (n < 14) pend[n++] = i;
@@ -1995,7 +1998,11 @@ static void FTTweakInitCallback(void *ctx) {
             // 被误归 C 类。200px 覆盖偏移+余量；用户手指在球上（onBall 排除）+ Began 在
             // 注入后 60ms 时间窗内，误判概率极低，自愈验证兜底。v1.0.115 的 45px 防误判
             // 目标改由「!onBall + 时间窗」达成，不再靠窄半径。
-            if (g_Probing && !g_ProbeDelivered && ph == 0 && !onBall && g_ProbeTapT0 > 0) {
+            // ⚠️ v1.0.126（ctor-23 实锤）：ph==0 → ph==0||ph==1——探测 tap 的 up 丢失会让
+            // 合成触摸残留成 Stationary（phase=1）回流：0x716 探测时送达了但 phase=1 →
+            // 只认 Began 判定 miss → 残留污染后续 700+ 个 SID 探测 → 首次全扫 50s 白扫。
+            // 残留合成手指 = 该 SID down 成功注入（送达证据）→ Stationary 同样算送达。
+            if (g_Probing && !g_ProbeDelivered && (ph == 0 || ph == 1) && !onBall && g_ProbeTapT0 > 0) {
                 double cx = gClickLockX * gScreenW;
                 double cy = gClickLockY * gScreenH;
                 if ((now - g_ProbeTapT0) < 0.06) {
@@ -2009,7 +2016,7 @@ static void FTTweakInitCallback(void *ctx) {
                                      loc.x, loc.y, cx, cy, dist);
                             FTLog(dbg);
                         }
-                        g_ProbeDelivered = YES; // v1.0.117：200px 内即送达
+                        g_ProbeDelivered = YES; // v1.0.117：200px 内即送达（v1.0.126 含 Stationary）
                     }
                 }
             }
@@ -2018,7 +2025,8 @@ static void FTTweakInitCallback(void *ctx) {
             // ⚠️ v1.0.117：半径 45px → 200px（同探测，回流偏移 ~100px，45px 会让真送达
             // 被误判 verify-fail → 回退循环）；加 ph==0——用户手指滑出球边的 Moved
             // （phase=1）不算合成回流，防用户手指干扰误判验证通过。
-            if (g_VerifyDelivering && !g_VerifySawSynthetic && !onBall && ph == 0) {
+            // ⚠️ v1.0.126：ph==0 → ph==0||ph==1（同探测，残留 Stationary 也算合成回流）。
+            if (g_VerifyDelivering && !g_VerifySawSynthetic && !onBall && (ph == 0 || ph == 1)) {
                 double vcx = gClickLockX * gScreenW;
                 double vcy = gClickLockY * gScreenH;
                 double vdist = sqrt((loc.x - vcx) * (loc.x - vcx) + (loc.y - vcy) * (loc.y - vcy));
@@ -2178,14 +2186,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.125 loaded (verify window 300ms - only extreme instant-enders skipped; rebind auto-resumes combo)");
+    syslog(LOG_ERR, "FloatingTap v1.0.126 loaded (delivery accept Stationary too - residual finger proves SID delivered; residue sweep 50ms)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.125 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; verify 300ms; rebind auto-resume)\n");
+            fprintf(mk, "FloatingTap v1.0.126 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; delivery accepts Stationary; sweep 50ms)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
