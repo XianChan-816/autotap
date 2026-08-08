@@ -1009,6 +1009,14 @@ static void FTBuildProbeCandidates(void) {
 // v1.0.106：按住一次自动连续扫描——顶掉/不送达都自动试下一个，不再要求每次重按）
 static void FTStartProbing(void) {
     if (g_Probing) return;
+    // ⚠️ v1.0.118：确保 HID client 已建立——探测 tap 注入前必须 connect，否则
+    // FT_HIDProbeTapDelayed 因 g_hidClient==NULL 静默丢弃全部 tap（ctor-15 实锤：
+    // 首轮全扫 768 零送达零顶掉 = 注入从未发生；第二轮因有残留触发 connect 立见
+    // 注入生效）。旧代码只在 FTRaiseResidualUps 有残留、或连点时才会 connect。
+    if (!FT_HIDConnect()) {
+        FTLog("probing aborted: HID connect failed");
+        return;
+    }
     // ⚠️ v1.0.116：点击点与球重叠保护（ctor-13 全扫 768 零送达的根因）——距离 <120px
     // （球直径 56 + 边距）时，注入到点击点的合成触摸会被球（可交互手势窗口 subview）
     // 拦截，任何 SID 都不会送达。紫球提示先拖动点击点/球分离，不再浪费 ~49s 全扫。
@@ -2020,14 +2028,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.117 loaded (delivery radius 200px - synthetic touch returns ~100px offset; verify requires Began)");
+    syslog(LOG_ERR, "FloatingTap v1.0.118 loaded (probe taps force HID connect - no more silent drop when client uninitialized)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.117 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; delivery radius 200px)\n");
+            fprintf(mk, "FloatingTap v1.0.118 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; probe taps force HID connect)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

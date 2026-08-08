@@ -619,7 +619,10 @@ void FT_HIDLockSenderID(uint64_t sid) {
 // 用【指定 SID】注入一次探测 tap（down + up 立即）——探测阶段专用，
 // 不走 g_WorkingSID 逻辑；0x0B0018 字段与正式派发一致。
 void FT_HIDProbeTap(double nx, double ny, uint64_t sid) {
-    if (!g_hidClient || !FT_HIDLoadSymbols() || !sid) return;
+    // ⚠️ v1.0.118：必须保证 client 已建立——旧代码 `if (!g_hidClient...) return`
+    // 在首次探测时 g_hidClient==NULL → 探测 tap 全部静默丢弃 → 全扫零送达零顶掉
+    // （ctor-15 实锤：注入从未发生）。FT_HIDConnect 幂等。
+    if (!sid || !FT_HIDConnect()) return;
     FT_IOHIDEventRef d = FT_HIDCreateDigitizerEvent(true, nx, ny, 2);
     if (d) {
         p_IOHIDEventSetSenderID(d, sid);
@@ -666,7 +669,9 @@ static void FTHIDProbeUpCallback(void *ctx) {
     }
 }
 void FT_HIDProbeTapDelayed(double nx, double ny, uint64_t sid) {
-    if (!g_hidClient || !FT_HIDLoadSymbols() || !sid) return;
+    // ⚠️ v1.0.118：同 FT_HIDProbeTap——必须先 connect，否则首次探测全被静默丢弃
+    // （ctor-15：无残留可清时 FTRaiseResidualUps 不触发 connect，g_hidClient==NULL）。
+    if (!sid || !FT_HIDConnect()) return;
     FT_IOHIDEventRef d = FT_HIDCreateDigitizerEvent(true, nx, ny, 2);
     if (d) {
         p_IOHIDEventSetSenderID(d, sid);
