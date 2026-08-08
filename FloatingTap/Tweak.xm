@@ -195,7 +195,11 @@ static BOOL   g_StabFail = NO;
 static double g_ProbeNoFingerT0 = 0;
 
 // v1.0.50：AutoTap App 配置（位置/间隔）——定义在 FTIntervalMs 之前（它要读）
-static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 10.0;
+// ⚠️ v1.0.123：默认间隔 10ms → 15ms——10ms（100Hz）+ up-delay 25ms = 同时 2.5 根
+// 合成手指重叠，up 丢失率高 → 残留手指堆积 → 小白条失效 + 游戏长按残留（ctor-19/20
+// 实锤，补发 up 也清不掉）。15ms（67Hz）→ 重叠 1.67 根，up 丢失率大幅下降，
+// 游戏连点 67Hz 完全足够。用户仍可在 App 里配更快的值。
+static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 15.0;
 static int  gCfgLoaded = 0;
 
 // MARK: - 诊断日志（append 到标记文件，Filza 可见；带单调时间戳）
@@ -267,20 +271,21 @@ static BOOL FTUIReady(void) {
 
 static unsigned long gClickCount = 0; // 本次连点周期内的点击次数（诊断）
 
-// 读取连点间隔（毫秒）：优先 App 配置（v1.0.50），兜底 cfg 文件，默认 12ms。
-// 12ms ≈ 83 次/秒；HID 事件每次递增 index 区分触摸，避免被系统串成同一触摸流。
+// 读取连点间隔（毫秒）：优先 App 配置（v1.0.50），兜底 cfg 文件，默认 15ms。
+// ⚠️ v1.0.123：15ms ≈ 67 次/秒（原 10ms=100Hz，up 重叠 2.5 根 → up 丢失 → 残留 →
+// 小白条失效，ctor-19/20 实锤）；67Hz 游戏连点足够。
 static double FTIntervalMs(void) {
     if (gCfgLoaded && gCfgMs >= 1.0) return gCfgMs;
     FILE *f = fopen("/var/mobile/Library/Preferences/com.floatingtap.cfg", "r");
     if (f) {
-        double v = 10.0;
+        double v = 15.0;
         if (fscanf(f, "%lf", &v) == 1 && v >= 1.0 && v <= 60000.0) {
             fclose(f);
             return v;
         }
         fclose(f);
     }
-    return 10.0;
+    return 15.0;
 }
 
 // MARK: - App 通信（v1.0.53：CFPreferences 共享偏好，cfprefsd 守护进程跨进程共享）
@@ -331,7 +336,7 @@ static void FTAppsListDeferredCallback(void *ctx);
 // 应用共享偏好里的 config（CoreFoundation CFDictionary，纯 C，无 ObjC）
 static void FTApplyConfigFromPrefs(CFDictionaryRef dict) {
     if (!dict || CFGetTypeID(dict) != CFDictionaryGetTypeID()) return;
-    double nx = 0.5, ny = 0.5, ms = 10.0;
+    double nx = 0.5, ny = 0.5, ms = 15.0; // v1.0.123：默认 15ms（10ms 残留太多，见上）
     CFStringRef kX = FTCreateCFStr("ClickX");
     CFStringRef kY = FTCreateCFStr("ClickY");
     CFStringRef kMs = FTCreateCFStr("IntervalMs");
@@ -345,7 +350,7 @@ static void FTApplyConfigFromPrefs(CFDictionaryRef dict) {
     if (kX) CFRelease(kX); if (kY) CFRelease(kY); if (kMs) CFRelease(kMs);
     if (nx < 0) nx = 0; if (nx > 1) nx = 1;
     if (ny < 0) ny = 0; if (ny > 1) ny = 1;
-    if (ms < 1) ms = 10;
+    if (ms < 1) ms = 15;
     gCfgX = nx; gCfgY = ny; gCfgMs = ms;
     gCfgLoaded = 1;
     FTMoveBallToConfig();
@@ -808,16 +813,21 @@ static void FTRaiseResidualUps(void) {
         // 处理连点流，立即补发 up 会被吞掉（ctor-19 实锤：残留 tap=799/91 Stationary
         // 持续 3-8s，补发 up 未抬掉 → 小白条失效直到系统自行过期）。等系统稳定后再
         // 逐个串行补发（25ms 间隔），确保每个 up 都被独立处理。
+        // ⚠️ v1.0.123：双保险——每个残留 index 补发 2 次 up（间隔 60ms）。ctor-20 实锤：
+        // 单次补发仍被吞（停止后残留 tap=1/5 持续 5s+）。首次可能被系统丢弃，第二次
+        // 在系统稳定后成功率更高（已抬起的 index 再 up 系统视为无操作，无害）。
         for (int k = 0; k < np; k++) {
-            FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
-            if (c) {
-                c->x = rx; c->y = ry; c->index = pend[k];
-                dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.15 + (double)k * 0.025) * NSEC_PER_SEC)),
-                                 dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
+            for (int r = 0; r < 2; r++) {
+                FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
+                if (c) {
+                    c->x = rx; c->y = ry; c->index = pend[k];
+                    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.15 + (double)(k * 2 + r) * 0.06) * NSEC_PER_SEC)),
+                                     dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
+                }
             }
         }
         char dbg2[96];
-        snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d (serial, delayed 150ms)", np);
+        snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d (x2, delayed 150ms)", np);
         FTLog(dbg2);
     }
 }
@@ -1151,7 +1161,10 @@ static void FTProbeNext(void) {
                 g_Probing = NO;
                 g_ProbeFullScan = NO;
                 g_ProbeIdx = 0;
-                g_ProbeEndingCount = 0;
+                // ⚠️ v1.0.123：不再清空 g_ProbeEndingCount（跳过列表）——锁定成功时清空
+                // 会丢掉 stab-fail 已验证的坏 SID（ctor-20 实锤：0x716 每次探测都被重新
+                // 锁定 → 41 次顶掉 → stab-fail → 重复「变蓝变黄」）。坏 SID 会话内不变，
+                // 跳过列表应跨锁定累积（respring 才重置）。
                 FTRaiseResidualUps(); // 清探测期残留合成手指（防连点不送达）
                 FTApplyBallAppearance(); // 回蓝色
                 char dbg2[128];
@@ -1279,7 +1292,7 @@ static void FTCheckProbe(void *ctx) {
             g_Probing = NO;
             g_ProbeFullScan = NO;
             g_ProbeIdx = 0;
-            g_ProbeEndingCount = 0;
+            // ⚠️ v1.0.123：保留跳过列表（同保底分支，见上）——坏 SID 会话内跨锁定累积
             FTRaiseResidualUps(); // 清探测期残留合成手指（防连点不送达，ctor(1)(1) 空跑根因）
             FTApplyBallAppearance(); // 回蓝色
             FTLog("probe OK - SID locked, starting combo");
@@ -2130,14 +2143,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.122 loaded (ball-ended clears touch by position - no ghost combo; residual-up delayed 150ms)");
+    syslog(LOG_ERR, "FloatingTap v1.0.123 loaded (skip-list persists across locks; residual-up x2; interval 15ms)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.122 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; ghost-combo fix; residual-up delayed)\n");
+            fprintf(mk, "FloatingTap v1.0.123 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; skip-list persists; residual x2; 15ms)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
