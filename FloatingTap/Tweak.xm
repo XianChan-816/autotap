@@ -182,6 +182,14 @@ static void FTCheckResidualDuringCombo(void);
 static BOOL   g_VerifyDelivering = NO;
 static BOOL   g_VerifySawSynthetic = NO;
 static void FTVerifyDeliveryTimer(void *ctx);
+// ⚠️ v1.0.119（ctor-16 实锤）：「高频稳定性验证」——低频探测 tap（60ms 单发）不顶掉
+// 用户手指的 SID，在 10ms 高频连点下可能顶掉（0x100000716：探测 dist=0 锁定，连点后
+// 每轮仅 8 次就 touches-ended → 停止 → 0.6s 重绑 → 循环，用户感知「不连续」；且频繁
+// 停止让 up 丢失 50% → 残留堆积 → 小白条失效）。锁定后进入 400ms 稳定性窗口：窗口内
+// touches-ended（顶掉）且随后手指重绑（gBallTouch!=NULL）→ 该 SID 高频顶掉 → 记跳过
+// + 断点续扫；窗口内稳定 → 验证通过，正式连点。
+static BOOL   g_StabTesting = NO;
+static BOOL   g_StabFail = NO;
 
 // v1.0.50：AutoTap App 配置（位置/间隔）——定义在 FTIntervalMs 之前（它要读）
 static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 10.0;
@@ -751,11 +759,15 @@ static void FTStartClicking(void) {
     }
     // v1.0.75：连点中禁用全部手势识别器（防 GR 取消手指/触发双击掐断连点）
     FTApplyGRModes();
-    // v1.0.112：连点送达自愈验证——300ms 内 SEND 无合成触摸回流 → 锁定 SID 假送达
+    // v1.0.112：连点送达自愈验证——窗口内 SEND 无合成触摸回流 → 锁定 SID 假送达
     // → FTVerifyDeliveryTimer 停止连点 + 记录跳过 + 自动重新探测（防空跑）
+    // ⚠️ v1.0.119：窗口 300→800ms——① 承载「高频稳定性验证」（g_StabTesting）：
+    // 锁定后窗口内 touches-ended 顶掉用户手指 → 记跳过 + 续扫；② 顶掉后系统重绑
+    // 用户手指需 ~0.6s（ctor-16 实测），窗口必须 ≥ 重绑延迟才能看到重绑（gBallTouch
+    // 非空）区分「顶掉 vs 真松手」。稳定 SID 首次注入 10ms 内即回流，800ms 无感。
     g_VerifyDelivering = YES;
     g_VerifySawSynthetic = NO;
-    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                      dispatch_get_main_queue(), NULL, FTVerifyDeliveryTimer);
     // v1.0.88 验证：连点期间隐藏点击点标记（alpha=0 不参与 hitTest）——
     // 怀疑手势窗口把落在自身 subview（标记/红圈）上的注入触摸「收口」不透传 App
@@ -841,7 +853,13 @@ static void FTStopClicking(const char *reason) {
     if (!gIsClicking) return;
     gIsClicking = NO;
     gStopGracePending = NO; // 取消任何待决的松手宽限
-    g_VerifyDelivering = NO; // v1.0.112：取消送达验证（正常停止）
+    // ⚠️ v1.0.119：稳定性验证窗口内【保留】g_VerifyDelivering，让 FTVerifyDeliveryTimer
+    // 裁决「顶掉 vs 真松手」并续扫；窗口外（正常连点）才取消送达验证。
+    if (!g_StabTesting) {
+        g_VerifyDelivering = NO; // v1.0.112：取消送达验证（正常停止）
+    } else if (reason && strcmp(reason, "touches-ended") == 0) {
+        g_StabFail = YES; // 验证窗口内用户手指被顶掉（注入导致 touches-ended）→ 标记
+    }
     if (gClickTimer) {
         dispatch_source_cancel(gClickTimer);
         gClickTimer = NULL;
@@ -964,6 +982,10 @@ static void FTBallHoldTimer(void *ctx) {
     (void)ctx;
     gBallTouchTimerPending = NO;
     if (gBallTouch != NULL && !gBallTouchClicking && !gDragMode) {
+        // ⚠️ v1.0.119：stab 裁决前不重启连点——顶掉后重绑会再次触发本计时器，若 SID
+        // 高频顶掉会反复「连点→顶掉→重启」（ctor-16 每轮 8 次循环）。等 0.8s 裁决
+        // （stab-fail 续扫 or 稳定通过）后再动作。
+        if (g_StabTesting && g_StabFail) return;
         if (g_LockedSID != 0) {
             gBallTouchClicking = YES;
             FTStartClicking();
@@ -1223,6 +1245,11 @@ static void FTCheckProbe(void *ctx) {
             FTApplyBallAppearance(); // 回蓝色
             FTLog("probe OK - SID locked, starting combo");
             gBallTouchClicking = YES;
+            // ⚠️ v1.0.119：进入【高频稳定性验证】——低频探测不顶掉的 SID 在 10ms 高频
+            // 连点下可能顶掉用户手指（ctor-16：0x100000716 每轮 8 次就 touches-ended）。
+            // FTVerifyDeliveryTimer 400ms 窗口内顶掉+重绑 → stab-fail → 记跳过 + 续扫。
+            g_StabTesting = YES;
+            g_StabFail = NO;
             FTStartClicking();
             return;
         }
@@ -1249,15 +1276,35 @@ static void FTStopGraceTimer(void *ctx) {
     FTStopClicking("touches-ended");
 }
 
-// v1.0.112：连点送达自愈验证——锁定 SID 后 300ms 内 SEND 无合成触摸回流（点击点附近
+// v1.0.112：连点送达自愈验证——锁定 SID 后 400ms 内 SEND 无合成触摸回流（点击点附近
 // !onBall 触摸）→ 锁定的 SID 假送达（顶掉型 C 类，ctor-8 实锤：0x100000661 连点 540 次
 // 空跑）→ 停止连点、记录跳过列表、清锁定、自动重新探测。
+// ⚠️ v1.0.119（ctor-16 实锤）：扩展为【高频稳定性裁决】——低频探测不顶掉的 SID，
+// 10ms 高频连点会顶掉用户手指（每轮 8 次就 touches-ended → 停止 → 0.6s 重绑 → 循环，
+// 用户感知「不连续」，且频繁停止让 up 丢失 50% → 残留 → 小白条失效）。窗口内
+// touches-ended 且手指随后重绑（gBallTouch!=NULL）→ 高频顶掉 → 记跳过 + 断点续扫，
+// 直到找到「高频也不顶掉」的稳定 SID；手指未重绑（真松手）→ 正常停止回蓝。
 static void FTVerifyDeliveryTimer(void *ctx) {
     (void)ctx;
     if (!g_VerifyDelivering) return;
     g_VerifyDelivering = NO;
-    if (g_VerifySawSynthetic) return; // 有回流 → SID 真送达，验证通过
-    FTLog("verify: locked SID not delivering - reverting to probe");
+    bool wasStab = g_StabTesting;
+    g_StabTesting = NO;
+    // 送达 + 无顶掉 → 验证通过（稳定 SID 或正常连点）
+    if (g_VerifySawSynthetic && !g_StabFail) {
+        if (wasStab) FTLog("stab: SID stable - combo continues");
+        return;
+    }
+    // 用户手指未重绑（gBallTouch==NULL）→ 真松手 → 正常停止（回蓝），不续扫
+    if (gBallTouch == NULL) {
+        if (wasStab) FTLog("stab: touches-ended was real finger-up - stay stopped");
+        return;
+    }
+    // 走到这里 = 手指还按着（被顶掉后已重绑）：假送达 或 高频顶掉 → 记跳过 + 续扫
+    const char *why = (!g_VerifySawSynthetic && !wasStab)
+        ? "verify: locked SID not delivering - reverting to probe"
+        : "stab-fail: high-freq combo ends user finger - reverting to probe";
+    FTLog(why);
     if (g_LockedSID) {
         bool dup = false;
         for (int k = 0; k < g_ProbeEndingCount; k++) {
@@ -1267,7 +1314,7 @@ static void FTVerifyDeliveryTimer(void *ctx) {
             g_ProbeEndingSIDs[g_ProbeEndingCount++] = g_LockedSID;
         }
     }
-    FTStopClicking("verify-fail");
+    FTStopClicking("stab/verify-fail");
     g_LockedSID = 0;
     FT_HIDLockSenderID(0);
     // v1.0.115：从【锁定位置】继续全扫（跳过已记录的坏 SID），不再从头 49 秒
@@ -1914,7 +1961,9 @@ static void FTTweakInitCallback(void *ctx) {
                 }
             } else if (ph == 1 || ph == 2) {                 // Moved / Stationary（仅作保险，主要靠计时器）
                 // v1.0.101：探测期间或未锁定 SID 时禁止直接连点（必须走探测校准）
+                // ⚠️ v1.0.119：stab 裁决前不重启（顶掉后重绑的 Moved 会走这里，防顶掉循环）
                 if (gBallTouch == tp && !gBallTouchClicking && !gDragMode && !g_Probing && g_LockedSID != 0 &&
+                    !(g_StabTesting && g_StabFail) &&
                     (now - gBallTouchDownTime) > 0.12 && !gBallTouchTimerPending) {
                     gBallTouchClicking = YES;
                     FTStartClicking();
@@ -2028,14 +2077,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.118 loaded (probe taps force HID connect - no more silent drop when client uninitialized)");
+    syslog(LOG_ERR, "FloatingTap v1.0.119 loaded (high-freq stability verify - skip SIDs that end user finger during combo)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.118 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; probe taps force HID connect)\n");
+            fprintf(mk, "FloatingTap v1.0.119 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; high-freq stability verify)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
