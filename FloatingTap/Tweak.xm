@@ -1844,18 +1844,18 @@ static void FTTweakInitCallback(void *ctx) {
             // 90px，用户手指滑出球边（Moved，距点击点 <90px）或第二根手指经过点击点附近
             // 会被误判送达（ctor-3 锁定不送达 SID → 空跑）；Began+时间窗只认探测 tap 自己的
             // 合成触摸（注入后立即回流的 Began），用户手指的 Moved/已存在触摸不匹配。
-            // ⚠️ v1.0.115：半径 90→45px——ctor-12 实锤：点击点距球仅 ~85px，用户手指在球
-            // 边缘滑出/重绑 Began（<90px）被误判送达 → 锁定假送达型 → 连点空跑 →
-            // verify-fail 回退循环（「一瞬间变蓝+绿圈消失」闪烁）。45px 只认精确落点击点的
-            // 合成触摸，用户手指在球上（onBall 排除）且滑出球边 40px 内才可能误判（概率大降）。
+            // ⚠️ v1.0.117 定案（ctor-14 实锤）：判定半径 45px → 200px——合成触摸回流位置
+            // 与注入点存在 ~100px 垂直偏移（注入 (417,788)，回流实测 (410,888) dist=101），
+            // 45px 全部 miss → 全扫 768 零送达 → 变不了蓝；0x652 类「送达+顶掉」B 类 SID
+            // 被误归 C 类。200px 覆盖偏移+余量；用户手指在球上（onBall 排除）+ Began 在
+            // 注入后 60ms 时间窗内，误判概率极低，自愈验证兜底。v1.0.115 的 45px 防误判
+            // 目标改由「!onBall + 时间窗」达成，不再靠窄半径。
             if (g_Probing && !g_ProbeDelivered && ph == 0 && !onBall && g_ProbeTapT0 > 0) {
                 double cx = gClickLockX * gScreenW;
                 double cy = gClickLockY * gScreenH;
-                // v1.0.116 诊断：记录任何距点击点 <200px 的 !onBall Began（无论是否 45px
-                // 命中），节流每 32 条——若仍有「送达但判定 miss」可从此日志定位合成触摸
-                // 实际落点与偏移量（下一轮不再盲猜）。
                 if ((now - g_ProbeTapT0) < 0.06) {
                     double dist = sqrt((loc.x - cx) * (loc.x - cx) + (loc.y - cy) * (loc.y - cy));
+                    // v1.0.116 诊断：记录回流落点+距离（节流每 32）——若仍有 miss 可定位偏移
                     if (dist < 200.0) {
                         static int sProbeSaw = 0;
                         if ((sProbeSaw++ % 32) == 0) {
@@ -1864,20 +1864,20 @@ static void FTTweakInitCallback(void *ctx) {
                                      loc.x, loc.y, cx, cy, dist);
                             FTLog(dbg);
                         }
+                        g_ProbeDelivered = YES; // v1.0.117：200px 内即送达
                     }
-                }
-                if (fabs(loc.x - cx) < 45 && fabs(loc.y - cy) < 45 &&
-                    (now - g_ProbeTapT0) < 0.06) {
-                    g_ProbeDelivered = YES;
                 }
             }
             // v1.0.112：连点送达自愈验证——锁定后连点期间，点击点附近出现 !onBall 合成
             // 触摸回流 → 真送达（300ms 内任一即通过；用户手指在球上 onBall 排除）
-            // ⚠️ v1.0.115：半径 90→45px（同探测判定，防用户手指干扰误判验证通过）
-            if (g_VerifyDelivering && !g_VerifySawSynthetic && !onBall) {
+            // ⚠️ v1.0.117：半径 45px → 200px（同探测，回流偏移 ~100px，45px 会让真送达
+            // 被误判 verify-fail → 回退循环）；加 ph==0——用户手指滑出球边的 Moved
+            // （phase=1）不算合成回流，防用户手指干扰误判验证通过。
+            if (g_VerifyDelivering && !g_VerifySawSynthetic && !onBall && ph == 0) {
                 double vcx = gClickLockX * gScreenW;
                 double vcy = gClickLockY * gScreenH;
-                if (fabs(loc.x - vcx) < 45 && fabs(loc.y - vcy) < 45) {
+                double vdist = sqrt((loc.x - vcx) * (loc.x - vcx) + (loc.y - vcy) * (loc.y - vcy));
+                if (vdist < 200.0) {
                     g_VerifySawSynthetic = YES;
                 }
             }
@@ -2020,14 +2020,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.116 loaded (click-point decoupled from ball - no more injected tap landing on ball; overlap guard; probe saw-log)");
+    syslog(LOG_ERR, "FloatingTap v1.0.117 loaded (delivery radius 200px - synthetic touch returns ~100px offset; verify requires Began)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.116 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; click-point decoupled from ball; overlap guard)\n");
+            fprintf(mk, "FloatingTap v1.0.117 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; delivery radius 200px)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
