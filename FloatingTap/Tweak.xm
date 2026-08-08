@@ -182,6 +182,11 @@ static void FTStopClicking(const char *reason); // v1.0.127：幽灵看门狗在
 // 自动重新探测。防止「锁定假送达型 → 连点空跑」（ctor-8：0x100000661 连点 540 次空跑）。
 static BOOL   g_VerifyDelivering = NO;
 static BOOL   g_VerifySawSynthetic = NO;
+// ⚠️ v1.0.135（ctor-32 实锤）：verify 窗口内【送达回流计数】——顶掉型 SID 每轮也有
+// 部分 down 送达（回流存在但 <50%），「有无回流」判不出（首轮 tap=15 全送达 → 不
+// 淘汰 → 顶掉循环永驻 → 连点断续 + 游戏跳屏）。用【回流比例】：顶掉轮回流 <50%、
+// 稳定轮回流 >50%。每轮 started 清零，sendEvent 判定处 +1。
+static int     g_VerifySawCount = 0;
 // ⚠️ v1.0.129（ctor-26 实锤）：verify 定时器必须绑定【具体轮次】。旧实现每轮
 // FTStartClicking 都排 0.8s 定时器且共用 g_VerifyDelivering——用户快速反复短按时
 //（游戏试枪），上一轮的定时器到期时新一轮 started 已把 g_VerifyDelivering 重置为
@@ -857,6 +862,7 @@ static void FTStartClicking(void) {
     g_VerifyEpoch++;
     g_VerifyDelivering = YES;
     g_VerifySawSynthetic = NO;
+    g_VerifySawCount = 0; // v1.0.135：每轮重置送达回流计数（顶掉检测用）
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                      dispatch_get_main_queue(), (void *)(intptr_t)g_VerifyEpoch,
                      FTVerifyDeliveryTimer);
@@ -997,13 +1003,18 @@ static void FTStopClicking(const char *reason) {
     if (reason && strcmp(reason, "touches-ended") == 0) {
         if (g_StabTesting) g_StabFail = YES; // stab 验证期顶掉标记（计数兜底）
         // ⚠️ v1.0.133（ctor-30 实锤）：**touches-ended 立即裁决**——本轮 started 后
-        // g_VerifySawSynthetic 若一直 NO（无任何送达回流）且点击 ≥3 次 = 顶掉循环/
-        // 空跑（注入被系统吞）→ 淘汰 SID。不能依赖 0.8s verify 定时器：顶掉循环中
-        // 自动重启连点（重绑 <0.8s + 120ms 计时器）不断递增 epoch → 定时器永远被
-        // 丢弃 → 永不裁决 → 顶掉 SID 永驻（ctor-30 每轮 7 次顶掉 + 残留堆积）。
-        // 快速短按（注入正常）→ 有回流 → YES → 保持锁定；clicks<3 的极短轻点豁免。
-        if (!g_VerifySawSynthetic && g_LockedSID != 0 && !g_Probing && gClickCount >= 3) {
-            FTLog("evict: round ended with NO delivery (high-freq ender / empty run)");
+        // 送达异常且点击 ≥3 次 = 顶掉循环/空跑（注入被系统吞）→ 淘汰 SID。不能依赖
+        // 0.8s verify 定时器：顶掉循环中自动重启连点（重绑 <0.8s + 120ms 计时器）
+        // 不断递增 epoch → 定时器永远被丢弃 → 永不裁决（ctor-30 每轮 7 次顶掉）。
+        // ⚠️ v1.0.135（ctor-32 实锤）：「有无回流」判不出顶掉型（每轮也有部分 down
+        // 送达 → 有回流但 <50%）。改【回流比例】：g_VerifySawCount*2 < gClickCount
+        // = 回流 <50% → 顶掉/空跑 → 淘汰。稳定轮（244 次）回流 >90% 保持；快速短按
+        //（注入正常）回流 ~100% 保持；clicks<3 极短轻点豁免。
+        if (g_LockedSID != 0 && !g_Probing && gClickCount >= 3 &&
+            g_VerifySawCount * 2 < gClickCount) {
+            char dbg3[96];
+            snprintf(dbg3, sizeof(dbg3), "evict: low return ratio %d/%lu (high-freq ender)", g_VerifySawCount, (unsigned long)gClickCount);
+            FTLog(dbg3);
             bool dup = false;
             for (int k = 0; k < g_ProbeEndingCount; k++) {
                 if (g_ProbeEndingSIDs[k] == g_LockedSID) { dup = true; break; }
@@ -1516,15 +1527,17 @@ static void FTVerifyDeliveryTimer(void *ctx) {
         g_VerifyFailCount = 0; // v1.0.130：通过即清零连续失败计数
         return;
     }
-    // ⚠️ v1.0.132 定案（ctor-29 实锤）：**「窗口内有无送达回流」是顶掉 vs 快速短按的
-    // 可靠区分**——顶掉循环里注入全被系统吞（无回流），快速短按注入正常（有回流）。
-    // · 松手 + 无回流（g_VerifySawSynthetic==NO）= 该轮注入从未送达（顶掉/空跑）→
-    //   淘汰（记跳过+清锁+续扫）——治 ctor(3)/ctor-29 的顶掉循环（每轮 14 次+空跑）；
-    // · 松手 + 有回流 = 用户真松手（连点正常工作过）→ 保持锁定（v1.0.129 防误杀）。
-    // 旧实现（v1.0.129）松手一律保持 → 顶掉 SID 永驻 → 顶掉-重绑-自动重启死循环。
+    // ⚠️ v1.0.132 定案（ctor-29 实锤）：**「窗口内送达回流」是顶掉 vs 快速短按的
+    // 可靠区分**——顶掉循环里注入被系统吞（回流少），快速短按注入正常（回流多）。
+    // · 松手 + 回流 <50%（g_VerifySawCount*2 < gClickCount）= 顶掉/空跑 → 淘汰；
+    // · 松手 + 回流 ≥50% = 用户真松手（连点正常工作过）→ 保持锁定。
+    // ⚠️ v1.0.135（ctor-32 实锤）：「有无回流」判不出顶掉型（每轮也有部分 down 送达）
+    // → 改回流比例（顶掉轮 <50%，稳定轮 >90%，快速短按 ~100%）。
     if (gBallTouch == NULL) {
-        if (!g_VerifySawSynthetic) {
-            FTLog("verify: round ended with NO delivery - evicting SID");
+        if (gClickCount >= 3 && g_VerifySawCount * 2 < gClickCount) {
+            char dbg0[96];
+            snprintf(dbg0, sizeof(dbg0), "verify: low return ratio %d/%lu - evicting SID", g_VerifySawCount, (unsigned long)gClickCount);
+            FTLog(dbg0);
             if (g_LockedSID) {
                 bool dup = false;
                 for (int k = 0; k < g_ProbeEndingCount; k++) {
@@ -1551,14 +1564,16 @@ static void FTVerifyDeliveryTimer(void *ctx) {
         FTLog("verify: finger up during window - verdict deferred, lock kept");
         return;
     }
-    // 走到这里 = 手指还在（顶掉后已重绑 / 快速重按）或假送达（用户按着但无回流）。
-    // ⚠️ v1.0.130（ctor-27 实锤）：**单轮无回流不淘汰**——游戏高频场景注入繁忙/残留
-    // 占槽时单轮窗口内无回流很常见（0x100000730 稳定连点 97 次仍被单轮 verify 误杀 →
-    // 「一开枪连点就失效」）。首次 fail 记警告保持锁定（连点继续），连续 2 次才确认
-    // 假送达/高频顶掉 → 淘汰 + 断点续扫。防空跑代价最多 2×0.8s。
+    // 走到这里 = 手指还在（顶掉后已重绑 / 快速重按）或假送达（用户按着但回流不足）。
+    // ⚠️ v1.0.130（ctor-27 实锤）：**单轮异常不淘汰**——游戏高频场景注入繁忙/残留
+    // 占槽时单轮窗口内异常很常见（0x100000730 稳定连点 97 次仍被单轮 verify 误杀）。
+    // 首次 fail 记警告保持锁定（连点继续），连续 2 次才确认 → 淘汰。防空跑 ≤2×0.8s。
+    // ⚠️ v1.0.135（ctor-32 实锤）：判定改【回流比例】——g_VerifySawCount*2 < gClickCount
+    // = 回流 <50% → 顶掉/空跑（顶掉型每轮也有部分送达 → 「有无回流」判不出）。
+    bool lowReturn = (g_VerifySawCount * 2 < gClickCount);
     g_VerifyFailCount++;
-    const char *why = (!g_VerifySawSynthetic && !wasStab)
-        ? "verify: no synthetic return this round"
+    const char *why = (lowReturn && !wasStab)
+        ? "verify: low return ratio this round"
         : "stab-fail: high-freq combo ends user finger";
     if (g_VerifyFailCount < 2) {
         char dbg2[96];
@@ -2215,12 +2230,13 @@ static void FTTweakInitCallback(void *ctx) {
             // verdict deferred, lock kept 永驻 → 无连续连点 + 残留堆积小白条）。
             // 本轮送达只看新 down 的 Began（ph==0）/Moved（ph==1）；v1.0.132 的
             // 30ms+35ms 无重叠注入下新 down 必有 Began。探测判定仍保留 ph==2（ctor-23）。
-            if (g_VerifyDelivering && !g_VerifySawSynthetic && !onBall && (ph == 0 || ph == 1)) {
+            if (g_VerifyDelivering && !onBall && (ph == 0 || ph == 1)) {
                 double vcx = gClickLockX * gScreenW;
                 double vcy = gClickLockY * gScreenH;
                 double vdist = sqrt((loc.x - vcx) * (loc.x - vcx) + (loc.y - vcy) * (loc.y - vcy));
                 if (vdist < 200.0) {
                     g_VerifySawSynthetic = YES;
+                    g_VerifySawCount++; // v1.0.135：回流计数（顶掉检测：比例 <50% 淘汰）
                 }
             }
             if (ph == 0) {                                   // Began
@@ -2384,14 +2400,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.134 loaded (residual rebuild-ctx down+up @click-pt; interval 40ms + up-delay 45ms)");
+    syslog(LOG_ERR, "FloatingTap v1.0.135 loaded (return-ratio eviction - enders have <50% return, stable >90%); residual rebuild-ctx");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.134 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; residual rebuild-ctx; 40ms+45ms)\n");
+            fprintf(mk, "FloatingTap v1.0.135 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; return-ratio eviction)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
