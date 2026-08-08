@@ -175,6 +175,7 @@ static bool g_PendingUpIdx[16] = {false}; // index 2-9 用（1 留给用户手�
 // 小白条失效 + 游戏长按效果 + tapCount 无限累积）
 static double g_PendingUpT[16] = {0};
 static void FTCheckResidualDuringCombo(void);
+static void FTStopClicking(const char *reason); // v1.0.127：幽灵看门狗在 FTClickCallback 提前调用，需前向声明
 
 // v1.0.112：连点「送达自愈验证」——锁定 SID 后若连点期间 SEND 无合成触摸回流
 //（点击点附近 !onBall 触摸）→ 锁定的 SID 假送达（顶掉型 C 类）→ 停止连点、记录跳过、
