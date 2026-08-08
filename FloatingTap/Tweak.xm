@@ -686,10 +686,12 @@ static void FTClickCallback(void *ctx) {
                  gClickLockX, gClickLockY, hx, hy, (long)FTGetOrientation());
         FTLog(diag);
     }
-    // v1.0.113：连点期间定期清残留（每 50 次 ≈ 500ms）——防残留合成手指累积
+    // v1.0.113：连点期间定期清残留——防残留合成手指累积
     // （ctor-9：SBHomeScreenWindow 残留 tap 40→481 → 小白条失效 + 游戏长按 + tapCount 累积）
+    // ⚠️ v1.0.122：每 50 次 → 每 25 次（≈250ms）——ctor-19 残留 tap=799/91 持续 3-8s，
+    // 50 次的窗口太长，残留先累积到影响小白条才清。加密后残留峰值更低、小白条更稳。
     static int sResidualCheck = 0;
-    if ((sResidualCheck++ % 50) == 0) {
+    if ((sResidualCheck++ % 25) == 0) {
         FTCheckResidualDuringCombo();
     }
 }
@@ -802,16 +804,20 @@ static void FTRaiseResidualUps(void) {
         }
     }
     if (np > 0) {
+        // ⚠️ v1.0.122：补发延迟 150ms 起步（原 0ms）——停止瞬间系统触摸上下文还在
+        // 处理连点流，立即补发 up 会被吞掉（ctor-19 实锤：残留 tap=799/91 Stationary
+        // 持续 3-8s，补发 up 未抬掉 → 小白条失效直到系统自行过期）。等系统稳定后再
+        // 逐个串行补发（25ms 间隔），确保每个 up 都被独立处理。
         for (int k = 0; k < np; k++) {
             FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
             if (c) {
                 c->x = rx; c->y = ry; c->index = pend[k];
-                dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((double)k * 0.025 * NSEC_PER_SEC)),
+                dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.15 + (double)k * 0.025) * NSEC_PER_SEC)),
                                  dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
             }
         }
         char dbg2[96];
-        snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d (serial)", np);
+        snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d (serial, delayed 150ms)", np);
         FTLog(dbg2);
     }
 }
@@ -2005,7 +2011,18 @@ static void FTTweakInitCallback(void *ctx) {
                     FTStartClicking();
                 }
             } else if (ph == 3 || ph == 4) {                 // Ended / Cancelled
-                if (gBallTouch == tp) {
+                // ⚠️ v1.0.122 定案（ctor-19 实锤）：不再依赖 gBallTouch==tp 指针匹配——
+                // 系统可能在 Began 与 Ended 之间重建 touch 对象（指针不同 → 匹配失败 →
+                // gBallTouch 残留幽灵 → 120ms 计时器照样触发连点且无人能停 →
+                // 「点一下立马松手还是长按状态」）。改判「球上/球边缘 40px 内的
+                // Ended/Cancelled 即清空追踪」（单指场景精确；双指罕见漏清代价仅多一轮）。
+                BOOL nearBall = onBall;
+                if (!nearBall) {
+                    double bdx = loc.x - (bf.origin.x + bf.size.width * 0.5);
+                    double bdy = loc.y - (bf.origin.y + bf.size.height * 0.5);
+                    nearBall = (bdx * bdx + bdy * bdy < 40.0 * 40.0);
+                }
+                if (gBallTouch != NULL && nearBall) {
                     // v1.0.108：探测中手指 Ended 分两种情况：
                     //  · 探测 tap 注入后 300ms 内（顶掉）→ 记录 SID 进跳过列表 + 置
                     //    g_ProbeTouchEnded（FTCheckProbe 自动继续扫，找送达型保底，用户
@@ -2113,14 +2130,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.121 loaded (stab-fail skips immediately; probe waits for finger rebind)");
+    syslog(LOG_ERR, "FloatingTap v1.0.122 loaded (ball-ended clears touch by position - no ghost combo; residual-up delayed 150ms)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.121 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; stab-fail skips immediately)\n");
+            fprintf(mk, "FloatingTap v1.0.122 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; ghost-combo fix; residual-up delayed)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
