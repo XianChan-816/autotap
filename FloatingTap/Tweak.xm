@@ -189,6 +189,10 @@ static BOOL   g_VerifySawSynthetic = NO;
 // 好 SID 被误淘汰 → 回退探测 → 探测时用户已松手 → 「一直变不了蓝」。g_VerifyEpoch
 // 每轮递增，定时器 ctx 携带快照，到期时 epoch 不匹配 = 旧轮 → 直接丢弃。
 static int     g_VerifyEpoch = 0;
+// ⚠️ v1.0.130（ctor-27 实锤）：verify-fail 连续计数——单轮窗口内无回流不淘汰（游戏
+// 高频场景注入繁忙/残留占槽时单轮无回流很常见，0x730 稳定连点 97 次仍被单轮误杀）。
+// 连续 2 次 fail 才确认假送达 → 淘汰 + 续扫；通过即清零。
+static int     g_VerifyFailCount = 0;
 static void FTVerifyDeliveryTimer(void *ctx);
 // ⚠️ v1.0.119（ctor-16 实锤）：「高频稳定性验证」——低频探测 tap（60ms 单发）不顶掉
 // 用户手指的 SID，在 10ms 高频连点下可能顶掉（0x100000716：探测 dist=0 锁定，连点后
@@ -648,8 +652,18 @@ static void FTSyntheticTap(double px, double py) {
     // 结束用户手指（touch ph=3 顶掉）→ 松手检测死 + 连点每 ~40 次断。避开 index=1 后
     // 注入成为「同源第二根手指」，系统不重置触摸上下文 → 用户手指全程 alive →
     // touchesEnded/Cancelled 真实 → 松手即停（豆包方案）与连点持续同时成立。
-    gTapIndex = (gTapIndex % 8) + 2;
-    uint32_t idx = gTapIndex;
+    // ⚠️ v1.0.130（ctor-27 实锤）：**分配 index 时跳过「仍待 up」的残留 index**——up 被吞
+    // 的残留手指在系统里仍活跃，循环复用其 index（2-9）会让新 down 被系统当作「已有手指
+    // 的移动」→ 无 Began 回流 → 游戏收不到新点击（「一开枪连点就失效」）+ verify 窗口内
+    // 无回流 → 好 SID 被误淘汰。找 2-15 第一个空位；全满（16 根残留，极端）才循环 2-9。
+    uint32_t idx = 0;
+    for (uint32_t i = 2; i < 16; i++) {
+        if (!g_PendingUpIdx[i]) { idx = i; break; }
+    }
+    if (idx == 0) {
+        gTapIndex = (gTapIndex % 8) + 2;
+        idx = gTapIndex;
+    }
     if (idx < 16) {
         g_PendingUpIdx[idx] = true; // v1.0.97：记录待 up 的合成手指（停止时清场用）
         struct timespec tts;
@@ -872,6 +886,11 @@ static void FTRaiseResidualUps(void) {
         // ⚠️ v1.0.129：延迟 150ms → 30ms（ctor-26：快速短按场景用户 150ms 内就重按，
         // 补发与新连点 index 复用冲突 → 残留永远清不掉）。30ms > up-delay 25ms 余量，
         // 且重按窗口极小；配合回调内 gIsClicking 检查（新一轮已开始则放弃补发）双保险。
+        // ⚠️ v1.0.130（ctor-27 实锤）：残留 Stationary 实测在【点击点】持续（move 未生效
+        // ——系统 UIEvent 层的 index 与注入 index 未必对应，角落 down 被当新手指），
+        // 角落 up 抬不掉点击点残留。改【双位置补发】：move 角落（若生效则手指离场）+
+        // up 角落（抬 move 后的手指）+ up 点击点 500ms/1000ms 各一次（残留真实位置，
+        // 系统稳定后接受 up 的概率更高；v1.0.122-123 的 150ms 内全被吞，1s 窗口是新尝试）。
         for (int k = 0; k < np; k++) {
             FTHIDUpCtx *m = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
             if (m) {
@@ -885,10 +904,35 @@ static void FTRaiseResidualUps(void) {
                 dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.09 + (double)k * 0.02) * NSEC_PER_SEC)),
                                  dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
             }
+            // 点击点位置 up（残留真实位置，系统稳定后补抬）——500ms 与 1000ms 各一次
+            FTHIDUpCtx *c1 = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
+            if (c1) {
+                c1->x = rx; c1->y = ry; c1->index = pend[k];
+                dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.5 + (double)k * 0.02) * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
+            }
+            FTHIDUpCtx *c2 = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
+            if (c2) {
+                c2->x = rx; c2->y = ry; c2->index = pend[k];
+                dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((1.0 + (double)k * 0.02) * NSEC_PER_SEC)),
+                                 dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
+            }
         }
         char dbg2[96];
-        snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d (move-to-corner + up, delayed 30ms)", np);
+        snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d (corner+click-pt, delayed 30ms/500ms/1s)", np);
         FTLog(dbg2);
+    }
+}
+
+// ⚠️ v1.0.130：连点期清残留专用 up 回调——**不检查 gIsClicking**（v1.0.129 的
+// FTSendHIDUpCallback 加了 gIsClicking 拦截 → FTCheckResidualDuringCombo 在连点中
+// 调用时补发全被拦 → 连点期残留清理失效，ctor-27 残留越积越多）。连点期补发的
+// up 抬的是残留 index（已清出 g_PendingUpIdx，v1.0.130 分配不再复用）→ 不冲突。
+static void FTSendHIDUpNoGuardCallback(void *ctx) {
+    FTHIDUpCtx *c = (FTHIDUpCtx *)ctx;
+    if (c) {
+        FT_HIDDispatchUp(c->x, c->y, c->index);
+        free(c);
     }
 }
 
@@ -921,7 +965,7 @@ static void FTCheckResidualDuringCombo(void) {
             if (c) {
                 c->x = rx; c->y = ry; c->index = pend[k];
                 dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((double)k * 0.025 * NSEC_PER_SEC)),
-                                 dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
+                                 dispatch_get_main_queue(), NULL, FTSendHIDUpNoGuardCallback);
             }
         }
         char dbg2[96];
@@ -1415,14 +1459,21 @@ static void FTVerifyDeliveryTimer(void *ctx) {
     g_VerifyDelivering = NO;
     bool wasStab = g_StabTesting;
     g_StabTesting = NO;
+    // ⚠️ v1.0.130（ctor-27 实锤）：g_StabFail 只属于【本轮窗口】——首轮短按 touches-ended
+    // 设它（FTStopClicking stab 分支），若窗口内松手被 deferred（v1.0.129 不清锁 return）
+    // 而没清，残留到下一轮 → 下一轮即使送达也因 g_StabFail==YES 不走通过分支 → 误判
+    // stab-fail → 好 SID（0x716/0x717 连遭误杀）被淘汰。触发时无条件保存并清理。
+    bool stabFail = g_StabFail;
+    g_StabFail = NO;
     // 送达 + 无顶掉 → 验证通过（稳定 SID 或正常连点）
-    if (g_VerifySawSynthetic && !g_StabFail) {
+    if (g_VerifySawSynthetic && !stabFail) {
         if (wasStab) {
             FTLog("stab: SID stable - combo continues");
             // v1.0.127：验证通过 → 重置连续失败计数、解除强制锁定
             g_StabFailCount = 0;
             g_StabForceLock = NO;
         }
+        g_VerifyFailCount = 0; // v1.0.130：通过即清零连续失败计数
         return;
     }
     // ⚠️ v1.0.129 修正（ctor-26 实锤）：用户已松手（gBallTouch==NULL）→ **不淘汰 SID、
@@ -1434,21 +1485,34 @@ static void FTVerifyDeliveryTimer(void *ctx) {
         FTLog("verify: finger up during window - verdict deferred, lock kept");
         return;
     }
-    // 走到这里 = 手指还在（顶掉后已重绑 / 快速重按）或假送达（用户按着但无回流）：
-    // 记跳过 + 断点续扫
+    // 走到这里 = 手指还在（顶掉后已重绑 / 快速重按）或假送达（用户按着但无回流）。
+    // ⚠️ v1.0.130（ctor-27 实锤）：**单轮无回流不淘汰**——游戏高频场景注入繁忙/残留
+    // 占槽时单轮窗口内无回流很常见（0x100000730 稳定连点 97 次仍被单轮 verify 误杀 →
+    // 「一开枪连点就失效」）。首次 fail 记警告保持锁定（连点继续），连续 2 次才确认
+    // 假送达/高频顶掉 → 淘汰 + 断点续扫。防空跑代价最多 2×0.8s。
+    g_VerifyFailCount++;
     const char *why = (!g_VerifySawSynthetic && !wasStab)
-        ? "verify: locked SID not delivering - reverting to probe"
-        : "stab-fail: high-freq combo ends user finger - reverting to probe";
-    FTLog(why);
+        ? "verify: no synthetic return this round"
+        : "stab-fail: high-freq combo ends user finger";
+    if (g_VerifyFailCount < 2) {
+        char dbg2[96];
+        snprintf(dbg2, sizeof(dbg2), "%s (%d/2) - lock kept, next round re-checks", why, g_VerifyFailCount);
+        FTLog(dbg2);
+        return;
+    }
+    g_VerifyFailCount = 0;
+    char dbg3[96];
+    snprintf(dbg3, sizeof(dbg3), "%s (2/2) - reverting to probe", why);
+    FTLog(dbg3);
     // ⚠️ v1.0.127：stab-fail（高频顶掉）连续计数——≥3 次判定本会话无稳定 SID →
     // 强制锁定跳过验证（快速变蓝）；假送达（verify）不算（那是 SID 根本不通，跳过正常）
-    if (wasStab && g_StabFail) {
+    if (wasStab && stabFail) {
         g_StabFailCount++;
         if (g_StabFailCount >= 3) {
             g_StabForceLock = YES;
-            char dbg3[96];
-            snprintf(dbg3, sizeof(dbg3), "stab: %d consecutive fails - force-lock next delivery SID (skip verify)", g_StabFailCount);
-            FTLog(dbg3);
+            char dbg4[96];
+            snprintf(dbg4, sizeof(dbg4), "stab: %d consecutive fails - force-lock next delivery SID (skip verify)", g_StabFailCount);
+            FTLog(dbg4);
         }
     }
     if (g_LockedSID) {
@@ -1467,9 +1531,9 @@ static void FTVerifyDeliveryTimer(void *ctx) {
     if (g_ProbeLockIdx > 0) {
         g_ProbeIdx = g_ProbeLockIdx;
         g_ProbeFullScan = YES;
-        char dbg2[96];
-        snprintf(dbg2, sizeof(dbg2), "verify-fail: resume full scan from %d/768", g_ProbeIdx);
-        FTLog(dbg2);
+        char dbg5[96];
+        snprintf(dbg5, sizeof(dbg5), "verify-fail: resume full scan from %d/768", g_ProbeIdx);
+        FTLog(dbg5);
     }
     FTStartProbing(); // 用户仍按着球 → 从跳过列表后继续探测
 }
@@ -2248,14 +2312,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.129 loaded (verify epoch - no false-fail on quick taps; residual up delayed 30ms; delivery accepts Stationary)");
+    syslog(LOG_ERR, "FloatingTap v1.0.130 loaded (stab-fail cleared per window; verify-fail x2 to evict; index skips residual; residual up @click-pt)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.129 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; verify epoch; residual 30ms)\n");
+            fprintf(mk, "FloatingTap v1.0.130 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; stab cleared; verify x2; index skip residual)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
