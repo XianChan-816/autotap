@@ -220,7 +220,10 @@ static double g_ProbeNoFingerT0 = 0;
 // 仍在 up(N) 前 5ms（重叠 1.25 根），up 丢失依旧（ctor-29：combo cleanup 11 + 每轮
 // raise 14 = 残留指数恶化 → 小白条 8s）。30ms+35ms：down(N+1) 在 up(N) 后 5ms → 活跃
 // <1 根 → up 丢失率大降。33Hz 远超全自动枪射速，App 仍可配更快（gCfgMs）。
-static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 30.0;
+// ⚠️ v1.0.134：30ms → 40ms（25Hz）+ up-delay 45ms——ctor-31 每轮仍残留 6-8 个（up
+// 丢失 3%），累积几十根 → 系统触摸崩溃 → 后半段每轮 4 次顶掉（「前面好后面失效」）。
+// 40ms+45ms 频率低 → 每轮 up 数量少 → 丢失总数更少；25Hz 仍远超游戏射速。
+static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 40.0;
 static int  gCfgLoaded = 0;
 
 // MARK: - 诊断日志（append 到标记文件，Filza 可见；带单调时间戳）
@@ -299,7 +302,7 @@ static double FTIntervalMs(void) {
     if (gCfgLoaded && gCfgMs >= 1.0) return gCfgMs;
     FILE *f = fopen("/var/mobile/Library/Preferences/com.floatingtap.cfg", "r");
     if (f) {
-        double v = 30.0; // v1.0.132：默认 30ms（33Hz，up 重叠 <1 根，残留最少）
+        double v = 40.0; // v1.0.134：默认 40ms（25Hz，up 丢失最少）
         if (fscanf(f, "%lf", &v) == 1 && v >= 1.0 && v <= 60000.0) {
             fclose(f);
             return v;
@@ -357,7 +360,7 @@ static void FTAppsListDeferredCallback(void *ctx);
 // 应用共享偏好里的 config（CoreFoundation CFDictionary，纯 C，无 ObjC）
 static void FTApplyConfigFromPrefs(CFDictionaryRef dict) {
     if (!dict || CFGetTypeID(dict) != CFDictionaryGetTypeID()) return;
-    double nx = 0.5, ny = 0.5, ms = 30.0; // v1.0.132：默认 30ms（33Hz，up 重叠 <1 根）
+    double nx = 0.5, ny = 0.5, ms = 40.0; // v1.0.134：默认 40ms（25Hz，up 丢失最少）
     CFStringRef kX = FTCreateCFStr("ClickX");
     CFStringRef kY = FTCreateCFStr("ClickY");
     CFStringRef kMs = FTCreateCFStr("IntervalMs");
@@ -371,7 +374,7 @@ static void FTApplyConfigFromPrefs(CFDictionaryRef dict) {
     if (kX) CFRelease(kX); if (kY) CFRelease(kY); if (kMs) CFRelease(kMs);
     if (nx < 0) nx = 0; if (nx > 1) nx = 1;
     if (ny < 0) ny = 0; if (ny > 1) ny = 1;
-    if (ms < 1) ms = 30;
+    if (ms < 1) ms = 40;
     gCfgX = nx; gCfgY = ny; gCfgMs = ms;
     gCfgLoaded = 1;
     FTMoveBallToConfig();
@@ -694,13 +697,14 @@ static void FTSyntheticTap(double px, double py) {
     // 不连续。25ms 下 up 在 down 后从容发出（v1.0.108 实测 clicks 131 持续）。跳屏改由
     // FTRaiseResidualUps 串行补发（v1.0.110）解决，不再牺牲 up-delay。
     // ⚠️ v1.0.132：25ms → 35ms——配合间隔 30ms（铁律 up-delay > 间隔）：down(N+1) 在
-    // up(N) 后 5ms 发出（无重叠）→ up 丢失率大降（ctor-29 的 combo cleanup 11 + raise 14
-    // = 20ms+25ms 重叠 1.25 根时残留指数恶化）。35ms 下活跃手指 <1 根。
+    // up(N) 后 5ms 发出（无重叠）→ up 丢失率大降。35ms 下活跃手指 <1 根。
+    // ⚠️ v1.0.134：35ms → 45ms——配合间隔 40ms（25Hz）：down(N+1) 仍在 up(N) 后 5ms，
+    // 但频率低 → 每轮 up 数量少 → 丢失总数更少（ctor-31 每轮仍残留 6-8 个）。
     // 上下文按次 malloc，避免全局覆盖导致 down/up 错配。
     FTHIDUpCtx *c = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
     if (c) {
         c->x = nx; c->y = ny; c->index = idx;
-        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.035 * NSEC_PER_SEC)),
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.045 * NSEC_PER_SEC)),
                          dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
     }
 }
@@ -890,32 +894,28 @@ static void FTRaiseResidualUps(void) {
         // 延迟 150ms/x2 全被系统吞）——残留合成手指 Stationary 持续数秒 → 全自动枪
         // 持续开火 + 小白条失效（用户：绿圈出现=已停止，枪还在开）。根因：up 事件
         // 可能被系统当作「同一手指的重复抬起」忽略。
-        // **换思路：先「移走」再「抬起」**——对每个残留 index 注入同 index 的 down
-        //（zxtouch 移动语义，位置=屏幕左上角 0.05,0.05），把残留手指移离点击点（游戏
-        // 按钮），60ms 后再 up 抬起。即使 up 仍被吞，手指已移走 → 游戏停止持续触发、
-        // 小白条恢复。角落远离按钮与 Home 区域。
-        // ⚠️ v1.0.129：延迟 150ms → 30ms（ctor-26：快速短按场景用户 150ms 内就重按，
-        // 补发与新连点 index 复用冲突 → 残留永远清不掉）。30ms > up-delay 25ms 余量，
-        // 且重按窗口极小；配合回调内 gIsClicking 检查（新一轮已开始则放弃补发）双保险。
-        // ⚠️ v1.0.130（ctor-27 实锤）：残留 Stationary 实测在【点击点】持续（move 未生效
-        // ——系统 UIEvent 层的 index 与注入 index 未必对应，角落 down 被当新手指），
-        // 角落 up 抬不掉点击点残留。改【双位置补发】：move 角落（若生效则手指离场）+
-        // up 角落（抬 move 后的手指）+ up 点击点 500ms/1000ms 各一次（残留真实位置，
-        // 系统稳定后接受 up 的概率更高；v1.0.122-123 的 150ms 内全被吞，1s 窗口是新尝试）。
+        // ⚠️ v1.0.130（ctor-27/29/30/31 实锤）：move 角落 + up 角落 + up 点击点 500ms/1s
+        // 全部无效——残留 Stationary 持续 tap 累积（61→224）→ 小白条 + 残留堆积到
+        // 几十根 → 系统触摸崩溃 → 后半段每轮 4 次顶掉（「前面测得好好的后面失效」）。
+        // 残留是系统 UIEvent 层幻影（up 补发时系统已无该手指上下文 → 忽略）。
+        // **v1.0.134 换思路：先「重建上下文」再「抬起」**——对每个残留 index 先注入
+        // 同 index 的 down 到【点击点】（系统重新建立该 index 手指上下文 = 位置更新），
+        // 30ms 后再同位置 up（有 down 上下文支撑的 up 系统才接受）。500ms/1s 各补一次
+        // up（残留若未抬，系统稳定后再试）。不再发角落（角落 down 被当新手指，无效）。
         for (int k = 0; k < np; k++) {
-            FTHIDUpCtx *m = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
-            if (m) {
-                m->x = 0.05; m->y = 0.05; m->index = pend[k];
+            FTHIDUpCtx *d = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
+            if (d) {
+                d->x = rx; d->y = ry; d->index = pend[k];
                 dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.03 + (double)k * 0.02) * NSEC_PER_SEC)),
                                  dispatch_get_main_queue(), NULL, FTSendHIDMoveCallback);
             }
             FTHIDUpCtx *u = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
             if (u) {
-                u->x = 0.05; u->y = 0.05; u->index = pend[k];
-                dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.09 + (double)k * 0.02) * NSEC_PER_SEC)),
+                u->x = rx; u->y = ry; u->index = pend[k];
+                dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((0.06 + (double)k * 0.02) * NSEC_PER_SEC)),
                                  dispatch_get_main_queue(), NULL, FTSendHIDUpCallback);
             }
-            // 点击点位置 up（残留真实位置，系统稳定后补抬）——500ms 与 1000ms 各一次
+            // 残留真实位置 up——500ms 与 1000ms 各一次（系统稳定后补抬，成功率更高）
             FTHIDUpCtx *c1 = (FTHIDUpCtx *)malloc(sizeof(FTHIDUpCtx));
             if (c1) {
                 c1->x = rx; c1->y = ry; c1->index = pend[k];
@@ -930,7 +930,7 @@ static void FTRaiseResidualUps(void) {
             }
         }
         char dbg2[96];
-        snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d (corner+click-pt, delayed 30ms/500ms/1s)", np);
+        snprintf(dbg2, sizeof(dbg2), "raise residual synthetic ups: %d (rebuild-ctx: down+up @click-pt, 30/60/500/1k ms)", np);
         FTLog(dbg2);
     }
 }
@@ -2384,14 +2384,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.133 loaded (touches-ended evicts no-delivery rounds immediately; verify drops Stationary)");
+    syslog(LOG_ERR, "FloatingTap v1.0.134 loaded (residual rebuild-ctx down+up @click-pt; interval 40ms + up-delay 45ms)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.133 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; touches-ended evicts no-delivery)\n");
+            fprintf(mk, "FloatingTap v1.0.134 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; residual rebuild-ctx; 40ms+45ms)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
