@@ -10,12 +10,18 @@ export ARCHS = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = FloatingTap
+TWEAK_NAME = FloatingTap BackboardProbe
 
-# Tweak.xm（UI+交互）+ HIDInject.c（纯 C HID 引擎）；不编译 FloatingBallView.m / HIDInject.m（ObjC 类版）
+# FloatingTap：SB 侧悬浮球 + 连点（现有逻辑）
 FloatingTap_FILES = Tweak.xm HIDInject.c
 FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 FloatingTap_FRAMEWORKS = UIKit CoreGraphics
 FloatingTap_LDFLAGS = -lz
+
+# BackboardProbe：backboardd 进程内 IOHID 注入最小原型（v2.0 方向验证）
+# 目的：验证「在触摸分发源头(backboardd)注入 → 系统当真实触摸 → 不顶掉用户手指」
+BackboardProbe_FILES = BackboardProbe.c
+BackboardProbe_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+BackboardProbe_FRAMEWORKS = CoreFoundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
