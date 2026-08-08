@@ -209,6 +209,14 @@ static BOOL   g_StabForceLock = NO;
 // v1.0.121：探测续扫时用户手指不在球上（顶掉未重绑/真松手）的起始时刻——等手指
 // 重绑或再按（≤5s），超时才停止探测回蓝（防真松手后空扫 46s 到紫）
 static double g_ProbeNoFingerT0 = 0;
+// ⚠️ v1.0.131（ctor(3) 实锤）：顶掉重绑检测——「连点停止时间/轮次」记录 + 「停止后
+// 0.5-2.5s 内系统自动重发 Began」计数。顶掉（用户手指物理还在，被系统 Ended 后
+// 0.6-1.7s 自动重绑）→ 命中；用户快速短按（真松手，重按间隔 <0.5s）→ 不命中。
+// 连续 2 次 → 该 SID 高频顶掉 → 淘汰（记跳过+清锁），防顶掉循环（0x716 每轮 13 次
+// → 连点注入全被吞 → 「连点功能没实现」+ 残留堆积 tap=66 → 小白条 8s）。
+static double g_LastStopT = 0;      // 最近一次 touches-ended 停止时刻（单调时钟）
+static unsigned long g_LastStopClicks = 0; // 该轮点击次数（顶掉轮很短）
+static int    g_EndedThenRebind = 0;      // 顶掉重绑连续计数（锁定新 SID 时清零）
 
 // v1.0.50：AutoTap App 配置（位置/间隔）——定义在 FTIntervalMs 之前（它要读）
 // ⚠️ v1.0.123：默认间隔 10ms → 15ms——10ms（100Hz）+ up-delay 25ms = 同时 2.5 根
@@ -566,11 +574,12 @@ typedef struct {
 static void FTSendHIDUpCallback(void *ctx) {
     FTHIDUpCtx *c = (FTHIDUpCtx *)ctx;
     if (c) {
-        // ⚠️ v1.0.129（ctor-26 实锤）：停止后补发 up 若遇上【新一轮连点已开始】
-        //（用户 150ms 内快速重按，index 2-9 复用）→ 补发会把新手指抬掉 / 把新连点的
-        // pending 位图清掉 → 新连点 up 失联 → 又丢 → 残留永远清不掉。新一轮已接管
-        // 该 index（同 index down = 更新/覆盖旧残留），放弃补发，让新连点自己管理。
-        if (gIsClicking) { free(c); return; }
+        // ⚠️ v1.0.131 修正（ctor(3) 实锤）：v1.0.129 的 gIsClicking 拦截在【顶掉循环】中
+        // 把所有补发全拦了（自动重启连点让 gIsClicking 几乎一直 YES）→ 残留永远清不掉
+        //（tap=66 → 小白条 8s）。v1.0.130 起 index 分配已跳过残留（位图 false → 不再
+        // 占用）→ 补发安全。改为【index 占用检查】：位图又变 true = 新连点占用了该
+        // index → 放弃；false = 残留 index 空闲 → 补发执行。
+        if (c->index < 16 && g_PendingUpIdx[c->index]) { free(c); return; }
         FT_HIDDispatchUp(c->x, c->y, c->index);
         if (c->index < 16) {
             g_PendingUpIdx[c->index] = false; // v1.0.97：up 已派发，清除残留标记
@@ -586,8 +595,8 @@ static void FTSendHIDUpCallback(void *ctx) {
 static void FTSendHIDMoveCallback(void *ctx) {
     FTHIDUpCtx *c = (FTHIDUpCtx *)ctx;
     if (c) {
-        // v1.0.129：同 FTSendHIDUpCallback——新一轮连点已开始则放弃（index 已被接管）
-        if (gIsClicking) { free(c); return; }
+        // v1.0.131：同 FTSendHIDUpCallback——gIsClicking 改「index 被占用」检查
+        if (c->index < 16 && g_PendingUpIdx[c->index]) { free(c); return; }
         FT_HIDDispatchDown(c->x, c->y, c->index);
         free(c);
     }
@@ -979,6 +988,12 @@ static void FTStopClicking(const char *reason) {
     if (!gIsClicking) return;
     gIsClicking = NO;
     gStopGracePending = NO; // 取消任何待决的松手宽限
+    // ⚠️ v1.0.131：记录本轮停止时刻/轮次——sendEvent 的重绑 Began 用它判断「顶掉」
+    //（停止后 0.5-2.5s 自动重绑 = 高频顶掉确认，clicks < 50 的短轮特征）
+    struct timespec tts;
+    clock_gettime(CLOCK_MONOTONIC, &tts);
+    g_LastStopT = (double)tts.tv_sec + (double)tts.tv_nsec * 1e-9;
+    g_LastStopClicks = gClickCount;
     // ⚠️ v1.0.119：稳定性验证窗口内【保留】g_VerifyDelivering，让 FTVerifyDeliveryTimer
     // 裁决「顶掉 vs 真松手」并续扫；窗口外（正常连点）才取消送达验证。
     if (!g_StabTesting) {
@@ -1279,6 +1294,7 @@ static void FTProbeNext(void) {
                          (unsigned long long)g_ProbeDeliveredSID);
                 FTLog(dbg2);
                 gBallTouchClicking = YES;
+                g_EndedThenRebind = 0; // v1.0.131：新锁定清零顶掉重绑计数
                 FTStartClicking();
             } else {
                 g_Probing = NO;
@@ -1411,6 +1427,7 @@ static void FTCheckProbe(void *ctx) {
             //（快速变蓝，防「一直变不了蓝」；连点断续由幽灵看门狗+自动重绑恢复兜底）。
             g_StabTesting = !g_StabForceLock;
             g_StabFail = NO;
+            g_EndedThenRebind = 0; // v1.0.131：新锁定清零顶掉重绑计数
             FTStartClicking();
             return;
         }
@@ -2159,6 +2176,43 @@ static void FTTweakInitCallback(void *ctx) {
                 if (onBall && gBallTouch == NULL) {
                     gBallTouch = tp;
                     gBallTouchDownTime = now;
+                    // ⚠️ v1.0.131（ctor(3) 实锤）：顶掉重绑检测——连点停止后 0.5-2.5s 内
+                    // 系统【自动】重发 Began（gBallTouch==NULL 时，用户无新物理动作）=
+                    // 用户手指物理还在、被顶掉后重绑 → 该 SID 高频顶掉确认。连续 2 次 →
+                    // 淘汰（记跳过+清锁+回蓝，不自动重启，用户下次按住重新探测跳过它）。
+                    // 防顶掉循环：0x100000716 每轮 13 次就被顶掉 → 注入全被吞（无点击，
+                    // 「连点没实现」）+ 每轮 13 残留（tap=66 → 小白条 8s）。用户快速短按
+                    //（真松手）重按间隔 <0.5s → 不命中（阈值分界，0.5-2.5s 窗口）。
+                    if (!gIsClicking && !g_Probing && g_LockedSID != 0 &&
+                        g_LastStopT > 0 && (now - g_LastStopT) > 0.5 && (now - g_LastStopT) < 2.5 &&
+                        g_LastStopClicks < 50) {
+                        g_EndedThenRebind++;
+                        if (g_EndedThenRebind >= 2) {
+                            g_EndedThenRebind = 0;
+                            char dbg[128];
+                            snprintf(dbg, sizeof(dbg), "rebind-after-end x2: SID 0x%llx high-freq ender - skip + clear lock",
+                                     (unsigned long long)g_LockedSID);
+                            FTLog(dbg);
+                            if (g_LockedSID) {
+                                bool dup = false;
+                                for (int k = 0; k < g_ProbeEndingCount; k++) {
+                                    if (g_ProbeEndingSIDs[k] == g_LockedSID) { dup = true; break; }
+                                }
+                                if (!dup && g_ProbeEndingCount < 64) {
+                                    g_ProbeEndingSIDs[g_ProbeEndingCount++] = g_LockedSID;
+                                }
+                            }
+                            g_LockedSID = 0;
+                            FT_HIDLockSenderID(0);
+                            FTApplyBallAppearance(); // 回蓝（不再自动重启连点）
+                            gBallTouchClicking = NO;
+                            // 手指物理还在（顶掉场景）→ 立即续扫找下一个稳定 SID；
+                            // 误判场景（用户慢速重按）→ 探测等手指 5s 自动回蓝，无碍
+                            FTStartProbing();
+                        } else {
+                            FTLog("rebind-after-end: possible high-freq ender (1/2)");
+                        }
+                    }
                     // v1.0.108：探测期间系统重发 Began（手指被顶掉后重绑复活）
                     // → 恢复「不顶掉」验证能力，后续送达型 SID 可直接锁定
                     if (g_Probing) g_ProbeFingerDead = NO;
@@ -2312,14 +2366,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.130 loaded (stab-fail cleared per window; verify-fail x2 to evict; index skips residual; residual up @click-pt)");
+    syslog(LOG_ERR, "FloatingTap v1.0.131 loaded (rebind-after-end x2 evicts high-freq enders; residual rebroadcast index-guarded)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.130 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; stab cleared; verify x2; index skip residual)\n");
+            fprintf(mk, "FloatingTap v1.0.131 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; rebind-after-end evicts enders)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
