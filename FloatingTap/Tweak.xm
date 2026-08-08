@@ -996,6 +996,33 @@ static void FTStopClicking(const char *reason) {
     // 新一轮 started 递增 epoch → 旧定时器丢弃，不误判。非松手停止（dbl-tap 等）才取消。
     if (reason && strcmp(reason, "touches-ended") == 0) {
         if (g_StabTesting) g_StabFail = YES; // stab 验证期顶掉标记（计数兜底）
+        // ⚠️ v1.0.133（ctor-30 实锤）：**touches-ended 立即裁决**——本轮 started 后
+        // g_VerifySawSynthetic 若一直 NO（无任何送达回流）且点击 ≥3 次 = 顶掉循环/
+        // 空跑（注入被系统吞）→ 淘汰 SID。不能依赖 0.8s verify 定时器：顶掉循环中
+        // 自动重启连点（重绑 <0.8s + 120ms 计时器）不断递增 epoch → 定时器永远被
+        // 丢弃 → 永不裁决 → 顶掉 SID 永驻（ctor-30 每轮 7 次顶掉 + 残留堆积）。
+        // 快速短按（注入正常）→ 有回流 → YES → 保持锁定；clicks<3 的极短轻点豁免。
+        if (!g_VerifySawSynthetic && g_LockedSID != 0 && !g_Probing && gClickCount >= 3) {
+            FTLog("evict: round ended with NO delivery (high-freq ender / empty run)");
+            bool dup = false;
+            for (int k = 0; k < g_ProbeEndingCount; k++) {
+                if (g_ProbeEndingSIDs[k] == g_LockedSID) { dup = true; break; }
+            }
+            if (!dup && g_ProbeEndingCount < 64) {
+                g_ProbeEndingSIDs[g_ProbeEndingCount++] = g_LockedSID;
+            }
+            g_VerifyFailCount = 0;
+            g_LockedSID = 0;
+            FT_HIDLockSenderID(0);
+            if (g_ProbeLockIdx > 0) {
+                g_ProbeIdx = g_ProbeLockIdx;
+                g_ProbeFullScan = YES;
+                char dbg2[96];
+                snprintf(dbg2, sizeof(dbg2), "evict: resume full scan from %d/768", g_ProbeIdx);
+                FTLog(dbg2);
+            }
+            FTStartProbing(); // 手指物理还在（顶掉场景）→ 续扫下一个；已松手 → 等手指回蓝
+        }
     } else {
         g_VerifyDelivering = NO; // v1.0.112：非松手停止取消送达验证
     }
@@ -2182,11 +2209,13 @@ static void FTTweakInitCallback(void *ctx) {
             // 被误判 verify-fail → 回退循环）；加 ph==0——用户手指滑出球边的 Moved
             // （phase=1）不算合成回流，防用户手指干扰误判验证通过。
             // ⚠️ v1.0.126：ph==0 → ph==0||ph==1（同探测，残留 Stationary 也算合成回流）。
-            // ⚠️ v1.0.129：ph==2（Stationary 残留）也算送达——ctor-26 实锤：残留合成
-            // 手指按在点击点（up 被吞），残留本身 = down 成功送达的证据；且残留占着
-            // 槽位时新注入 down 不产生新 Began（只有残留的 Stationary 回流），若不算
-            // Stationary 则 verify 永远「看不到回流」→ 好 SID 被误淘汰。
-            if (g_VerifyDelivering && !g_VerifySawSynthetic && !onBall && (ph == 0 || ph == 1 || ph == 2)) {
+            // ⚠️ v1.0.133（ctor-30 实锤）：**去掉 ph==2**——残留 Stationary 是【上一轮】
+            // 的，不证明本轮送达。v1.0.129 加 ph==2 后，顶掉循环里残留常驻点击点 →
+            // verify 永远「看到送达」→ 顶掉 SID 永不淘汰（ctor-30：每轮 7 次顶掉 +
+            // verdict deferred, lock kept 永驻 → 无连续连点 + 残留堆积小白条）。
+            // 本轮送达只看新 down 的 Began（ph==0）/Moved（ph==1）；v1.0.132 的
+            // 30ms+35ms 无重叠注入下新 down 必有 Began。探测判定仍保留 ph==2（ctor-23）。
+            if (g_VerifyDelivering && !g_VerifySawSynthetic && !onBall && (ph == 0 || ph == 1)) {
                 double vcx = gClickLockX * gScreenW;
                 double vcy = gClickLockY * gScreenH;
                 double vdist = sqrt((loc.x - vcx) * (loc.x - vcx) + (loc.y - vcy) * (loc.y - vcy));
@@ -2355,14 +2384,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.132 loaded (verify evicts no-delivery rounds; interval 30ms + up-delay 35ms; index 2-9 skips residual)");
+    syslog(LOG_ERR, "FloatingTap v1.0.133 loaded (touches-ended evicts no-delivery rounds immediately; verify drops Stationary)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.132 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; verify evicts no-delivery; 30ms+35ms; idx 2-9)\n");
+            fprintf(mk, "FloatingTap v1.0.133 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; touches-ended evicts no-delivery)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
