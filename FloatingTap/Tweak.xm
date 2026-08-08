@@ -190,7 +190,9 @@ static void FTVerifyDeliveryTimer(void *ctx);
 // + 断点续扫；窗口内稳定 → 验证通过，正式连点。
 static BOOL   g_StabTesting = NO;
 static BOOL   g_StabFail = NO;
-static BOOL   g_StabExtended = NO; // v1.0.120：裁决已延长一次（等系统重绑用户手指）
+// v1.0.121：探测续扫时用户手指不在球上（顶掉未重绑/真松手）的起始时刻——等手指
+// 重绑或再按（≤5s），超时才停止探测回蓝（防真松手后空扫 46s 到紫）
+static double g_ProbeNoFingerT0 = 0;
 
 // v1.0.50：AutoTap App 配置（位置/间隔）——定义在 FTIntervalMs 之前（它要读）
 static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 10.0;
@@ -1059,6 +1061,7 @@ static void FTStartProbing(void) {
     FTBuildProbeCandidates();
     g_Probing = YES;
     if (!g_ProbeFullScan) g_ProbeIdx = 0; // 全扫中保留进度
+    g_ProbeNoFingerT0 = 0;   // v1.0.121：新探测会话重置「等手指」计时
     g_ProbeTouchEnded = NO;
     g_ProbeDelivered = NO;
     g_ProbeTapT0 = 0;            // v1.0.107：清注入时刻
@@ -1079,8 +1082,37 @@ static void FTStartProbing(void) {
 // v1.0.111：全扫范围扩到 0x100000600-0x1000008ff（768 个）——有效 SID 会话随机，
 // 可能落在 6xx/8xx 段（ctor-7 实测 7xx 全扫 256 个仅 2 个送达型、无 A 类 → 变不了蓝）；
 // 检查窗口 80ms→60ms（Began 回流 10-30ms，顶掉信号 <60ms 内）；分段进度日志。
+// v1.0.121：FTProbeNext 的「等手指」延时重查回调（dispatch_after_f 需要 void(*)(void*) 签名）
+static void FTProbeNextWaitCB(void *ctx) {
+    (void)ctx;
+    FTProbeNext();
+}
+
 static void FTProbeNext(void) {
     if (!g_Probing) return;
+    // ⚠️ v1.0.121：用户手指不在球上（顶掉未重绑 / 真松手）→ 等手指重绑或再按再注入。
+    // 顶掉续扫后手指未重绑时盲目注入探测 tap 没有意义（v1.0.120 的「等重绑裁决」
+    // 被 0.7~1.7s 重绑延迟击穿 → 0x7b1 死循环，ctor-18 实锤）。等 250ms 重查；
+    // 超过 5s 无手指 → 停止探测回蓝（防真松手后空扫 46s 到紫）。
+    if (gBallTouch == NULL) {
+        struct timespec tts;
+        clock_gettime(CLOCK_MONOTONIC, &tts);
+        double now = (double)tts.tv_sec + (double)tts.tv_nsec * 1e-9;
+        if (g_ProbeNoFingerT0 == 0) g_ProbeNoFingerT0 = now;
+        if (now - g_ProbeNoFingerT0 > 5.0) {
+            g_Probing = NO;
+            g_ProbeFullScan = NO;
+            g_ProbeIdx = 0;
+            g_ProbeNoFingerT0 = 0;
+            FTApplyBallAppearance(); // 回蓝
+            FTLog("probe: no finger on ball for 5s - stopped");
+            return;
+        }
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                         dispatch_get_main_queue(), NULL, FTProbeNextWaitCB);
+        return;
+    }
+    g_ProbeNoFingerT0 = 0; // 手指在，清零等待计时
     uint64_t sid = 0;
     if (g_ProbeFullScan) {
         while (g_ProbeIdx < 768) {
@@ -1251,7 +1283,6 @@ static void FTCheckProbe(void *ctx) {
             // FTVerifyDeliveryTimer 400ms 窗口内顶掉+重绑 → stab-fail → 记跳过 + 续扫。
             g_StabTesting = YES;
             g_StabFail = NO;
-            g_StabExtended = NO; // v1.0.120：每轮锁定重置延长标志
             FTStartClicking();
             return;
         }
@@ -1278,14 +1309,17 @@ static void FTStopGraceTimer(void *ctx) {
     FTStopClicking("touches-ended");
 }
 
-// v1.0.112：连点送达自愈验证——锁定 SID 后 400ms 内 SEND 无合成触摸回流（点击点附近
+// v1.0.112：连点送达自愈验证——锁定 SID 后窗口内 SEND 无合成触摸回流（点击点附近
 // !onBall 触摸）→ 锁定的 SID 假送达（顶掉型 C 类，ctor-8 实锤：0x100000661 连点 540 次
 // 空跑）→ 停止连点、记录跳过列表、清锁定、自动重新探测。
 // ⚠️ v1.0.119（ctor-16 实锤）：扩展为【高频稳定性裁决】——低频探测不顶掉的 SID，
 // 10ms 高频连点会顶掉用户手指（每轮 8 次就 touches-ended → 停止 → 0.6s 重绑 → 循环，
-// 用户感知「不连续」，且频繁停止让 up 丢失 50% → 残留 → 小白条失效）。窗口内
-// touches-ended 且手指随后重绑（gBallTouch!=NULL）→ 高频顶掉 → 记跳过 + 断点续扫，
-// 直到找到「高频也不顶掉」的稳定 SID；手指未重绑（真松手）→ 正常停止回蓝。
+// 用户感知「不连续」，且频繁停止让 up 丢失 50% → 残留 → 小白条失效）。窗口（0.8s）内
+// touches-ended（顶掉）→ 高频顶掉 → 记跳过 + 断点续扫，直到找到「高频也不顶掉」的
+// 稳定 SID。
+// ⚠️ v1.0.121（ctor-18 实锤）：顶掉即判跳过续扫，不再等系统重绑判断真松手——重绑
+// 延迟 0.6~1.7s 不稳定，等待逻辑会被击穿（0x7b1 死循环，每轮 5-7 次）。真松手场景由
+// FTProbeNext 的「等手指」兜底（≤5s 无手指才停止探测回蓝，不会空扫 46s）。
 static void FTVerifyDeliveryTimer(void *ctx) {
     (void)ctx;
     if (!g_VerifyDelivering) return;
@@ -1297,24 +1331,12 @@ static void FTVerifyDeliveryTimer(void *ctx) {
         if (wasStab) FTLog("stab: SID stable - combo continues");
         return;
     }
-    // 有顶掉标记或无回流 → 看用户手指状态：
-    if (gBallTouch == NULL) {
-        // ⚠️ v1.0.120：顶掉后系统重绑用户手指需 0.6~1.4s+（ctor-16/17 实测），首次
-        // 裁决（0.8s）时往往还没重绑——不能直接当「真松手」处理（ctor-17 实锤：
-        // 误判后坏 SID 0x100000716 不淘汰，每轮 10 次反复顶掉循环 → 不连续）。
-        // 延长等待一次（共 ~1.6s）：期间重绑 → 顶掉确认 → 记跳过 + 续扫；
-        // 1.6s 仍无重绑 → 才是真松手 → 保持停止（点击本身已在 touches-ended 时立即停）。
-        if (!g_StabExtended) {
-            g_StabExtended = YES;
-            g_VerifyDelivering = YES; // 保持验证进行，重排检查
-            dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                             dispatch_get_main_queue(), NULL, FTVerifyDeliveryTimer);
-            return;
-        }
-        if (wasStab) FTLog("stab: no rebind in 1.6s - real finger-up, stay stopped");
-        return;
-    }
-    // 走到这里 = 手指已重绑（顶掉确认）：假送达 或 高频顶掉 → 记跳过 + 续扫
+    // ⚠️ v1.0.121 定案（ctor-18 实锤）：走到这里 = 假送达 或 高频顶掉 → **立即记跳过 +
+    // 续扫**，不再等系统重绑判断真松手——顶掉后系统重绑用户手指需 0.6~1.7s（ctor-18
+    // 实测 0x7b1 顶掉后 ~1.7s 才重绑），超过 0.8s×2=1.6s 两段裁决总窗口 → 等待逻辑
+    // 竞态失效 → 坏 SID 不进跳过列表 → 每轮 5-7 次死循环（「接着按压变蓝后不连续」）。
+    // 用户真松手场景由 FTProbeNext 的「等手指」兜底：续扫时手指不在球上 → 等待重绑/
+    // 再按（≤5s），超时才停止探测回蓝——不会误把真松手当顶掉，也不会空扫 46s。
     const char *why = (!g_VerifySawSynthetic && !wasStab)
         ? "verify: locked SID not delivering - reverting to probe"
         : "stab-fail: high-freq combo ends user finger - reverting to probe";
@@ -2091,14 +2113,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.120 loaded (stab verdict waits for system finger rebind - correctly skips high-freq enders)");
+    syslog(LOG_ERR, "FloatingTap v1.0.121 loaded (stab-fail skips immediately; probe waits for finger rebind)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.120 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; stab verdict waits for rebind)\n");
+            fprintf(mk, "FloatingTap v1.0.121 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; stab-fail skips immediately)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
