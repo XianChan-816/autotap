@@ -202,9 +202,11 @@ static double g_ProbeNoFingerT0 = 0;
 // v1.0.50：AutoTap App 配置（位置/间隔）——定义在 FTIntervalMs 之前（它要读）
 // ⚠️ v1.0.123：默认间隔 10ms → 15ms——10ms（100Hz）+ up-delay 25ms = 同时 2.5 根
 // 合成手指重叠，up 丢失率高 → 残留手指堆积 → 小白条失效 + 游戏长按残留（ctor-19/20
-// 实锤，补发 up 也清不掉）。15ms（67Hz）→ 重叠 1.67 根，up 丢失率大幅下降，
-// 游戏连点 67Hz 完全足够。用户仍可在 App 里配更快的值。
-static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 15.0;
+// 实锤，补发 up 也清不掉）。15ms（67Hz）→ 重叠 1.67 根，up 丢失率大幅下降。
+// ⚠️ v1.0.128：15ms → 20ms（50Hz）——15ms + 25ms up-delay 重叠仍有 1.67 根，残留
+// 依旧（ctor-25：绿圈出现还在开枪 = 残留手指按着开火键）。20ms → 重叠 1.25 根，
+// up 丢失率进一步下降；游戏连点 50Hz 完全足够（远超任何游戏射速）。App 可配更快。
+static double gCfgX = 0.5, gCfgY = 0.5, gCfgMs = 20.0;
 static int  gCfgLoaded = 0;
 
 // MARK: - 诊断日志（append 到标记文件，Filza 可见；带单调时间戳）
@@ -276,21 +278,21 @@ static BOOL FTUIReady(void) {
 
 static unsigned long gClickCount = 0; // 本次连点周期内的点击次数（诊断）
 
-// 读取连点间隔（毫秒）：优先 App 配置（v1.0.50），兜底 cfg 文件，默认 15ms。
-// ⚠️ v1.0.123：15ms ≈ 67 次/秒（原 10ms=100Hz，up 重叠 2.5 根 → up 丢失 → 残留 →
-// 小白条失效，ctor-19/20 实锤）；67Hz 游戏连点足够。
+// 读取连点间隔（毫秒）：优先 App 配置（v1.0.50），兜底 cfg 文件，默认 20ms。
+// ⚠️ v1.0.128：20ms ≈ 50 次/秒（15ms=67Hz 时 up 重叠 1.67 根残留仍多，ctor-25 实锤）；
+// 50Hz 游戏连点足够，up 丢失率最低。
 static double FTIntervalMs(void) {
     if (gCfgLoaded && gCfgMs >= 1.0) return gCfgMs;
     FILE *f = fopen("/var/mobile/Library/Preferences/com.floatingtap.cfg", "r");
     if (f) {
-        double v = 15.0;
+        double v = 20.0;
         if (fscanf(f, "%lf", &v) == 1 && v >= 1.0 && v <= 60000.0) {
             fclose(f);
             return v;
         }
         fclose(f);
     }
-    return 15.0;
+    return 20.0;
 }
 
 // MARK: - App 通信（v1.0.53：CFPreferences 共享偏好，cfprefsd 守护进程跨进程共享）
@@ -341,7 +343,7 @@ static void FTAppsListDeferredCallback(void *ctx);
 // 应用共享偏好里的 config（CoreFoundation CFDictionary，纯 C，无 ObjC）
 static void FTApplyConfigFromPrefs(CFDictionaryRef dict) {
     if (!dict || CFGetTypeID(dict) != CFDictionaryGetTypeID()) return;
-    double nx = 0.5, ny = 0.5, ms = 15.0; // v1.0.123：默认 15ms（10ms 残留太多，见上）
+    double nx = 0.5, ny = 0.5, ms = 20.0; // v1.0.128：默认 20ms（残留最少，见上）
     CFStringRef kX = FTCreateCFStr("ClickX");
     CFStringRef kY = FTCreateCFStr("ClickY");
     CFStringRef kMs = FTCreateCFStr("IntervalMs");
@@ -355,7 +357,7 @@ static void FTApplyConfigFromPrefs(CFDictionaryRef dict) {
     if (kX) CFRelease(kX); if (kY) CFRelease(kY); if (kMs) CFRelease(kMs);
     if (nx < 0) nx = 0; if (nx > 1) nx = 1;
     if (ny < 0) ny = 0; if (ny > 1) ny = 1;
-    if (ms < 1) ms = 15;
+    if (ms < 1) ms = 20;
     gCfgX = nx; gCfgY = ny; gCfgMs = ms;
     gCfgLoaded = 1;
     FTMoveBallToConfig();
@@ -686,11 +688,16 @@ static void FTSyntheticTap(double px, double py) {
 static void FTClickCallback(void *ctx) {
     (void)ctx;
     if (!gBallView || !gIsClicking) return;
-    // ⚠️ v1.0.127 幽灵看门狗（ctor-24 用户实锤「短按后一直触发连击，要手动停」）：
-    // 连点中用户手指必须还在球上（gBallTouch 非空）。顶掉后未重绑 / 系统漏发 Ended /
-    // 用户已物理松手而 gBallTouch 残留 → 立即停止（比 50ms 松手宽限更快兜底）。
-    // 正常按住（静止）gBallTouch 持续非空 → 不影响；touches-ended 正常路径仍走宽限。
-    if (gBallTouch == NULL) {
+    // ⚠️ v1.0.128 定案（ctor-25 实锤）：幽灵看门狗必须配合松手宽限，不能抢跑！
+    // v1.0.127 的 `if (gBallTouch == NULL) FTStopClicking("ghost-guard")` 把「高频顶掉」
+    //（touches-ended 到达 → gBallTouch 清空 + 50ms 宽限已排，用户手指物理还在等重绑）
+    // 误判为「用户松手」→ 10ms 内抢跑停止 → 连点每轮 46 次恶化到 2 次 → 频繁停止又
+    // 加剧残留 → 恶性循环（ctor-25 日志 ghost-guard 刷屏 + clicks: 2）。
+    // 修复：宽限已排（gStopGracePending）说明 touches-ended 走正常停止/重绑路径 →
+    // 看门狗不干预；只有「gBallTouch==NULL 且无宽限」的异常（几乎不发生）才兜底停止。
+    // 幽灵连点（Ended 丢失、gBallTouch 残留非空）本就不触发此分支，由 v1.0.127 的
+    // Ended 双条件（指针匹配 OR 100px）兜底。
+    if (gBallTouch == NULL && !gStopGracePending) {
         FTStopClicking("ghost-guard");
         return;
     }
@@ -2221,14 +2228,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.127 loaded (verify 800ms strict + force-lock after 3 fails; ghost-combo fix: Ended matches pointer OR 100px)");
+    syslog(LOG_ERR, "FloatingTap v1.0.128 loaded (ghost-guard defers to grace window; interval 20ms for fewer residual fingers)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.127 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; verify 800ms + force-lock; ghost-combo fix)\n");
+            fprintf(mk, "FloatingTap v1.0.128 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; ghost-guard defers; 20ms)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
