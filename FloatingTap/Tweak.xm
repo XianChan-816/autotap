@@ -856,13 +856,14 @@ static void FTStartClicking(void) {
         if (gClickLockX < 0.001) gClickLockX = 0.001; if (gClickLockX > 0.999) gClickLockX = 0.999;
         if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
         double ms = FTIntervalMs();
-        // v2.8.3：backboardd 自身从真实触摸捕获 digitizer 身份，无需 SB 推 SID（旧 FTDaemonSetSID 推送已删）。
-        // v2.8.2：坐标换算成【点坐标】再发——backboardd 的 FTCreateEvent 把 x/y 直接当
-        // IOHID 手指点坐标用；gClickLockX/Y 是归一化(0~1)，不换算会落在屏幕左上角(0.5,0.66)px。
+        // v2.8.7：backboardd 裸 HID 层的事件【没有】senderID（iOS 在此层尚未赋值），
+        // 故 senderID 必须由 SB 侧从真实触摸捕获（FT_HIDGetMainSID，v1 验证可用）经命令推给 backboardd。
+        // 坐标换算成【点坐标】再发——backboardd 的 FTCreateEvent 把点坐标÷屏宽高得归一化 0~1。
         // 竖屏基准 gScreenW/H（834×1194）与 IOHID digitizer 归一化基准一致（ctor 已实锤）。
-        FTDaemonStartClicking(gClickLockX * gScreenW, gClickLockY * gScreenH, ms, gScreenW, gScreenH);
+        uint64_t sid = FT_HIDGetMainSID();
+        FTDaemonStartClicking(gClickLockX * gScreenW, gClickLockY * gScreenH, ms, gScreenW, gScreenH, sid);
+        FTLog(sid ? "clicking started via backboard (sid pushed)" : "clicking started via backboard (WARN: sid=0, tap screen once first)");
         FTApplyGRModes();
-        FTLog("clicking started via backboard");
         return;
     }
     if (!FT_HIDConnect()) {
@@ -2459,14 +2460,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.137 loaded (v2.8.6: inject sets hardware digitizer senderID + normalized 0..1 coords + IOHIDEventSystemClientDispatchEvent; click-point independent of ball)");
+    syslog(LOG_ERR, "FloatingTap v1.0.138 loaded (v2.8.7: senderID from SB FT_HIDGetMainSID pushed to backboardd; backboardd re-feeds original callback, no client dispatch)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.137 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; v2.8.6 senderID + normalized + client dispatch)\n");
+            fprintf(mk, "FloatingTap v1.0.138 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; v2.8.7 senderID from SB + backboardd re-feed)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

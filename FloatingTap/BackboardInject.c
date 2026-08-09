@@ -198,6 +198,7 @@ static void (*p_AppendEvent)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits
 static uint32_t (*p_GetType)(FT_IOHIDEventRef);
 static void     (*p_SetSenderID)(FT_IOHIDEventRef, uint64_t);
 static uint64_t  (*p_GetSenderID)(FT_IOHIDEventRef);
+static CFTypeRef (*p_ServiceGetProperty)(void *, CFStringRef); // IOHIDServiceGetProperty（读 digitizer 硬件 SID）
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
 static IOHIDEventSystemClientRef (*p_ClientCreate)(CFAllocatorRef);
 static IOHIDEventSystemClientRef (*p_ClientCreateWithType)(CFAllocatorRef, uint32_t);
@@ -464,15 +465,16 @@ static bool FTLoadSymbols(void) {
     p_ClientCreate    = (IOHIDEventSystemClientRef (*)(CFAllocatorRef))dlsym(h, "IOHIDEventSystemClientCreate");
     p_ClientCreateWithType = (IOHIDEventSystemClientRef (*)(CFAllocatorRef, uint32_t))dlsym(h, "IOHIDEventSystemClientCreateWithType");
     p_DispatchEvent   = (void (*)(IOHIDEventSystemClientRef, FT_IOHIDEventRef))dlsym(h, "IOHIDEventSystemClientDispatchEvent");
+    p_ServiceGetProperty = (CFTypeRef (*)(void *, CFStringRef))dlsym(h, "IOHIDServiceGetProperty");
 
     // 事件创建 + senderID 打标是注入必需；HID 客户端为可选项（缺失时退化 re-feed 原始回调）。
     g_symOK = (p_CreateDigitizerEvent && p_CreateFingerEvent && p_AppendEvent && p_GetType
                && p_SetSenderID && p_GetSenderID);
-    FTDLogFmt("symbols: digi=%p finger=%p append=%p setInt=%p setFlt=%p getType=%p setSID=%p getSID=%p client=%p disp=%p => %s",
+    FTDLogFmt("symbols: digi=%p finger=%p append=%p setInt=%p setFlt=%p getType=%p setSID=%p getSID=%p svcProp=%p client=%p disp=%p => %s",
               (void *)p_CreateDigitizerEvent, (void *)p_CreateFingerEvent, (void *)p_AppendEvent,
               (void *)p_SetIntegerValue, (void *)p_SetFloatValue, (void *)p_GetType,
-              (void *)p_SetSenderID, (void *)p_GetSenderID, (void *)p_ClientCreate,
-              (void *)p_DispatchEvent, g_symOK ? "OK" : "FAILED");
+              (void *)p_SetSenderID, (void *)p_GetSenderID, (void *)p_ServiceGetProperty,
+              (void *)p_ClientCreate, (void *)p_DispatchEvent, g_symOK ? "OK" : "FAILED");
     return g_symOK;
 }
 
@@ -661,22 +663,20 @@ static FT_IOHIDEventRef FTCreateEvent(bool down, double x, double y, uint32_t in
     return parent;
 }
 
-// MARK: - 注入（佳影 performDigitizerEvent 同款：直接喂回原始回调）
+// MARK: - 注入（backboardd 原生 re-feed：直接喂回原始回调）
 
 static void FTInject(bool down, double x, double y, uint32_t index) {
-    // ★ 必需：senderID（硬件 digitizer 身份，iOS 校验，缺失则事件被静默丢弃）。
-    //   且至少一条可用分发通道：HID 客户端优先，缺失则退化 re-feed 原始回调。
+    // ★ senderID 必需（硬件 digitizer 身份，iOS 校验，缺失则合成事件被静默丢弃）。
+    //   来源：SB 经命令传入 g_MainSID（首选）/ 命令线程读 g_service 的 SenderID 属性（兜底）。
     if (!g_senderID) return;
-    if (!g_client && !(g_origOK && g_origCall)) return;
+    if (!g_origOK || !g_origCall) return;
     FT_IOHIDEventRef ev = FTCreateEvent(down, x, y, index);
     if (!ev) return;
     if (p_SetSenderID) p_SetSenderID(ev, g_senderID);
+    // backboardd 是 HID 服务端，注入=把合成事件喂回原始回调（与真实触摸同管线）。
+    // ⚠️ 绝不用 IOHIDEventSystemClientDispatchEvent（v2.2 实锤：backboardd 内自连客户端=死锁/黑屏）。
     pthread_mutex_lock(&g_injectLock);
-    if (g_client && p_DispatchEvent) {
-        p_DispatchEvent(g_client, ev);                 // 高频通道（ZXTouch 验证）
-    } else if (g_origOK && g_origCall) {
-        g_origCall(g_target, g_refcon, g_service, ev); // 退化：re-feed 原始回调
-    }
+    g_origCall(g_target, g_refcon, g_service, ev);
     pthread_mutex_unlock(&g_injectLock);
     CFRelease(ev);
 }
@@ -745,17 +745,30 @@ static void *FTCommandThread(void *arg) {
                 if (fgets(line, sizeof(line), f)) {
                     if (strncmp(line, "start", 5) == 0) {
                         double x = 0.5, y = 0.5; long long ms = 12;
-                        double W = 834, H = 1194;
-                        sscanf(line + 5, "%lf %lf %lld %lf %lf", &x, &y, &ms, &W, &H);
+                        double W = 834, H = 1194; uint64_t cmdSID = 0;
+                        sscanf(line + 5, "%lf %lf %lld %lf %lf %llu", &x, &y, &ms, &W, &H, &cmdSID);
                         // v2.8.2：x/y 为【点坐标】（SB 按竖屏基准尺寸换算），钳制到点范围。
                         if (x < 0) x = 0; if (x > 4096) x = 4096;
                         if (y < 0) y = 0; if (y > 4096) y = 4096;
                         if (ms < 5) ms = 5;
                         if (W > 0) g_screenW = W;
                         if (H > 0) g_screenH = H;
-                        FTDLogFmt("cmd: start @(%.1f,%.1f) ms=%lld sender=%llu client=%p",
+                        // ★ senderID 解析（命令线程，非热路径，可安全调用 CF）：
+                        //   1) SB 经命令传入的真实 digitizer SID（FT_HIDGetMainSID，首选、v1 验证可用）
+                        if (cmdSID) g_senderID = cmdSID;
+                        //   2) 兜底：读已捕获的 g_service 的 SenderID 属性（backboardd 内即时、
+                        //      无 SB 依赖）。绝不在回调热路径里调 CF，故放此处。
+                        else if (!g_senderID && g_service && p_ServiceGetProperty) {
+                            CFTypeRef v = p_ServiceGetProperty(g_service, CFSTR("SenderID"));
+                            if (v && CFGetTypeID(v) == CFNumberGetTypeID()) {
+                                uint64_t s = 0;
+                                CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, &s);
+                                if (s) g_senderID = s;
+                            }
+                        }
+                        FTDLogFmt("cmd: start @(%.1f,%.1f) ms=%lld sender=%llu (cmd=%llu)",
                                   x, y, (long long)ms, (unsigned long long)g_senderID,
-                                  (void *)g_client);
+                                  (unsigned long long)cmdSID);
                         FTStart(x, y, (int64_t)ms);
                     } else if (strncmp(line, "stop", 4) == 0) {
                         FTDLog("cmd: stop");
@@ -789,12 +802,10 @@ static void *FTInitThread(void *ctx) {
 
     if (g_stage >= 1) {
         if (!FTLoadSymbols()) goto done;
-        // HID 事件系统客户端：高频注入通道（ZXTouch 验证）。创建失败则 FTInject 退化 re-feed。
-        if (p_ClientCreate) g_client = p_ClientCreate(kCFAllocatorDefault);
-        else if (p_ClientCreateWithType) g_client = p_ClientCreateWithType(kCFAllocatorDefault, 1);
-        FTDLogFmt("hid client=%p (create=%p createWithType=%p dispatch=%p)",
-                  (void *)g_client, (void *)p_ClientCreate, (void *)p_ClientCreateWithType,
-                  (void *)p_DispatchEvent);
+        // ⚠️ v2.2 实锤：backboardd 是 HID 服务端，内部创建 IOHIDEventSystemClient 并 DispatchEvent
+        //   = 自己连自己 → 死锁/看门狗杀 backboardd → 黑屏。故【绝不】在 backboardd 内建客户端或
+        //   调用 DispatchEvent。注入走 re-feed 原始回调（与真实触摸同管线），senderID 由 SB 推入。
+        FTDLogFmt("symbols loaded (client-create/dispatch intentionally NOT used in backboardd)");
     }
     if (g_stage >= 2) { if (!FTLocateCallback()) goto done; }
     if (g_stage >= 3) { if (!FTInstallHook())    goto done; }
@@ -843,7 +854,7 @@ static void FTBCtor(void) {
     const char *proc = getprogname();
     FILE *mk = fopen(g_logPath, "a");
     if (mk) {
-        fprintf(mk, "\n===== [BackboardInject v2.8.3] ctor pid=%d proc=%s slice=%s ptrauth=%s "
+        fprintf(mk, "\n===== [BackboardInject v2.8.7] ctor pid=%d proc=%s slice=%s ptrauth=%s "
                     "build=%s(0x%08x) =====\n",
                 (int)getpid(), proc ? proc : "?",
 #if defined(__arm64e__)

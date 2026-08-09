@@ -1,8 +1,8 @@
 Package: com.floatingtap.tweak
 Name: FloatingTap
-Version: 2.8.6-senderid
+Version: 2.8.7-sid-from-sb
 Architecture: iphoneos-arm64
-Description: 全局悬浮球自动点击器（v2.8.6：修复「完全没反应」根因——注入事件缺失硬件 digitizer senderID 被 iOS 静默丢弃 + 坐标为点坐标未归一化；改用 IOHIDEventSystemClientDispatchEvent 高频通道并打标 senderID；点击点与蓝圈独立（佳影式，红色拖动模式摆位、连击模式不吸附）；v2.8.5 绿圈常显；v2.8.3 解耦 SID 探针；v2.8 控制通道改 Darwin 通知+文件避开沙盒禁 socket）
+Description: 全局悬浮球自动点击器（v2.8.7：senderID 改由 SB 从真实触摸捕获(FT_HIDGetMainSID)经命令推给 backboardd——backboardd 裸 HID 层事件无 senderID，v2.8.6 误读 event.senderID=0 导致仍静默丢弃；注入改回 backboardd 原生 re-feed 原始回调（避开 v2.2 客户端自连死锁，弃用 IOHIDEventSystemClientDispatchEvent）；点击点独立可拖佳影式；v2.8.6 补 senderID+归一化+client dispatch；v2.8.5 绿圈常显）
 Maintainer: FloatingTap
 Author: FloatingTap
 Section: Tweaks

@@ -20,8 +20,9 @@ int FTDaemonPing(void);
 int FTDaemonSpawn(void);
 
 // 开始连点：坐标点坐标（SB 已按竖屏基准尺寸换算），intervalMs 毫秒间隔（>5ms），
-// sw/sh = 竖屏基准屏幕尺寸（供 backboardd 把点坐标归一化为 HID 0~1 坐标）
-void FTDaemonStartClicking(double nx, double ny, double intervalMs, double sw, double sh);
+// sw/sh = 竖屏基准屏幕尺寸（供 backboardd 把点坐标归一化为 HID 0~1 坐标），
+// sid = SB 侧捕获的真实硬件 digitizer senderID（backboardd 裸 HID 层事件无 senderID，必须由此推入）
+void FTDaemonStartClicking(double nx, double ny, double intervalMs, double sw, double sh, uint64_t sid);
 
 // 停止连点
 void FTDaemonStopClicking(void);
