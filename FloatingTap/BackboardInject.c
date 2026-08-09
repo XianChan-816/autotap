@@ -453,6 +453,8 @@ static int FTDSetupSocket(void) {
 // 调用会黑屏（BackboardProbe 事故）。必须延迟到进程就绪后。
 // 用 dispatch_after 主队列重试：2s/6s/15s，每次检查 client 是否建立成功。
 
+static void FTBRetry3(void *ctx); // 前向声明（FTBRetry2 在 15s 兜底时引用）
+
 static void FTBInitOnce(void *ctx) {
     (void)ctx;
     if (g_client) return;
