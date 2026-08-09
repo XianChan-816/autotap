@@ -873,6 +873,16 @@ static void FTStartClicking(void) {
         if (gClickLockX < 0.001) gClickLockX = 0.001; if (gClickLockX > 0.999) gClickLockX = 0.999;
         if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
         double ms = FTIntervalMs();
+        // ⚠️ v2.0.3 关键：daemon 必须用【SB 探测锁定的有效 SID】注入——
+        // daemon 自己枚举的 registryID 在 Dopamine 上从不送达（HIDInject.c v1.0.104
+        // 定案实测），全 ret=0x1。SB 的 g_LockedSID 是探测验证过的「送达且不顶掉」
+        // 会话有效值，推给 daemon 才有点击。
+        if (g_LockedSID != 0) {
+            FTDaemonSetSID(g_LockedSID);
+            char dbgS[96];
+            snprintf(dbgS, sizeof(dbgS), "daemon SID <- SB locked 0x%llx", (unsigned long long)g_LockedSID);
+            FTLog(dbgS);
+        }
         FTDaemonStartClicking(gClickLockX, gClickLockY, ms);
         FTApplyGRModes();
         FTLog("clicking started via daemon");
