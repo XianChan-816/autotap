@@ -18,13 +18,22 @@ FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 FloatingTap_FRAMEWORKS = UIKit CoreGraphics
 FloatingTap_LDFLAGS = -lz
 
-# BackboardInject v2.4：backboardd 内注入（佳影同源架构 + hook 前地址校验）
-#   4) v2.3 黑屏根因 = 盲信 MSFindSymbol 返回值。日志里 cbAddr=0x8a514a818d8268a4、
-#      orig=0xd051f08113efc000，高位异常、低 47 位也不像合法 image 地址
-#      → hook 装上后第一个 HID 事件进回调即崩（socket 那两行日志都没来得及打）。
-#      v2.4 对策：dladdr 校验 + ptrauth_strip + vm_read_overwrite 试读，
-#      三关任一不过就【拒绝 hook】；orig 另设 g_origOK 门禁，不合法宁可丢事件也不盲调。
-#      回调内严禁 fopen/malloc/syslog，只用预开 fd 的裸 write() 打探针。
+# BackboardInject v2.5：backboardd 内注入（佳影同源架构 + PAC 地址正确解析）
+#   4) v2.3 黑屏根因 = 盲信 MSFindSymbol 返回值（带 PAC 的指针当裸地址用）。
+#   5) v2.4 实测（未黑屏，四道防线拦住了）：
+#        raw 0x8a514a818d8268a4 -> dladdr 成功 symaddr=0x18d8268a4，但 raw 不可读 -> REJECT
+#      真相：iOS 用户态 VA 是 36 位（T0SZ=28），PAC 占 bit36..62；
+#            真地址 = 低 36 位 = 0x18d8268a4 = IOKit 基址 0x18d820000 + 0x68a4。
+#            v2.4 手工掩码用了 47 位（macOS 规格）→ 剥不干净；
+#            而 dladdr 自带剥离，正确答案本来就在 dli_saddr 里，被 v2.4 丢了。
+#   v2.5 对策：
+#      · FTResolvePlain 候选阶梯 dli_saddr → XPACI → &36位 → &47位 → 原值，
+#        逐个 vm_read_overwrite 试读，第一个读得通的才用。
+#      · 调用面 / patch 面分离：MSHookFunction 收裸地址；orig 求出裸地址后
+#        用 ptrauth_sign_unauthenticated 重新签名再调（arm64e 走 blraaz 认证，
+#        arm64 slice 则原样 blr）——两种 slice 都不会跳飞。
+#      · 死人开关：hook 装上但 orig 不可用（触摸会失效）时故意不标 SAFE，重启即禁用。
+#      · 回调内严禁 fopen/malloc/syslog，只用预开 fd 的裸 write() 打探针。
 # 黑屏教训链：
 #   1) SafeProbe（ctor 只 fopen）→ 加载安全，实测不黑屏
 #   2) v2.1 黑屏根因 = ctor 里 dispatch_after_f（GCD API）

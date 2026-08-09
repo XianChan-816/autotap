@@ -1,5 +1,5 @@
 //
-//  BackboardInject.c — FloatingTap v2.4 backboardd 内注入（佳影同源架构，纯 C）
+//  BackboardInject.c — FloatingTap v2.5 backboardd 内注入（佳影同源架构，纯 C）
 //
 //  ============================ 教训链（必读） ============================
 //  · v2.1 黑屏：constructor 里调用 dispatch_after_f（GCD）→ 违反铁律。
@@ -37,7 +37,7 @@
 //       0 = 只写日志（等于关闭）
 //       1 = dlopen IOKit + 解析事件构造符号（不碰任何 HID 对象）
 //       2 = 1 + 定位 ___IOHIDServiceEventCallback + 地址校验 + 指令 dump（不 hook）
-//       3 = 2 + 装 hook，回调【纯透传】，只用裸 write 打探针  ← v2.4 默认
+//       3 = 2 + 装 hook，回调【纯透传】，只用裸 write 打探针  ← v2.5 默认
 //       4 = 3 + 回调内调 IOHIDEventGetType 并捕获 service/target/refcon
 //       5 = 4 + 开 socket 服务 + 真正连点注入（完整功能）
 //     改完 stage 会自动获得一次新的尝试机会（guard 按 stage 记账）。
@@ -57,6 +57,32 @@
 //  回调内严禁 fopen/malloc/syslog/CF —— 只用预开 fd 的裸 write()。
 //  4) 全程零 GCD：socket 用独立 pthread 阻塞 accept，连点用独立 pthread 定时。
 //     绝不占用 backboardd 主线程/主队列。
+//
+//  ======================= v2.5：PAC 真相 + 修法（关键）=======================
+//  v2.4 实测日志（设备存活，未黑屏）：
+//      MSFindSymbol ___IOHIDServiceEventCallback => raw 0x8a514a818d8268a4
+//      verify raw 0x8a514a818d8268a4 -> image=IOKit sym=<redacted> symaddr=0x18d8268a4
+//      insn dump @0x8a514a818d8268a4: UNREADABLE → REJECT
+//      SURVIVED -> stage 3 marked SAFE (hits=0)
+//  结论：
+//   A) 指针确实带 PAC。iOS 用户态 VA = 36 位（T0SZ=28），所以 PAC 占 bit36..62，
+//      真实地址 = 低 36 位 = 0x18d8268a4 = IOKit 基址 0x18d820000 + 0x68a4。
+//      v2.4 的手工掩码用了 47 位（0x00007FFF_FFFFFFFF）——对 macOS 对，对 iOS 错。
+//   B) dladdr 内部会自行剥离 PAC，所以它成功了，并把真地址放在 dli_saddr 里；
+//      v2.4 只用了它的返回值（bool），把 dli_saddr 这个正确答案扔了。
+//   C) "sym=<redacted>" 是 dyld 共享缓存无本地符号表时的正常返回，不是错误。
+//  v2.5 修法：
+//   1) FTResolvePlain()：候选阶梯 dli_saddr → XPACI → &36位 → &47位 → 原值，
+//      逐个 vm_read_overwrite 试读，第一个读得通的才采用，全过程打日志。
+//   2) 【调用面 / patch 面分离】——v2.3 崩溃的真正原因很可能在这：
+//        · 交给 MSHookFunction 打补丁的必须是【裸地址】
+//        · 而 arm64e 上通过 C 函数指针调用会走 blraaz（key IA / disc 0 认证），
+//          裸地址直接调 = 认证失败 = 硬崩；arm64 slice 上则相反，签名值直接
+//          blr 跳过去 = 跳到垃圾地址 = 硬崩。
+//        · 故统一：先求裸地址，再 FTSignPtr() 转成可调用形式（arm64e 重新签名，
+//          arm64 原样返回），两种 slice 都安全。
+//   3) 死人开关：hook 装上但 orig 不可用（回调只能丢事件 → 触摸失效）时，
+//      guard 故意【不标记 SAFE】，重启即自动禁用，避免"不崩但触摸全废"的死局。
 //
 
 #include <stdio.h>
@@ -133,7 +159,8 @@ static int   g_stage = 1;
 static bool  g_symOK = false;
 static void *g_cbRaw  = NULL;                        // MSFindSymbol 原始返回（可能带 PAC）
 static void *g_cbAddr = NULL;                        // strip + 校验后的可用地址
-static FT_ServiceEventCallback g_origCB = NULL;      // MSHookFunction 保存的原函数
+static FT_ServiceEventCallback g_origCB = NULL;      // MSHookFunction 写回的原始值（可能带 PAC / 是 trampoline）
+static FT_ServiceEventCallback g_origCall = NULL;    // 校验+重新签名后的【可调用】指针 ← 只用这个调
 static bool  g_hooked = false;
 
 // 回调内零 I/O 探针：init 阶段预开 fd，回调里只用裸 write()
@@ -188,13 +215,29 @@ static void FTProbe(const char *tag) {
 
 // MARK: - PAC 处理与地址安全校验
 
-static void *FTStripPtr(void *p) {
-#if defined(__arm64e__) && __has_feature(ptrauth_calls)
+// iOS 用户态 VA = 36 位（T0SZ=28）→ PAC 占 bit36..62。实测 raw=0x8a514a8_18d8268a4，
+// 低 36 位 0x18d8268a4 才是真地址。47 位掩码是 macOS 的规格，用在 iOS 上必错。
+#define FT_VA36_MASK 0x0000000FFFFFFFFFULL
+#define FT_VA47_MASK 0x00007FFFFFFFFFFFULL
+
+// XPACI：硬件按实际 TCR 配置剥离，arm64 slice 上是 no-op
+static void *FTXpac(void *p) {
+#if __has_feature(ptrauth_calls)
     return ptrauth_strip(p, ptrauth_key_function_pointer);
 #else
-    uintptr_t v = (uintptr_t)p;
-    if (v >> 47) v &= 0x00007FFFFFFFFFFFULL;   // 手工清 PAC 位
-    return (void *)v;
+    return p;
+#endif
+}
+
+// 裸地址 → 【可调用】的函数指针
+//   arm64e slice：编译器用 blraaz 认证（key IA / discriminator 0），必须重新签名
+//   arm64  slice：blr 不认证，原样返回即可
+static void *FTSignPtr(void *plain) {
+#if __has_feature(ptrauth_calls)
+    if (!plain) return NULL;
+    return ptrauth_sign_unauthenticated(plain, ptrauth_key_function_pointer, 0);
+#else
+    return plain;
 #endif
 }
 
@@ -211,13 +254,17 @@ static bool FTSafeRead(void *addr, void *out, size_t len) {
 }
 
 // 地址是否落在某个已加载 image 内（dladdr 只查 image 区间，不解引用 → 安全）
-static bool FTAddrInImage(void *addr, char *outDesc, size_t descLen) {
+// 注意：dladdr 内部自带 PAC 剥离，所以带签名的指针也能查成功，
+// 且 dli_saddr 就是【已剥离的真实符号地址】—— v2.4 的致命疏漏是没取这个字段。
+static bool FTAddrInImage(void *addr, char *outDesc, size_t descLen, void **outSaddr) {
     Dl_info info;
     memset(&info, 0, sizeof(info));
+    if (outSaddr) *outSaddr = NULL;
     if (dladdr(addr, &info) == 0) {
         if (outDesc) snprintf(outDesc, descLen, "NOT-IN-ANY-IMAGE");
         return false;
     }
+    if (outSaddr) *outSaddr = info.dli_saddr;
     if (outDesc) {
         const char *fn = info.dli_fname ? info.dli_fname : "?";
         const char *sn = info.dli_sname ? info.dli_sname : "?";
@@ -229,6 +276,7 @@ static bool FTAddrInImage(void *addr, char *outDesc, size_t descLen) {
 }
 
 // dump 目标函数入口前 16 字节（arm64e 函数头通常是 pacibsp = 0xd503237f）
+__attribute__((unused))
 static void FTDumpInsns(void *addr) {
     uint32_t w[4] = {0, 0, 0, 0};
     if (!FTSafeRead(addr, w, sizeof(w))) {
@@ -238,6 +286,55 @@ static void FTDumpInsns(void *addr) {
     FTDLogFmt("insn dump @%p: %08x %08x %08x %08x%s",
               addr, w[0], w[1], w[2], w[3],
               (w[0] == 0xd503237f) ? "  (pacibsp ✓ 函数入口)" : "");
+}
+
+// v2.5 核心：从可能带 PAC 的原始指针求出【真实可读的裸地址】
+// 候选阶梯：dladdr 的 dli_saddr → XPACI → &36位 → &47位 → 原值
+// 每个候选都用 vm_read_overwrite 试读，第一个读得通的才采用（读不通不会崩）
+static void *FTResolvePlain(void *raw, const char *what) {
+    if (!raw) return NULL;
+
+    char desc[256];
+    void *cands[8]; const char *tags[8]; int n = 0;
+
+    void *saddr = NULL;
+    bool inimg = FTAddrInImage(raw, desc, sizeof(desc), &saddr);
+    FTDLogFmt("%s: dladdr(raw %p) -> %s", what, raw, desc);
+    if (inimg && saddr) { cands[n] = saddr; tags[n] = "dli_saddr"; n++; }
+
+    void *x = FTXpac(raw);
+    if (x != raw) { cands[n] = x; tags[n] = "xpaci"; n++; }
+
+    void *m36 = (void *)((uintptr_t)raw & FT_VA36_MASK);
+    void *m47 = (void *)((uintptr_t)raw & FT_VA47_MASK);
+    if (m36 != raw && m36 != x) { cands[n] = m36; tags[n] = "mask36"; n++; }
+    if (m47 != raw && m47 != x && m47 != m36) { cands[n] = m47; tags[n] = "mask47"; n++; }
+
+    cands[n] = raw; tags[n] = "raw"; n++;
+
+    for (int i = 0; i < n; i++) {
+        // 跳过与已试候选重复的项
+        bool dup = false;
+        for (int k = 0; k < i; k++) if (cands[k] == cands[i]) { dup = true; break; }
+        if (dup) continue;
+
+        uint32_t w[4] = {0, 0, 0, 0};
+        if (!FTSafeRead(cands[i], w, sizeof(w))) {
+            FTDLogFmt("%s cand[%s] %p -> UNREADABLE", what, tags[i], cands[i]);
+            continue;
+        }
+        void *sa2 = NULL;
+        bool in2 = FTAddrInImage(cands[i], desc, sizeof(desc), &sa2);
+        (void)sa2;
+        FTDLogFmt("%s cand[%s] %p -> READABLE %08x %08x %08x %08x | %s%s",
+                  what, tags[i], cands[i], w[0], w[1], w[2], w[3],
+                  in2 ? desc : "(not-in-image, 可能是 trampoline)",
+                  (w[0] == 0xd503237f) ? "  [pacibsp ✓]" : "");
+        return cands[i];
+    }
+
+    FTDLogFmt("%s: 全部候选均不可读 -> 放弃（不 hook，进程保持健康）", what);
+    return NULL;
 }
 
 // MARK: - 控制文件（stage / guard）
@@ -346,37 +443,14 @@ static bool FTLocateCallback(void) {
     }
     if (!g_cbRaw) { FTDLog("___IOHIDServiceEventCallback NOT FOUND"); return false; }
 
-    // ---- v2.4 新增：PAC 剥离 + 三重校验，地址不合法就绝不 hook ----
-    char desc[256];
-    void *cand = g_cbRaw;
-    bool ok = FTAddrInImage(cand, desc, sizeof(desc));
-    FTDLogFmt("verify raw  %p -> %s", cand, desc);
-
-    if (!ok) {
-        void *st = FTStripPtr(g_cbRaw);
-        if (st != g_cbRaw) {
-            ok = FTAddrInImage(st, desc, sizeof(desc));
-            FTDLogFmt("verify strip %p -> %s", st, desc);
-            if (ok) cand = st;
-        }
-    }
-
-    if (!ok) {
-        FTDLogFmt("REJECT: 地址 %p 不在任何已加载 image 内（MSFindSymbol 返回值不可用）。"
-                  " 不安装 hook，进程保持健康。", g_cbRaw);
-        FTDumpInsns(g_cbRaw);
+    // ---- v2.5：候选阶梯求裸地址（dli_saddr 优先），读不通就不 hook ----
+    void *plain = FTResolvePlain(g_cbRaw, "cbAddr");
+    if (!plain) {
+        FTDLogFmt("REJECT: 无法从 %p 求出可读的回调地址，不安装 hook。", g_cbRaw);
         return false;
     }
-
-    FTDumpInsns(cand);
-    uint32_t first = 0;
-    if (!FTSafeRead(cand, &first, sizeof(first))) {
-        FTDLogFmt("REJECT: %p 不可读，不安装 hook。", cand);
-        return false;
-    }
-
-    g_cbAddr = cand;
-    FTDLogFmt("callback target LOCKED @ %p", g_cbAddr);
+    g_cbAddr = plain;
+    FTDLogFmt("callback target LOCKED @ %p  (raw was %p)", g_cbAddr, g_cbRaw);
     return true;
 }
 
@@ -403,12 +477,12 @@ static void FTServiceEventCallbackNew(void *target, void *refcon,
         }
     }
 
-    // g_origOK 只有在 orig 指针通过校验后才置位。
-    // 未通过 → 直接 return（丢几个事件，屏幕短暂无响应），绝不盲调导致崩溃。
-    if (!g_origOK) { FTProbe("[cb] orig-SKIP\n"); return; }
+    // g_origOK 只有在 orig 指针通过「可读校验 + 重新签名」后才置位。
+    // 未通过 → 直接 return（丢事件，触摸暂时失效），绝不盲调导致崩溃。
+    if (!g_origOK || !g_origCall) { FTProbe("[cb] orig-SKIP\n"); return; }
 
     FTProbe("[cb] pre-orig\n");
-    g_origCB(target, refcon, service, event);
+    g_origCall(target, refcon, service, event);
     FTProbe("[cb] post-orig\n");
 }
 
@@ -433,38 +507,28 @@ static bool FTInstallHook(void) {
         FTDLogFmt("probe fd=%d", g_probeFd);
     }
 
+    // MSHookFunction 要的是【裸地址】（它自己去 mprotect + 写指令）
     FTDLogFmt("about to MSHookFunction(%p, %p)", g_cbAddr, (void *)FTServiceEventCallbackNew);
     fHook(g_cbAddr, (void *)FTServiceEventCallbackNew, (void **)&g_origCB);
     g_hooked = (g_origCB != NULL);
     FTDLogFmt("hook installed=%d origRaw=%p", g_hooked ? 1 : 0, (void *)g_origCB);
     if (!g_hooked) return false;
 
-    // ---- v2.4：校验 orig 指针，通过才允许回调调用它 ----
-    void *op = (void *)g_origCB;
-    char desc[256];
-    bool ok = FTAddrInImage(op, desc, sizeof(desc));
-    FTDLogFmt("verify orig %p -> %s", op, desc);
-
-    if (!ok) {
-        void *st = FTStripPtr(op);
-        if (st != op) {
-            ok = FTAddrInImage(st, desc, sizeof(desc));
-            FTDLogFmt("verify orig strip %p -> %s", st, desc);
-            if (ok) { g_origCB = (FT_ServiceEventCallback)st; op = st; }
-        }
+    // ---- v2.5：orig 也走候选阶梯求裸地址，再重新签名成可调用指针 ----
+    // 关键：调用面和 patch 面必须分开。arm64e 上 C 函数指针调用走 blraaz，
+    // 直接调裸地址会认证失败硬崩；arm64 slice 上直接调签名值则跳到垃圾地址。
+    void *origPlain = FTResolvePlain((void *)g_origCB, "orig");
+    if (origPlain) {
+        g_origCall = (FT_ServiceEventCallback)FTSignPtr(origPlain);
+        g_origOK = true;
+        FTDLogFmt("orig usable: plain=%p callable=%p (回调将正常透传)",
+                  origPlain, (void *)g_origCall);
+    } else {
+        g_origCall = NULL;
+        g_origOK = false;
+        FTDLog("⚠️ orig 不可用 → 回调将丢弃全部事件：不崩，但触摸会失效。"
+               " guard 将保持未确认，重启后自动禁用。");
     }
-    // trampoline 通常不属于任何 image，可读即认为可用
-    if (!ok) {
-        uint32_t probe = 0;
-        if (FTSafeRead(op, &probe, sizeof(probe))) {
-            FTDLogFmt("orig 不在 image 内但可读（应为 trampoline），首指令=%08x", probe);
-            ok = true;
-        }
-    }
-
-    g_origOK = ok;
-    FTDLogFmt("orig usable=%d  %s", ok ? 1 : 0,
-              ok ? "(回调将正常透传)" : "(⚠️ 回调将丢弃事件，触摸会失效但不会崩)");
     return g_hooked;
 }
 
@@ -513,11 +577,11 @@ static FT_IOHIDEventRef FTCreateEvent(bool down, double x, double y, uint32_t in
 // MARK: - 注入（佳影 performDigitizerEvent 同款：直接喂回原始回调）
 
 static void FTInject(bool down, double x, double y, uint32_t index) {
-    if (!g_captured || !g_origCB) return;
+    if (!g_captured || !g_origOK || !g_origCall) return;
     FT_IOHIDEventRef ev = FTCreateEvent(down, x, y, index);
     if (!ev) return;
     pthread_mutex_lock(&g_injectLock);
-    g_origCB(g_target, g_refcon, g_service, ev);   // ← 零客户端、零 DispatchEvent
+    g_origCall(g_target, g_refcon, g_service, ev); // ← 零客户端、零 DispatchEvent
     pthread_mutex_unlock(&g_injectLock);
     CFRelease(ev);
 }
@@ -671,9 +735,19 @@ static void *FTInitThread(void *ctx) {
 done:
     // 存活确认：再撑 25 秒不崩 → 把 guard 标记为「本 stage 已验证安全」
     sleep(25);
+
+    // 【死人开关】hook 装上了但 orig 不可用 = 触摸事件被全部丢弃 = 设备变砖（虽不崩）。
+    // 这种情况故意【不标记 SAFE】，让 guard 保持"未确认"，用户重启即自动禁用。
+    if (g_hooked && !g_origOK) {
+        FTWriteGuard(g_stage, 1);
+        FTDLogFmt("⚠️ DEADMAN: stage %d hook 已装但 orig 不可用（触摸失效）。"
+                  " guard 保持未确认 → 请重启设备，下次开机将自动禁用。", g_stage);
+        return NULL;
+    }
+
     FTWriteGuard(g_stage, 0);
-    FTDLogFmt("SURVIVED -> stage %d marked SAFE (hits=%lu captured=%d)",
-              g_stage, g_hits, g_captured ? 1 : 0);
+    FTDLogFmt("SURVIVED -> stage %d marked SAFE (hits=%lu captured=%d origOK=%d)",
+              g_stage, g_hits, g_captured ? 1 : 0, g_origOK ? 1 : 0);
     return NULL;
 }
 
@@ -684,8 +758,19 @@ static void FTBCtor(void) {
     const char *proc = getprogname();
     FILE *mk = fopen(g_logPath, "a");
     if (mk) {
-        fprintf(mk, "\n===== [BackboardInject v2.4] ctor pid=%d proc=%s =====\n",
-                (int)getpid(), proc ? proc : "?");
+        fprintf(mk, "\n===== [BackboardInject v2.5] ctor pid=%d proc=%s slice=%s ptrauth=%s =====\n",
+                (int)getpid(), proc ? proc : "?",
+#if defined(__arm64e__)
+                "arm64e",
+#else
+                "arm64",
+#endif
+#if __has_feature(ptrauth_calls)
+                "yes"
+#else
+                "no"
+#endif
+                );
         fclose(mk);
     }
 
