@@ -1,5 +1,23 @@
 #!/bin/bash
-# tools/fix-deb-arch.sh —— theos 打完 deb 之后必须跑的修补脚本
+# tools/fix-deb-arch.sh
+#
+# ############################################################################
+# ##  ⛔ 已弃用 —— 不要再用这个脚本产出的 deb 去 dpkg -i 装机 ⛔              ##
+# ##                                                                        ##
+# ##  2026-08-09 事故定案：手工 dpkg-deb -R / -b 重打的包会把 ellekit 的      ##
+# ##  /var/jb/Library/MobileSubstrate/DynamicLibraries（本体是 symlink →     ##
+# ##  /usr/lib/TweakInject）替换成真实目录，ellekit 的 injection_init 目录    ##
+# ##  自检失败 → abort → 全机每个 App 一起来就 SIGABRT。                      ##
+# ##  救援：sudo apt-get install --reinstall -y --allow-unauthenticated      ##
+# ##       ellekit                                                          ##
+# ##                                                                        ##
+# ##  正确部署姿势：scp dylib/plist 到真实目录 /var/jb/usr/lib/TweakInject/   ##
+# ##  + ldid -S 重签（见 ssh_deploy_v29.py，几十次部署零事故）。              ##
+# ##  另：Architecture arm64 vs arm64e 并不是 iU 的原因，别为改架构动 deb。   ##
+# ############################################################################
+#
+# 以下逻辑仅保留作参考。脚本已内置硬拦截：一旦发现包里含会覆盖 ellekit
+# symlink 的目录条目，直接 exit 1 拒绝出包。
 #
 # 修两个坑（都实际炸过）：
 #
@@ -78,9 +96,28 @@ for DEB in "$@"; do
         exit 1
     fi
     echo "  -> 属主校验 OK (全部 root/root)"
+
+    # ==== 硬拦截：包里不许含会覆盖 ellekit symlink 的目录条目 ====
+    # ellekit 把 /var/jb/Library/MobileSubstrate/DynamicLibraries 做成
+    # symlink -> /usr/lib/TweakInject。deb 里若含它的「目录条目」，
+    # dpkg -i 会把 symlink 替换成真目录 → ellekit injection_init 自检失败
+    # → 全机每个 App SIGABRT（2026-08-09 事故）。
+    KILLER=$(dpkg-deb --fsys-tarfile "$DEB" 2>/dev/null | tar tvf - 2>/dev/null \
+             | awk '$1 ~ /^d/ {print $NF}' \
+             | grep -E '(^|/)var/jb/Library/MobileSubstrate/DynamicLibraries/?$' || true)
+    if [ -n "$KILLER" ]; then
+        echo "  ⛔ 危险：包内含会覆盖 ellekit symlink 的目录条目："
+        echo "     $KILLER"
+        echo "     dpkg -i 会毁掉 DynamicLibraries -> /usr/lib/TweakInject，"
+        echo "     导致全机 App 打不开。拒绝出包。"
+        echo "     请改用 scp 部署到 /var/jb/usr/lib/TweakInject/（见 ssh_deploy_v29.py）。"
+        exit 1
+    fi
+    echo "  -> ellekit symlink 安全校验 OK"
 done
 
 echo
-echo "完成。安装：sudo dpkg -i <deb>"
-echo "⚠️ 装完若 App 打不开，多半又是属主问题，救援命令："
+echo "⚠️ 仍然不建议 dpkg -i 安装自打包，优先 scp 到 /var/jb/usr/lib/TweakInject/"
+echo "   若装完 App 全打不开，救援："
+echo "   sudo apt-get install --reinstall -y --allow-unauthenticated ellekit"
 echo "   sudo chown -R root:wheel /var/jb/Library/MobileSubstrate"
