@@ -54,16 +54,29 @@ static void FTLog(const char *msg);
 static int g_DaemonMode = 0;
 static int g_DaemonProbed = 0;
 
-// 探测 daemon 是否可用（只测一次，结果缓存）。失败回退 SB 注入，不影响使用。
+// 探测 daemon 是否可用（只测一次，结果缓存）。失败先尝试 spawn daemon 再测，
+// 还不行才回退 SB 注入（不影响使用）。daemon 崩了下次探测会重新 spawn。
 static int FTDaemonProbe(void) {
     if (g_DaemonProbed) return g_DaemonMode;
-    g_DaemonProbed = 1;
     if (FTDaemonPing()) {
+        g_DaemonProbed = 1;
         g_DaemonMode = 1;
         FTLog("daemon available - clicking via daemon");
+    } else if (FTDaemonSpawn()) {
+        // spawn 成功 → 等 daemon 就绪后二次 ping（spawn 内部已等 300ms）
+        if (FTDaemonPing()) {
+            g_DaemonProbed = 1;
+            g_DaemonMode = 1;
+            FTLog("daemon spawned + available - clicking via daemon");
+        } else {
+            g_DaemonProbed = 1;
+            g_DaemonMode = -1;
+            FTLog("daemon spawned but ping failed - fallback to SB inject");
+        }
     } else {
+        g_DaemonProbed = 1;
         g_DaemonMode = -1;
-        FTLog("daemon unavailable - fallback to SB inject");
+        FTLog("daemon unavailable (no binary) - fallback to SB inject");
     }
     return g_DaemonMode;
 }

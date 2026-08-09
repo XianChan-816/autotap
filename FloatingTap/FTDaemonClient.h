@@ -14,6 +14,10 @@ extern "C" {
 // ping daemon：返回 1 = 存活（可连点走 daemon 注入），0 = daemon 不可用
 int FTDaemonPing(void);
 
+// 主动 spawn floatingtapd 独立 daemon（launchd 未拉起时的兜底）。
+// 返回 1 = 已尝试 spawn（需再 ping 验证）；0 = spawn 失败/二进制不存在。
+int FTDaemonSpawn(void);
+
 // 开始连点：坐标归一化 0~1，intervalMs 毫秒间隔（>5ms）
 void FTDaemonStartClicking(double nx, double ny, double intervalMs);
 

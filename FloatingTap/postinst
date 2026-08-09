@@ -1,15 +1,25 @@
 #!/bin/bash
-# FloatingTap postinst — 安装后启动 floatingtapd 独立注入 daemon
-# ⚠️ daemon 崩不影响系统（独立进程）；launchctl bootstrap 失败不阻塞安装。
+# FloatingTap postinst — 启动 floatingtapd 独立注入 daemon（尽力而为，失败不阻塞安装）
+# ⚠️ daemon 崩不影响系统（独立进程）；SB 侧 FTDaemonSpawn() 也会兜底拉起。
 # rootless 下 LaunchDaemons plist 实际位于 /var/jb/Library/LaunchDaemons/
+# Dopamine 的 launchctl 在 /var/jb/usr/bin/launchctl（PATH 可能没有 /var/jb/usr/bin）
+
+LOG="/tmp/floatingtap_daemon.log"
+echo "[postinst] start" >> "$LOG" 2>/dev/null || true
+
+# launchctl 完整路径（rootless）
+LC="/var/jb/usr/bin/launchctl"
+[ -x "$LC" ] || LC="launchctl"
 
 PLIST="/var/jb/Library/LaunchDaemons/com.floatingtap.daemon.plist"
 
 # 先卸载旧实例（幂等），再加载新的
-launchctl bootout system/com.floatingtap.daemon 2>/dev/null
-launchctl bootstrap system "$PLIST" 2>/dev/null
-launchctl kickstart -k system/com.floatingtap.daemon 2>/dev/null
+"$LC" bootout system/com.floatingtap.daemon 2>>"$LOG" || true
+"$LC" bootstrap system "$PLIST" 2>>"$LOG" || {
+  echo "[postinst] bootstrap failed, will rely on SB-side spawn" >> "$LOG" 2>/dev/null || true
+}
+"$LC" kickstart -k system/com.floatingtap.daemon 2>>"$LOG" || true
 
-echo "floatingtapd: postinst done" >> /tmp/floatingtap_daemon.log 2>/dev/null || true
+echo "[postinst] done" >> "$LOG" 2>/dev/null || true
 
 exit 0

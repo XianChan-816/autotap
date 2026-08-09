@@ -1,0 +1,9 @@
+# postinst 必须是 LF 换行（Windows 下 git autocrlf=true 会把 deb 控制脚本
+# 转成 CRLF → 设备上执行报 "bad interpreter" → daemon 拉不起来）
+postinst text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.xm text eol=lf
+Makefile text eol=lf
+control text eol=lf
+*.plist text eol=lf

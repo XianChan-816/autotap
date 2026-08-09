@@ -25,13 +25,35 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/select.h>
+#include <sys/stat.h>
+#include <spawn.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 
 // ⚠️ socket 放 /var/jb/tmp（Dopamine rootless 下该目录必然存在）；
 // /var/jb/run 在部分固件不存在，daemon 启动时也不会自动建目录。
 static const char *g_sockPath = "/var/jb/tmp/floatingtapd.sock";
+static const char *g_daemonPath = "/var/jb/usr/libexec/floatingtapd";
 static const int g_timeoutMs = 300;
+
+// 主动 spawn floatingtapd 独立 daemon（launchd 未拉起时的兜底）。
+// ⚠️ 不依赖 launchd/launchctl——rootless dpkg 安装环境里 launchctl bootstrap
+// 经常失败（路径/权限），SB 直接 posix_spawn 最可靠。SB 常驻 → daemon 常驻；
+// daemon 崩 → 下次探测失败会再次 spawn。返回 1 = 已尝试 spawn（需再 ping 验证）。
+int FTDaemonSpawn(void) {
+    if (access(g_daemonPath, X_OK) != 0) return 0;
+    pid_t pid = 0;
+    char *argv[] = { (char *)g_daemonPath, NULL };
+    int rc = posix_spawn(&pid, argv[0], NULL, NULL, argv, NULL);
+    if (rc != 0) return 0;
+    // 等 300ms 让 daemon 完成 IOHID client 创建 + socket 监听
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 300 * 1000 * 1000;
+    nanosleep(&ts, NULL);
+    return 1;
+}
 
 // 连接 daemon socket（每次调用新建，用完即关——保持无状态，避免陈旧连接）
 static int FTDConnect(void) {
