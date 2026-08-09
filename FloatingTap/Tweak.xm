@@ -1043,7 +1043,7 @@ static void FTStopClicking(const char *reason) {
     gIsClicking = NO;
     gStopGracePending = NO; // 取消任何待决的松手宽限
     // v2.2：backboardd 路径 → 通知停止，恢复手势，无需 SB 端残留清理
-    if (g_DaemonProbed && g_DaemonMode == 1) {
+    if (FTDaemonProbe() == 1) {
         FTDaemonStopClicking();
         FTApplyGRModes();
         char dbgD[96];
