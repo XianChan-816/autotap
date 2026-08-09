@@ -10,26 +10,27 @@ export ARCHS = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = FloatingTap BackboardSafeProbe
+TWEAK_NAME = FloatingTap BackboardInject
 
-# FloatingTap：SB 侧悬浮球 + 连点（UI/交互 + 连点引擎，纯 SB 注入）
-# ⚠️ v2.1 回退：BackboardInject（注入 backboardd）已移除——实测黑屏
-#（backboardd 注入即使延迟初始化仍有 ellekit/PAC 崩溃风险）。触摸注入
-# 回到绝对安全的 SB 进程内（崩 = 安全模式，永不黑屏）。
-# v2.0 的 FTDaemonClient（socket 客户端）一并移除——独立 daemon 无 HID
-# entitlement（dispatch 全 0x1），backboardd 注入黑屏，两条路都走不通。
-FloatingTap_FILES = Tweak.xm HIDInject.c
+# FloatingTap：SB 侧悬浮球 + 连点（UI/交互 + 连点引擎 + backboardd socket 客户端）
+FloatingTap_FILES = Tweak.xm HIDInject.c FTDaemonClient.c
 FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 FloatingTap_FRAMEWORKS = UIKit CoreGraphics
 FloatingTap_LDFLAGS = -lz
 
-# BackboardSafeProbe：backboardd 注入【加载安全】最小验证 dylib
-# ⚠️ 只测「ellekit 加载 backboardd dylib 本身是否黑屏」——constructor 只写日志，
-# 零 API 调用。装上重启后看 /tmp/bb_safe_probe.log：
-#   有 ctor 行 = 加载安全 → 下一步做佳影式服务回调注入；
-#   黑屏 = 加载环节就崩 → backboardd 注入路线彻底放弃。
-# 本文件必须与 FloatingTap 同 deb 打包（当前无功能冲突），黑屏时 Sileo 整体卸载。
-BackboardSafeProbe_FILES = BackboardSafeProbe.c
-BackboardSafeProbe_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+# BackboardInject v2.2：backboardd 内注入（佳影式，第二阶段）
+# 安全链已验证：
+#   1) SafeProbe（ctor 只 fopen）→ 加载安全，不黑屏（bb_safe_probe.log 实测）
+#   2) v2.1 黑屏根因 = ctor 里 dispatch_after_f（GCD API），违反报告 §三铁律
+# 本版：
+#   · constructor 只写日志（验证安全）
+#   · pthread_create 后台线程（纯 POSIX，ctor 阶段安全）sleep 3s 后初始化
+#   · 佳影同源事件构造（IOHIDEventCreateDigitizerEvent 字段与佳影 0xd46c 一致）
+#   · backboardd 进程内有 HID entitlement → DispatchEvent 应有效
+#   · 连续 50 次失败自动关 socket → SB 回退旧注入（防死锁）
+# SB 侧 FTDaemonClient 协议不变（socket /var/jb/tmp/floatingtapd.sock）
+BackboardInject_FILES = BackboardInject.c
+BackboardInject_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+BackboardInject_FRAMEWORKS = CoreFoundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk

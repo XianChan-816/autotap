@@ -38,6 +38,30 @@
 #import <CoreGraphics/CoreGraphics.h>
 
 #include "HIDInject.h"
+#include "FTDaemonClient.h"
+
+// FTLog 定义于文件后部（诊断日志），此处前向声明供 daemon 探测函数使用
+static void FTLog(const char *msg);
+
+// MARK: - v2.2 backboardd 注入探测
+// 连点注入优先走 BackboardInject（注入 backboardd 的 dylib，佳影式同源注入）。
+// socket 由 BackboardInject 提供（/var/jb/tmp/floatingtapd.sock）。
+// 探测失败（BackboardInject 未加载/黑屏保护自动关 socket）→ 回退 SB 注入。
+static int g_DaemonMode = 0;
+static int g_DaemonProbed = 0;
+
+static int FTDaemonProbe(void) {
+    if (g_DaemonProbed) return g_DaemonMode;
+    g_DaemonProbed = 1;
+    if (FTDaemonPing()) {
+        g_DaemonMode = 1;
+        FTLog("backboard inject available - clicking via backboardd");
+    } else {
+        g_DaemonMode = -1;
+        FTLog("backboard inject unavailable - fallback to SB inject");
+    }
+    return g_DaemonMode;
+}
 
 // MARK: - objc_msgSend 类型化函数指针（ARM64 下结构体参数需与目标方法签名一致）
 
@@ -824,6 +848,25 @@ static void FTRaiseResidualUps(void);
 // 不参与 SB 手势窗口路由、用真实 digitizer SID → 不顶掉用户手指 → 无需探测。
 static void FTStartClicking(void) {
     if (gIsClicking) return;
+    // v2.2：backboardd 注入可用时优先走（高频稳定，佳影式）；失败回退 SB 注入
+    if (FTDaemonProbe() == 1) {
+        gIsClicking = YES;
+        gClickCount = 0;
+        if (gClickLockX < 0.001) gClickLockX = 0.001; if (gClickLockX > 0.999) gClickLockX = 0.999;
+        if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
+        double ms = FTIntervalMs();
+        // 把 SB 探测锁定的有效 SID 推给 backboardd 注入（registryID 兜底）
+        if (g_LockedSID != 0) {
+            FTDaemonSetSID(g_LockedSID);
+            char dbgS[96];
+            snprintf(dbgS, sizeof(dbgS), "backboard SID <- SB locked 0x%llx", (unsigned long long)g_LockedSID);
+            FTLog(dbgS);
+        }
+        FTDaemonStartClicking(gClickLockX, gClickLockY, ms);
+        FTApplyGRModes();
+        FTLog("clicking started via backboard");
+        return;
+    }
     if (!FT_HIDConnect()) {
         FTLog("clicking failed: HID connect failed");
         return;
@@ -998,6 +1041,15 @@ static void FTStopClicking(const char *reason) {
     if (!gIsClicking) return;
     gIsClicking = NO;
     gStopGracePending = NO; // 取消任何待决的松手宽限
+    // v2.2：backboardd 路径 → 通知停止，恢复手势，无需 SB 端残留清理
+    if (g_DaemonProbed && g_DaemonMode == 1) {
+        FTDaemonStopClicking();
+        FTApplyGRModes();
+        char dbgD[96];
+        snprintf(dbgD, sizeof(dbgD), "clicking stopped via backboard (%s)", reason ? reason : "?");
+        FTLog(dbgD);
+        return;
+    }
     // ⚠️ v1.0.132（ctor-29 实锤）：touches-ended 停止【保留 verify】——让定时器到期裁决
     // 「该轮是否有送达回流」（g_VerifySawSynthetic）：顶掉循环（无回流）→ 淘汰 SID；
     // 快速短按（有回流）→ 保持锁定。v1.0.129 epoch 保护：用户松手后 0.8s 内重按 →
