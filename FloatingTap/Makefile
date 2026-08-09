@@ -5,8 +5,13 @@
 
 export THEOS_PACKAGE_SCHEME = rootless
 export TARGET := iphone:clang:latest:15.0
-# 必须 arm64 arm64e 双架构：M1 的 SpringBoard/backboardd 是 arm64e 进程，纯 arm64 无法注入。
-export ARCHS = arm64 arm64e
+# 必须 arm64e：M1 的 SpringBoard/backboardd 是 arm64e 进程。
+# 关键：以前 ARCHS = arm64 arm64e（双架构）会让 theos 把包名打成
+# com.floatingtap.tweak:iphoneos-arm64（剥掉 64e 后缀），跟 ellekit roothide
+# 期望的 :iphoneos-arm64e 命名空间不一致，导致 dpkg 认为"不同 arch"，旧的
+# arm64 包残留 iU 状态永远无法被覆盖 → sileo 持续抱错"ellemkit"（依赖没法
+# 满足是次要的，真因是包升级 fail）。所以只留 arm64e slice。
+export ARCHS = arm64e
 
 include $(THEOS)/makefiles/common.mk
 
