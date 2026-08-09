@@ -1,8 +1,8 @@
 Package: com.floatingtap.tweak
 Name: FloatingTap
-Version: 2.8.4-ball-lock
+Version: 2.8.5-ball-offset
 Architecture: iphoneos-arm64
-Description: 全局悬浮球自动点击器（v2.8.4：连击模式点击点锁定球心——按住球即在球位置连点，绿圈标记跟随球，不再落在 190px 下方空处导致「没效果」。v2.8.3 解耦 backboardd 与遗留 SID 探针；v2.8.2 修坐标换算；v2.8 控制通道改 Darwin 通知+文件避开沙盒禁 socket 黑屏）
+Description: 全局悬浮球自动点击器（v2.8.5：修正 v2.8.4 硬伤——点击点不可落在球正心，球 userInteractionEnabled=YES 会拦截注入触摸导致「没效果」，改取球正下方紧贴处，绿圈常显跟随球并穿透到下层 App 命中按钮；v2.8.4 让绿圈跟随球；v2.8.3 解耦 backboardd 与遗留 SID 探针；v2.8.2 修坐标换算；v2.8 控制通道改 Darwin 通知+文件避开沙盒禁 socket 黑屏）
 Maintainer: FloatingTap
 Author: FloatingTap
 Section: Tweaks
