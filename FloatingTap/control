@@ -1,8 +1,8 @@
 Package: com.floatingtap.tweak
 Name: FloatingTap
-Version: 2.5.0-pacresolve
+Version: 2.6.0-pathfix
 Architecture: iphoneos-arm64
-Description: 全局悬浮球自动点击器（v2.5：用 dladdr 的 dli_saddr 求 PAC 剥离后的真地址——iOS 是 36 位 VA，47 位掩码是错的；调用面与 patch 面分离，orig 重新签名后再调；死人开关防触摸失效死局；分级 0-5，默认 3 纯透传）
+Description: 全局悬浮球自动点击器（v2.6：修复 rootless 路径双前缀导致自愈保险被永久锁死——dylib 内绝对路径会自动前缀 jbroot，手写 /var/jb 等于加两次；guard 改为 build-id 记账+阈值 2+存活窗压到 15 秒，新构建必得一次干净机会）
 Maintainer: FloatingTap
 Author: FloatingTap
 Section: Tweaks

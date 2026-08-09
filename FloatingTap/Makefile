@@ -18,7 +18,15 @@ FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 FloatingTap_FRAMEWORKS = UIKit CoreGraphics
 FloatingTap_LDFLAGS = -lz
 
-# BackboardInject v2.5：backboardd 内注入（佳影同源架构 + PAC 地址正确解析）
+# BackboardInject v2.6：backboardd 内注入（佳影同源架构 + PAC 解析 + rootless 路径修正）
+#   6) v2.6 头号教训：注入 dylib 内的绝对路径会被运行时自动前缀 jbroot。
+#        dylib "/tmp/X"        -> <jbroot>/tmp/X   == shell 的 /var/jb/tmp/X  ✓
+#        dylib "/var/jb/tmp/X" -> <jbroot>/var/jb/tmp/X                       ✗ 死角
+#      v2.5 的 guard 落在死角，postinst 清不掉，一次被打断的记账永久生效，
+#      之后每次开机都是 "[GUARD] 上次未存活 -> 自动禁用"，注入根本没跑起来。
+#      对策：dylib 侧全改 /tmp/；guard 加 build id（新构建自动作废）；
+#            阈值 1 -> 2（防"装完立刻重启"误判）；存活窗 36s -> 15s。
+
 #   4) v2.3 黑屏根因 = 盲信 MSFindSymbol 返回值（带 PAC 的指针当裸地址用）。
 #   5) v2.4 实测（未黑屏，四道防线拦住了）：
 #        raw 0x8a514a818d8268a4 -> dladdr 成功 symaddr=0x18d8268a4，但 raw 不可读 -> REJECT

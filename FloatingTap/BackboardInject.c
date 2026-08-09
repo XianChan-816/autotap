@@ -1,5 +1,16 @@
 //
-//  BackboardInject.c — FloatingTap v2.5 backboardd 内注入（佳影同源架构，纯 C）
+//  BackboardInject.c — FloatingTap v2.6 backboardd 内注入（佳影同源架构，纯 C）
+//
+//  ==================== v2.6 头号教训：rootless 路径双前缀 ====================
+//  注入 dylib 内的绝对路径，会被 rootless 运行时自动前缀 jbroot：
+//      dylib "/tmp/X"        -> <jbroot>/tmp/X        == shell 的 /var/jb/tmp/X  ✓
+//      dylib "/var/jb/tmp/X" -> <jbroot>/var/jb/tmp/X                           ✗ 死角
+//  实证（v2.5 日志原文）：源码写 "/var/jb/tmp/ftb_stage"，printf 出来是
+//      /var/containers/Bundle/Application/.jbroot-91718B01B8229D6D/var/jb/tmp/ftb_stage
+//  后果：guard 落在死角 → postinst 的 rm 永远清不掉 → 早期一次被打断的记账
+//        （安装后立刻 killall/重启，没撑过 36 秒存活窗）永久生效
+//        → 之后每次开机都是 "[GUARD] 上次未存活 -> 自动禁用"，注入再没跑起来过。
+//  铁律：dylib 侧一律 "/tmp/..."，shell 侧一律 "/var/jb/tmp/..."，两者指同一文件。
 //
 //  ============================ 教训链（必读） ============================
 //  · v2.1 黑屏：constructor 里调用 dispatch_after_f（GCD）→ 违反铁律。
@@ -29,10 +40,14 @@
 //
 //  ============================ 本版安全设计 ============================
 //  1) constructor 只做：fopen 写日志 + 读控制文件 + pthread_create。零 API。
-//  2) 【开机自愈保险】崩溃后自动禁用，无需安全模式：
-//       ctor 读 guard 文件；若「本 stage 已尝试过且未确认存活」→ 直接禁用返回。
-//       存活 25 秒后才把 guard 标记为「已确认安全」。
-//       ⇒ 最多黑屏一次，下次开机自动跳过，设备正常进系统。
+//  2) 【开机自愈保险 v2.6】崩溃后自动禁用，无需安全模式：
+//       guard 内容 = "<build id> <stage> <attempts>"，单一路径 /tmp/ftb_guard。
+//       · build id = 编译时间戳 hash：新构建自动作废旧记录，
+//         不再依赖 postinst 能否够到文件（v2.5 正是栽在这）。
+//       · 阈值 2：同 build 同 stage 连续 2 次没撑过存活窗才禁用。
+//         阈值 1 会把"安装后立刻重启"误判成崩溃。
+//       · 存活窗约 15 秒（v2.3 实测崩溃在 hook 装上后几微秒，长窗口只增加误判）。
+//       ⇒ 最多黑屏两次，之后自动跳过，设备正常进系统。
 //  3) 【分级开关】改 /var/jb/tmp/ftb_stage 即可推进/回退，无需重新编译安装：
 //       0 = 只写日志（等于关闭）
 //       1 = dlopen IOKit + 解析事件构造符号（不碰任何 HID 对象）
@@ -128,13 +143,30 @@ typedef void  (*FT_MSHookFunction)(void *symbol, void *replace, void **result);
 
 // MARK: - 路径
 
-static const char *g_sockPath  = "/var/jb/tmp/floatingtapd.sock";
+// ⚠️ v2.6 铁律：注入 dylib 内【绝不写 /var/jb 前缀】。
+//    rootless 运行时会自动给绝对路径前缀 jbroot：
+//      dylib  "/tmp/X"        -> <jbroot>/tmp/X      ← 与 shell 的 /var/jb/tmp/X 同一文件 ✓
+//      dylib  "/var/jb/tmp/X" -> <jbroot>/var/jb/tmp/X  ← 死角，shell 侧永远够不到 ✗
+//    v2.5 的 guard 就是栽在这：postinst 清的是前者，dylib 读的是后者，
+//    残留的 "3 1" 永久生效 -> 每次开机都被自愈保险禁用。
+static const char *g_sockPath  = "/tmp/floatingtapd.sock";
 static const char *g_logPath   = "/tmp/backboard_inject.log";
-// 控制文件写两份（/var/jb/tmp 可能随 jbroot 挂载，/tmp 实测 backboardd 可写）
-static const char *g_stageA    = "/var/jb/tmp/ftb_stage";
-static const char *g_stageB    = "/tmp/ftb_stage";
-static const char *g_guardA    = "/var/jb/tmp/ftb_guard";
-static const char *g_guardB    = "/tmp/ftb_guard";
+static const char *g_stagePath = "/tmp/ftb_stage";
+static const char *g_guardPath = "/tmp/ftb_guard";
+static const char *g_piPath    = "/tmp/ftb_pi";        // postinst 落的握手标记
+// v2.5 遗留死角，ctor 里主动清掉（此处必须保留双前缀写法才能命中）
+static const char *g_deadGuard = "/var/jb/tmp/ftb_guard";
+static const char *g_deadStage = "/var/jb/tmp/ftb_stage";
+
+// 编译时间戳 -> 32 位 hash，作为 build id 写进 guard。
+// 新构建 = 新 build id = guard 自动作废 = 无条件获得一次干净机会，
+// 不再依赖 postinst 能否够到文件。
+static const char g_buildStr[] = __DATE__ " " __TIME__;
+static unsigned FTBuildID(void) {
+    unsigned h = 2166136261u;
+    for (const char *p = g_buildStr; *p; p++) { h ^= (unsigned char)*p; h *= 16777619u; }
+    return h;
+}
 
 // MARK: - 事件构造符号（仅"创建/设值"类，纯内存操作，无跨进程通信 → 安全）
 
@@ -348,27 +380,36 @@ static int FTReadIntFile(const char *path, int def) {
     return v;
 }
 
-// guard 文件格式： "<stage> <attempts>"
-static void FTReadGuard(int *gstage, int *gattempts) {
-    int bs = -1, ba = 0, cs = -1, ca = 0;
-    FILE *f = fopen(g_guardA, "r");
-    if (f) { if (fscanf(f, "%d %d", &bs, &ba) != 2) { bs = -1; ba = 0; } fclose(f); }
-    f = fopen(g_guardB, "r");
-    if (f) { if (fscanf(f, "%d %d", &cs, &ca) != 2) { cs = -1; ca = 0; } fclose(f); }
-    // 取"更悲观"的一份：只要任一份记录了本 stage 的未确认尝试，就算尝试过
-    if (bs >= 0 && cs >= 0) {
-        *gstage = (ba >= ca) ? bs : cs;
-        *gattempts = (ba >= ca) ? ba : ca;
-    } else if (bs >= 0) { *gstage = bs; *gattempts = ba; }
-    else if (cs >= 0)   { *gstage = cs; *gattempts = ca; }
-    else                { *gstage = -1; *gattempts = 0; }
+// guard 文件格式： "<buildid> <stage> <attempts>"
+// buildid 不匹配 = 别的构建留下的记录 = 直接作废（新版本必得一次干净机会）。
+// 单一路径，不再做 A/B "取更悲观" —— v2.5 正是被够不到的那一份永久锁死。
+static void FTReadGuard(int *gstage, int *gattempts, char *rawOut, size_t rawLen) {
+    *gstage = -1; *gattempts = 0;
+    if (rawOut && rawLen) snprintf(rawOut, rawLen, "MISSING");
+
+    FILE *f = fopen(g_guardPath, "r");
+    if (!f) return;
+    char line[128] = {0};
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return; }
+    fclose(f);
+
+    for (char *p = line; *p; p++) if (*p == '\n' || *p == '\r') *p = 0;
+    if (rawOut && rawLen) snprintf(rawOut, rawLen, "\"%s\"", line);
+
+    unsigned bid = 0; int st = -1, at = 0;
+    if (sscanf(line, "%u %d %d", &bid, &st, &at) != 3) return;
+    if (bid != FTBuildID()) {
+        if (rawOut && rawLen)
+            snprintf(rawOut, rawLen, "\"%s\" (build 0x%08x != 本版 0x%08x -> 作废)",
+                     line, bid, FTBuildID());
+        return;                                  // 旧构建的记录，不认
+    }
+    *gstage = st; *gattempts = at;
 }
 
 static void FTWriteGuard(int stage, int attempts) {
-    FILE *f = fopen(g_guardA, "w");
-    if (f) { fprintf(f, "%d %d\n", stage, attempts); fclose(f); }
-    f = fopen(g_guardB, "w");
-    if (f) { fprintf(f, "%d %d\n", stage, attempts); fclose(f); }
+    FILE *f = fopen(g_guardPath, "w");
+    if (f) { fprintf(f, "%u %d %d\n", FTBuildID(), stage, attempts); fclose(f); }
 }
 
 // MARK: - 符号解析（stage >= 1，后台线程内执行）
@@ -410,8 +451,8 @@ static bool FTLocateCallback(void) {
     FT_MSGetImageByName fGetImage = (FT_MSGetImageByName)dlsym(RTLD_DEFAULT, "MSGetImageByName");
     FT_MSFindSymbol     fFindSym  = (FT_MSFindSymbol)dlsym(RTLD_DEFAULT, "MSFindSymbol");
     if (!fGetImage || !fFindSym) {
-        const char *libs[] = { "/var/jb/usr/lib/libellekit.dylib",
-                               "/var/jb/usr/lib/libsubstrate.dylib",
+        // 路径不带 /var/jb：运行时自动前缀 jbroot（写了反而变 <jbroot>/var/jb/... 死角）
+        const char *libs[] = { "/usr/lib/libellekit.dylib",
                                "/usr/lib/libsubstrate.dylib", NULL };
         for (int i = 0; libs[i] && (!fGetImage || !fFindSym); i++) {
             void *lh = dlopen(libs[i], RTLD_LAZY);
@@ -491,8 +532,7 @@ static bool FTInstallHook(void) {
     if (!g_cbAddr) return false;
     FT_MSHookFunction fHook = (FT_MSHookFunction)dlsym(RTLD_DEFAULT, "MSHookFunction");
     if (!fHook) {
-        const char *libs[] = { "/var/jb/usr/lib/libellekit.dylib",
-                               "/var/jb/usr/lib/libsubstrate.dylib",
+        const char *libs[] = { "/usr/lib/libellekit.dylib",
                                "/usr/lib/libsubstrate.dylib", NULL };
         for (int i = 0; libs[i] && !fHook; i++) {
             void *lh = dlopen(libs[i], RTLD_LAZY);
@@ -683,7 +723,6 @@ static void *FTSocketThread(void *arg) {
 }
 
 static bool FTSetupSocket(void) {
-    mkdir("/var/jb/tmp", 0777);
     unlink(g_sockPath);
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) { FTDLogFmt("socket() failed: %s", strerror(errno)); return false; }
@@ -712,7 +751,7 @@ static bool FTSetupSocket(void) {
 static void *FTInitThread(void *ctx) {
     (void)ctx;
     signal(SIGPIPE, SIG_IGN);
-    sleep(6);                                  // 等 backboardd 完全就绪（比 v2.2 更保守）
+    sleep(4);                                  // 等 backboardd 完全就绪
     FTDLogFmt("init thread start, stage=%d", g_stage);
 
     if (g_stage >= 1) { if (!FTLoadSymbols())   goto done; }
@@ -733,8 +772,10 @@ static void *FTInitThread(void *ctx) {
     }
 
 done:
-    // 存活确认：再撑 25 秒不崩 → 把 guard 标记为「本 stage 已验证安全」
-    sleep(25);
+    // 存活确认：再撑 6 秒不崩 → 把 guard 标记为「本 stage 已验证安全」。
+    // 窗口从 v2.5 的 36 秒压到约 15 秒：v2.3 实测崩溃发生在 hook 装上后的几微秒内，
+    // 长窗口只会让"安装后立刻重启"被误判成崩溃。
+    sleep(6);
 
     // 【死人开关】hook 装上了但 orig 不可用 = 触摸事件被全部丢弃 = 设备变砖（虽不崩）。
     // 这种情况故意【不标记 SAFE】，让 guard 保持"未确认"，用户重启即自动禁用。
@@ -758,7 +799,8 @@ static void FTBCtor(void) {
     const char *proc = getprogname();
     FILE *mk = fopen(g_logPath, "a");
     if (mk) {
-        fprintf(mk, "\n===== [BackboardInject v2.5] ctor pid=%d proc=%s slice=%s ptrauth=%s =====\n",
+        fprintf(mk, "\n===== [BackboardInject v2.6] ctor pid=%d proc=%s slice=%s ptrauth=%s "
+                    "build=%s(0x%08x) =====\n",
                 (int)getpid(), proc ? proc : "?",
 #if defined(__arm64e__)
                 "arm64e",
@@ -766,31 +808,53 @@ static void FTBCtor(void) {
                 "arm64",
 #endif
 #if __has_feature(ptrauth_calls)
-                "yes"
+                "yes",
 #else
-                "no"
+                "no",
 #endif
-                );
+                g_buildStr, FTBuildID());
         fclose(mk);
     }
 
-    // 读 stage（默认 4 = 完整功能；有自愈保险兜底，且日志逐步打点可定位失败点。
-    // 需要二分排查时手动降到 1/2/3）
-    int st = FTReadIntFile(g_stageA, -1);
-    if (st < 0) st = FTReadIntFile(g_stageB, -1);
-    if (st < 0) st = 3;                 // v2.4 默认 3：装 hook 但纯透传，先证明 hook 本身安全
+    // v2.5 死角清理：那两个被双前缀的文件（<jbroot>/var/jb/tmp/...）shell 侧永远够不到，
+    // 只能由 dylib 自己用同样的双前缀写法删掉，否则残留记录会永久锁死自愈保险。
+    unlink(g_deadGuard);
+    unlink(g_deadStage);
+
+    // 读 stage（单一路径 /tmp/ftb_stage，等价于 shell 侧 /var/jb/tmp/ftb_stage）
+    int st = FTReadIntFile(g_stagePath, -1);
+    if (st < 0) st = 3;                 // 默认 3：装 hook 但纯透传，先证明 hook 本身安全
     if (st > 5) st = 5;
     g_stage = st;
 
-    // 【开机自愈保险】本 stage 上次尝试过但没撑过 30 秒 → 判定为会崩，直接禁用
+    // 【开机自愈保险】同一 build + 同一 stage 连续 2 次没撑过存活窗 → 判定为会崩，禁用。
+    // 阈值取 2 而不是 1：安装后立刻 killall/重启会在存活窗内打断记账，
+    // 那属于误判，不该因此永久封死（v2.5 就是被这种误判 + 死角文件双杀）。
     int gs = -1, ga = 0;
-    FTReadGuard(&gs, &ga);
-    if (gs == g_stage && ga >= 1) {
+    char rawGuard[160];
+    FTReadGuard(&gs, &ga, rawGuard, sizeof(rawGuard));
+
+    // 握手探针：确认 dylib 与 postinst 是否在同一个文件视图里
+    char piBuf[64] = "MISSING";
+    { FILE *pf = fopen(g_piPath, "r");
+      if (pf) { if (!fgets(piBuf, sizeof(piBuf), pf)) strcpy(piBuf, "EMPTY");
+                for (char *p = piBuf; *p; p++) if (*p=='\n'||*p=='\r') *p = 0;
+                fclose(pf); } }
+
+    { FILE *f = fopen(g_logPath, "a");
+      if (f) {
+          fprintf(f, "[paths] stage=%d(from %s) guard=%s -> %s | postinst marker %s = %s\n",
+                  g_stage, g_stagePath, g_guardPath, rawGuard, g_piPath, piBuf);
+          fclose(f);
+      } }
+
+    if (gs == g_stage && ga >= 2) {
         FILE *f = fopen(g_logPath, "a");
         if (f) {
-            fprintf(f, "[GUARD] stage %d 上次未存活 -> 本次自动禁用（设备可正常启动）。\n"
-                       "        降级：echo 0 > %s 然后注销；或改 stage 重试。\n",
-                    g_stage, g_stageA);
+            fprintf(f, "[GUARD] stage %d 连续 %d 次未存活 -> 本次自动禁用（设备可正常启动）。\n"
+                       "        重试：echo %d > /var/jb/tmp/ftb_stage 并删除 /var/jb/tmp/ftb_guard\n"
+                       "        关闭：echo 0 > /var/jb/tmp/ftb_stage\n",
+                    g_stage, ga, g_stage);
             fclose(f);
         }
         return;                                 // 不启动任何线程 → 等价于未注入
@@ -800,7 +864,7 @@ static void FTBCtor(void) {
         if (f) { fprintf(f, "[stage 0] 已关闭，不做任何事。\n"); fclose(f); }
         return;
     }
-    FTWriteGuard(g_stage, 1);                   // 先记账，再干活
+    FTWriteGuard(g_stage, (gs == g_stage ? ga : 0) + 1);   // 先记账，再干活
 
     pthread_t th;
     if (pthread_create(&th, NULL, FTInitThread, NULL) == 0) pthread_detach(th);

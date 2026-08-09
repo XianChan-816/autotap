@@ -30,9 +30,10 @@
 #include <errno.h>
 #include <time.h>
 
-// ⚠️ socket 放 /var/jb/tmp（Dopamine rootless 下该目录必然存在）；
-// /var/jb/run 在部分固件不存在，daemon 启动时也不会自动建目录。
-static const char *g_sockPath = "/var/jb/tmp/floatingtapd.sock";
+// ⚠️ v2.6：注入 dylib 内绝不写 /var/jb 前缀——rootless 运行时会自动前缀 jbroot，
+// 手写 "/var/jb/tmp/X" 会变成 <jbroot>/var/jb/tmp/X（死角）。
+// 写 "/tmp/X" 才等价于 shell 侧的 /var/jb/tmp/X，与 BackboardInject 侧保持一致。
+static const char *g_sockPath = "/tmp/floatingtapd.sock";
 static const int g_timeoutMs = 300;
 
 // ⚠️ v2.1：注入改由 BackboardInject.dylib（注入 backboardd 进程）提供 socket——
