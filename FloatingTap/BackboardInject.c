@@ -48,7 +48,7 @@
 //         阈值 1 会把"安装后立刻重启"误判成崩溃。
 //       · 存活窗约 15 秒（v2.3 实测崩溃在 hook 装上后几微秒，长窗口只增加误判）。
 //       ⇒ 最多黑屏两次，之后自动跳过，设备正常进系统。
-//  3) 【分级开关】改 /var/jb/tmp/ftb_stage 即可推进/回退，无需重新编译安装：
+//  3) 【分级开关】改 /var/jb/Library/FloatingTap/ftb_stage（Filza 里即 /Library/FloatingTap/ftb_stage）即可推进/回退，无需重新编译安装：
 //       0 = 只写日志（等于关闭）
 //       1 = dlopen IOKit + 解析事件构造符号（不碰任何 HID 对象）
 //       2 = 1 + 定位 ___IOHIDServiceEventCallback + 地址校验 + 指令 dump（不 hook）
@@ -149,9 +149,13 @@ typedef void  (*FT_MSHookFunction)(void *symbol, void *replace, void **result);
 //      dylib  "/var/jb/tmp/X" -> <jbroot>/var/jb/tmp/X  ← 死角，shell 侧永远够不到 ✗
 //    v2.5 的 guard 就是栽在这：postinst 清的是前者，dylib 读的是后者，
 //    残留的 "3 1" 永久生效 -> 每次开机都被自愈保险禁用。
+static const char *g_ctrlDir   = "/Library/FloatingTap";               // 持久目录：jbroot /Library 重启不清
 static const char *g_sockPath  = "/tmp/floatingtapd.sock";
 static const char *g_logPath   = "/tmp/backboard_inject.log";
-static const char *g_stagePath = "/tmp/ftb_stage";
+// v2.7 关键修复：stage 文件从 /tmp 移到持久目录。/var/jb/tmp 重启会被清空，
+// 而 ftb_stage 是唯一不被 dylib 重新生成的文件 -> 重启即丢 -> 永远回退默认 stage 3。
+// 改放 /Library/FloatingTap（== shell 的 /var/jb/Library/FloatingTap），重启不清，且 dylib 每次开机写回。
+static const char *g_stagePath = "/Library/FloatingTap/ftb_stage";
 static const char *g_guardPath = "/tmp/ftb_guard";
 static const char *g_piPath    = "/tmp/ftb_pi";        // postinst 落的握手标记
 // v2.5 遗留死角，ctor 里主动清掉（此处必须保留双前缀写法才能命中）
@@ -378,6 +382,11 @@ static int FTReadIntFile(const char *path, int def) {
     if (fscanf(f, "%d", &v) != 1) v = def;
     fclose(f);
     return v;
+}
+
+static void FTWriteIntFile(const char *path, int v) {
+    FILE *f = fopen(path, "w");
+    if (f) { fprintf(f, "%d", v); fclose(f); }
 }
 
 // guard 文件格式： "<buildid> <stage> <attempts>"
@@ -821,11 +830,15 @@ static void FTBCtor(void) {
     unlink(g_deadGuard);
     unlink(g_deadStage);
 
-    // 读 stage（单一路径 /tmp/ftb_stage，等价于 shell 侧 /var/jb/tmp/ftb_stage）
+    // v2.7：确保持久控制目录存在（jbroot /Library 重启不清）
+    mkdir(g_ctrlDir, 0755);
+
+    // 读 stage（持久目录 /Library/FloatingTap/ftb_stage，等价于 shell 侧 /var/jb/Library/FloatingTap/ftb_stage）
     int st = FTReadIntFile(g_stagePath, -1);
     if (st < 0) st = 3;                 // 默认 3：装 hook 但纯透传，先证明 hook 本身安全
     if (st > 5) st = 5;
     g_stage = st;
+    FTWriteIntFile(g_stagePath, g_stage);   // 自愈：把当前 stage 写回持久目录，下次开机一定读得到
 
     // 【开机自愈保险】同一 build + 同一 stage 连续 2 次没撑过存活窗 → 判定为会崩，禁用。
     // 阈值取 2 而不是 1：安装后立刻 killall/重启会在存活窗内打断记账，
@@ -852,8 +865,8 @@ static void FTBCtor(void) {
         FILE *f = fopen(g_logPath, "a");
         if (f) {
             fprintf(f, "[GUARD] stage %d 连续 %d 次未存活 -> 本次自动禁用（设备可正常启动）。\n"
-                       "        重试：echo %d > /var/jb/tmp/ftb_stage 并删除 /var/jb/tmp/ftb_guard\n"
-                       "        关闭：echo 0 > /var/jb/tmp/ftb_stage\n",
+                       "        重试：echo %d > /Library/FloatingTap/ftb_stage 并删除 /tmp/ftb_guard\n"
+                       "        关闭：echo 0 > /Library/FloatingTap/ftb_stage\n",
                     g_stage, ga, g_stage);
             fclose(f);
         }

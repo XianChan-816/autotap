@@ -54,7 +54,7 @@ FloatingTap_LDFLAGS = -lz
 #   · 注入 = 直接调用原始回调把事件喂回 backboardd 管线（零客户端、零 SID 探测）
 #   · 全程零 GCD：socket 用阻塞 accept 线程，连点用独立 pthread
 #   · 开机自愈保险：崩一次→下次开机自动禁用（不用进安全模式）
-#   · 分级开关 /var/jb/tmp/ftb_stage
+#   · 分级开关 /var/jb/Library/FloatingTap/ftb_stage（Filza 里即 /Library/FloatingTap/ftb_stage）
 #     0关闭 1符号 2定位+校验 3挂钩纯透传(默认) 4加GetType捕获 5socket+注入
 # SB 侧 FTDaemonClient 协议不变（socket /var/jb/tmp/floatingtapd.sock）
 BackboardInject_FILES = BackboardInject.c

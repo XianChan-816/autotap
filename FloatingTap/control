@@ -1,8 +1,8 @@
 Package: com.floatingtap.tweak
 Name: FloatingTap
-Version: 2.6.0-pathfix
+Version: 2.7.0-persiststage
 Architecture: iphoneos-arm64
-Description: 全局悬浮球自动点击器（v2.6：修复 rootless 路径双前缀导致自愈保险被永久锁死——dylib 内绝对路径会自动前缀 jbroot，手写 /var/jb 等于加两次；guard 改为 build-id 记账+阈值 2+存活窗压到 15 秒，新构建必得一次干净机会）
+Description: 全局悬浮球自动点击器（v2.7：把 stage 开关文件从重启即清空的 /var/jb/tmp 移到持久目录 /var/jb/Library/FloatingTap，解决每次重启回退默认 stage 3、无法切到高频 stage 5 的问题；v2.6 已修复 rootless 路径双前缀导致自愈保险被永久锁死）
 Maintainer: FloatingTap
 Author: FloatingTap
 Section: Tweaks
