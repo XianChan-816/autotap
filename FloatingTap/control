@@ -1,8 +1,8 @@
 Package: com.floatingtap.tweak
 Name: FloatingTap
-Version: 2.8.2-coords
+Version: 2.8.3-decouple
 Architecture: iphoneos-arm64
-Description: 全局悬浮球自动点击器（v2.8.2：修复连点坐标——SB 发的归一化坐标需在发送前乘竖屏基准尺寸转成点坐标，否则注入落在屏幕外(0.5,0.66)px 看不见；backboardd 命令解析的 0.001~0.999 钳制改回点范围。v2.8 控制通道改 Darwin 通知+文件，避开 backboardd 沙盒禁 socket 黑屏）
+Description: 全局悬浮球自动点击器（v2.8.3：解耦 backboardd 连点与遗留 SB 侧 SID 探针——按住球直接走 backboardd 注入，不再依赖 g_LockedSID（旧探针每次停止会清零+拉黑该 SID，导致「第一次变黄能用、后面再按没反应」）。v2.8.2 修了坐标换算；v2.8 控制通道改 Darwin 通知+文件避开沙盒禁 socket 黑屏）
 Maintainer: FloatingTap
 Author: FloatingTap
 Section: Tweaks

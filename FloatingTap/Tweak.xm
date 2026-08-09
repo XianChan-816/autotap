@@ -856,13 +856,7 @@ static void FTStartClicking(void) {
         if (gClickLockX < 0.001) gClickLockX = 0.001; if (gClickLockX > 0.999) gClickLockX = 0.999;
         if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
         double ms = FTIntervalMs();
-        // 把 SB 探测锁定的有效 SID 推给 backboardd 注入（registryID 兜底）
-        if (g_LockedSID != 0) {
-            FTDaemonSetSID(g_LockedSID);
-            char dbgS[96];
-            snprintf(dbgS, sizeof(dbgS), "backboard SID <- SB locked 0x%llx", (unsigned long long)g_LockedSID);
-            FTLog(dbgS);
-        }
+        // v2.8.3：backboardd 自身从真实触摸捕获 digitizer 身份，无需 SB 推 SID（旧 FTDaemonSetSID 推送已删）。
         // v2.8.2：坐标换算成【点坐标】再发——backboardd 的 FTCreateEvent 把 x/y 直接当
         // IOHID 手指点坐标用；gClickLockX/Y 是归一化(0~1)，不换算会落在屏幕左上角(0.5,0.66)px。
         // 竖屏基准 gScreenW/H（834×1194）与 IOHID digitizer 归一化基准一致（ctor 已实锤）。
@@ -1221,11 +1215,15 @@ static void FTBallHoldTimer(void *ctx) {
         // 高频顶掉会反复「连点→顶掉→重启」（ctor-16 每轮 8 次循环）。等 0.8s 裁决
         // （stab-fail 续扫 or 稳定通过）后再动作。
         if (g_StabTesting && g_StabFail) return;
-        if (g_LockedSID != 0) {
+        // ⚠️ v2.8.3：现代路径（backboardd 注入）直接连点，不再依赖遗留 SB 侧 SID 探针。
+        // backboardd 自身从真实触摸捕获 (target,refcon,service)，无需 g_LockedSID；旧探针每次停止
+        // 会把 g_LockedSID 清零并拉黑（g_ProbeEndingSIDs），导致「第一次变黄能用、后面再按没反应」。
+        // 故 backboardd 可用时直接走，彻底绕开遗留探针；仅当 backboardd 不可用时才兜底走旧探针。
+        if (FTDaemonProbe() == 1 || g_LockedSID != 0) {
             gBallTouchClicking = YES;
             FTStartClicking();
         } else {
-            FTStartProbing(); // 第一次按住：探测校准有效 SID（球变橙色）
+            FTStartProbing(); // 仅 backboardd 不可用时兜底：探测校准有效 SID（球变橙色）
         }
     }
 }
@@ -2327,7 +2325,9 @@ static void FTTweakInitCallback(void *ctx) {
             } else if (ph == 1 || ph == 2) {                 // Moved / Stationary（仅作保险，主要靠计时器）
                 // v1.0.101：探测期间或未锁定 SID 时禁止直接连点（必须走探测校准）
                 // ⚠️ v1.0.119：stab 裁决前不重启（顶掉后重绑的 Moved 会走这里，防顶掉循环）
-                if (gBallTouch == tp && !gBallTouchClicking && !gDragMode && !g_Probing && g_LockedSID != 0 &&
+                // ⚠️ v2.8.3：backboardd 可用时同样允许直接连点（不再卡在 g_LockedSID）
+                if (gBallTouch == tp && !gBallTouchClicking && !gDragMode && !g_Probing &&
+                    (g_LockedSID != 0 || FTDaemonProbe() == 1) &&
                     !(g_StabTesting && g_StabFail) &&
                     (now - gBallTouchDownTime) > 0.12 && !gBallTouchTimerPending) {
                     gBallTouchClicking = YES;
