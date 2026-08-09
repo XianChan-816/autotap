@@ -1,8 +1,8 @@
 Package: com.floatingtap.tweak
 Name: FloatingTap
-Version: 2.8.5-ball-offset
+Version: 2.8.6-senderid
 Architecture: iphoneos-arm64
-Description: 全局悬浮球自动点击器（v2.8.5：修正 v2.8.4 硬伤——点击点不可落在球正心，球 userInteractionEnabled=YES 会拦截注入触摸导致「没效果」，改取球正下方紧贴处，绿圈常显跟随球并穿透到下层 App 命中按钮；v2.8.4 让绿圈跟随球；v2.8.3 解耦 backboardd 与遗留 SID 探针；v2.8.2 修坐标换算；v2.8 控制通道改 Darwin 通知+文件避开沙盒禁 socket 黑屏）
+Description: 全局悬浮球自动点击器（v2.8.6：修复「完全没反应」根因——注入事件缺失硬件 digitizer senderID 被 iOS 静默丢弃 + 坐标为点坐标未归一化；改用 IOHIDEventSystemClientDispatchEvent 高频通道并打标 senderID；点击点与蓝圈独立（佳影式，红色拖动模式摆位、连击模式不吸附）；v2.8.5 绿圈常显；v2.8.3 解耦 SID 探针；v2.8 控制通道改 Darwin 通知+文件避开沙盒禁 socket）
 Maintainer: FloatingTap
 Author: FloatingTap
 Section: Tweaks

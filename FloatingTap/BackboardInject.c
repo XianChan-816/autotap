@@ -196,6 +196,12 @@ static void (*p_SetIntegerValue)(FT_IOHIDEventRef, uint32_t, int64_t);
 static void (*p_SetFloatValue)(FT_IOHIDEventRef, uint32_t, double);
 static void (*p_AppendEvent)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits);
 static uint32_t (*p_GetType)(FT_IOHIDEventRef);
+static void     (*p_SetSenderID)(FT_IOHIDEventRef, uint64_t);
+static uint64_t  (*p_GetSenderID)(FT_IOHIDEventRef);
+typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+static IOHIDEventSystemClientRef (*p_ClientCreate)(CFAllocatorRef);
+static IOHIDEventSystemClientRef (*p_ClientCreateWithType)(CFAllocatorRef, uint32_t);
+static void (*p_DispatchEvent)(IOHIDEventSystemClientRef, FT_IOHIDEventRef);
 
 // MARK: - 状态
 
@@ -218,6 +224,9 @@ static void *g_target = NULL;
 static void *g_refcon = NULL;
 static FT_IOHIDServiceRef g_service = NULL;
 static volatile bool g_captured = false;
+static uint64_t g_senderID = 0;                      // 真实触摸捕获的硬件 digitizer senderID（iOS 必需，否则事件被静默丢弃）
+static IOHIDEventSystemClientRef g_client = NULL;    // HID 事件系统客户端（高频注入通道，优先于 re-feed）
+static double g_screenW = 834.0, g_screenH = 1194.0; // 竖屏基准，SB 侧 start 命令传入
 
 static pthread_mutex_t g_injectLock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -450,12 +459,20 @@ static bool FTLoadSymbols(void) {
     p_SetFloatValue   = (void (*)(FT_IOHIDEventRef, uint32_t, double))dlsym(h, "IOHIDEventSetFloatValue");
     p_AppendEvent     = (void (*)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits))dlsym(h, "IOHIDEventAppendEvent");
     p_GetType         = (uint32_t (*)(FT_IOHIDEventRef))dlsym(h, "IOHIDEventGetType");
+    p_SetSenderID     = (void (*)(FT_IOHIDEventRef, uint64_t))dlsym(h, "IOHIDEventSetSenderID");
+    p_GetSenderID     = (uint64_t (*)(FT_IOHIDEventRef))dlsym(h, "IOHIDEventGetSenderID");
+    p_ClientCreate    = (IOHIDEventSystemClientRef (*)(CFAllocatorRef))dlsym(h, "IOHIDEventSystemClientCreate");
+    p_ClientCreateWithType = (IOHIDEventSystemClientRef (*)(CFAllocatorRef, uint32_t))dlsym(h, "IOHIDEventSystemClientCreateWithType");
+    p_DispatchEvent   = (void (*)(IOHIDEventSystemClientRef, FT_IOHIDEventRef))dlsym(h, "IOHIDEventSystemClientDispatchEvent");
 
-    g_symOK = (p_CreateDigitizerEvent && p_CreateFingerEvent && p_AppendEvent && p_GetType);
-    FTDLogFmt("symbols: digi=%p finger=%p append=%p setInt=%p setFlt=%p getType=%p => %s",
+    // 事件创建 + senderID 打标是注入必需；HID 客户端为可选项（缺失时退化 re-feed 原始回调）。
+    g_symOK = (p_CreateDigitizerEvent && p_CreateFingerEvent && p_AppendEvent && p_GetType
+               && p_SetSenderID && p_GetSenderID);
+    FTDLogFmt("symbols: digi=%p finger=%p append=%p setInt=%p setFlt=%p getType=%p setSID=%p getSID=%p client=%p disp=%p => %s",
               (void *)p_CreateDigitizerEvent, (void *)p_CreateFingerEvent, (void *)p_AppendEvent,
               (void *)p_SetIntegerValue, (void *)p_SetFloatValue, (void *)p_GetType,
-              g_symOK ? "OK" : "FAILED");
+              (void *)p_SetSenderID, (void *)p_GetSenderID, (void *)p_ClientCreate,
+              (void *)p_DispatchEvent, g_symOK ? "OK" : "FAILED");
     return g_symOK;
 }
 
@@ -525,12 +542,19 @@ static void FTServiceEventCallbackNew(void *target, void *refcon,
         FTProbe("[cb] gettype\n");
         uint32_t ty = (event && p_GetType) ? p_GetType(event) : 0;
         FTProbe("[cb] gettype ok\n");
-        if (ty == 11 && !g_captured) {
-            g_target  = target;
-            g_refcon  = refcon;
-            g_service = service;
-            g_captured = true;
-            FTProbe("[cb] CAPTURED\n");
+        if (ty == 11) {
+            if (!g_captured) {
+                // (target, refcon, service) 仅冻结首次——仅供 re-feed 退化兜底使用
+                g_target  = target;
+                g_refcon  = refcon;
+                g_service = service;
+                g_captured = true;
+                FTProbe("[cb] CAPTURED\n");
+            }
+            // ★ senderID 持续刷新：backboardd 裸 HID 层，所有真实手指共享同一硬件 digitizer SID。
+            //   iOS 必需——缺失或错误则合成事件被静默丢弃（"完全没反应"根因）。
+            uint64_t sid = (p_GetSenderID ? p_GetSenderID(event) : 0);
+            if (sid) g_senderID = sid;
         }
     }
 
@@ -597,14 +621,21 @@ static FT_IOHIDEventRef FTCreateEvent(bool down, double x, double y, uint32_t in
     Boolean range = down ? 1 : 0;
     Boolean touch = down ? 1 : 0;
 
+    // ★ iOS digitizer 坐标必须【归一化 0~1】（x/屏宽, y/屏高）。直接喂点坐标(417)会被路由到
+    // 错误/空白位置 → 看起来「没效果」。ZXTouch/iosre 均验证归一化是 HID 注入的硬性要求。
+    double nx = (g_screenW > 0) ? (x / g_screenW) : (x / 834.0);
+    double ny = (g_screenH > 0) ? (y / g_screenH) : (y / 1194.0);
+
     FT_IOHIDEventRef child = p_CreateFingerEvent(kCFAllocatorDefault, ts, index, 3, mask,
-                                                 x, y, 0.0, 0.0, 0.0, range, touch, 0);
+                                                 nx, ny, 0.0, 0.0, 0.0, range, touch, 0);
     if (!child) return NULL;
     if (p_SetFloatValue) {
-        p_SetFloatValue(child, 0x0B0014, 0.04);   // radius
-        p_SetFloatValue(child, 0x0B0015, 0.04);
-        p_SetFloatValue(child, 0x0B000D, x);      // X
-        p_SetFloatValue(child, 0x0B000E, y);      // Y
+        p_SetFloatValue(child, 0x0B0014, 0.04);   // major radius
+        p_SetFloatValue(child, 0x0B0015, 0.04);   // minor radius
+        // v1.0.77 定案：构造参数(pos x,y)可能不持久化，必须显式落 X/Y 字段（归一化 0~1），
+        // 否则合成事件坐标为 0 → 落点错误/被系统丢弃。对齐 HIDInject.c。
+        p_SetFloatValue(child, 0x0B000D, nx);     // X（归一化）
+        p_SetFloatValue(child, 0x0B000E, ny);     // Y（归一化）
     }
     if (p_SetIntegerValue) {
         p_SetIntegerValue(child, 0x0B0007, (int64_t)mask);
@@ -633,11 +664,19 @@ static FT_IOHIDEventRef FTCreateEvent(bool down, double x, double y, uint32_t in
 // MARK: - 注入（佳影 performDigitizerEvent 同款：直接喂回原始回调）
 
 static void FTInject(bool down, double x, double y, uint32_t index) {
-    if (!g_captured || !g_origOK || !g_origCall) return;
+    // ★ 必需：senderID（硬件 digitizer 身份，iOS 校验，缺失则事件被静默丢弃）。
+    //   且至少一条可用分发通道：HID 客户端优先，缺失则退化 re-feed 原始回调。
+    if (!g_senderID) return;
+    if (!g_client && !(g_origOK && g_origCall)) return;
     FT_IOHIDEventRef ev = FTCreateEvent(down, x, y, index);
     if (!ev) return;
+    if (p_SetSenderID) p_SetSenderID(ev, g_senderID);
     pthread_mutex_lock(&g_injectLock);
-    g_origCall(g_target, g_refcon, g_service, ev); // ← 零客户端、零 DispatchEvent
+    if (g_client && p_DispatchEvent) {
+        p_DispatchEvent(g_client, ev);                 // 高频通道（ZXTouch 验证）
+    } else if (g_origOK && g_origCall) {
+        g_origCall(g_target, g_refcon, g_service, ev); // 退化：re-feed 原始回调
+    }
     pthread_mutex_unlock(&g_injectLock);
     CFRelease(ev);
 }
@@ -671,7 +710,7 @@ static void FTStart(double x, double y, int64_t ms) {
     if (ms < 5) ms = 5;
     if (ms > 60000) ms = 60000;
     g_tx = x; g_ty = y; g_ms = ms;
-    if (!g_captured) FTDLog("start: captured 尚未就绪，先空转等首次真实触摸（不影响连点启动）");
+    if (!g_senderID) FTDLog("start: senderID 尚未就绪，先空转等首次真实触摸（不影响连点启动）");
     if (g_clickRun) return;             // 已在连点，只更新坐标
     g_clickRun = true;
     if (pthread_create(&g_clickTh, NULL, FTClickThread, NULL) == 0) pthread_detach(g_clickTh);
@@ -706,15 +745,17 @@ static void *FTCommandThread(void *arg) {
                 if (fgets(line, sizeof(line), f)) {
                     if (strncmp(line, "start", 5) == 0) {
                         double x = 0.5, y = 0.5; long long ms = 12;
-                        sscanf(line + 5, "%lf %lf %lld", &x, &y, &ms);
-                        // v2.8.2：x/y 现在为【点坐标】（SB 已按竖屏基准尺寸换算），
-                        // 旧 clamp(0.001~0.999) 会把点坐标(如 417)压成 0.999 → 落左上角。
-                        // 改为点范围安全钳制。
+                        double W = 834, H = 1194;
+                        sscanf(line + 5, "%lf %lf %lld %lf %lf", &x, &y, &ms, &W, &H);
+                        // v2.8.2：x/y 为【点坐标】（SB 按竖屏基准尺寸换算），钳制到点范围。
                         if (x < 0) x = 0; if (x > 4096) x = 4096;
                         if (y < 0) y = 0; if (y > 4096) y = 4096;
                         if (ms < 5) ms = 5;
-                        FTDLogFmt("cmd: start @(%.1f,%.1f) ms=%lld (captured=%d)",
-                                  x, y, (long long)ms, g_captured ? 1 : 0);
+                        if (W > 0) g_screenW = W;
+                        if (H > 0) g_screenH = H;
+                        FTDLogFmt("cmd: start @(%.1f,%.1f) ms=%lld sender=%llu client=%p",
+                                  x, y, (long long)ms, (unsigned long long)g_senderID,
+                                  (void *)g_client);
                         FTStart(x, y, (int64_t)ms);
                     } else if (strncmp(line, "stop", 4) == 0) {
                         FTDLog("cmd: stop");
@@ -746,7 +787,15 @@ static void *FTInitThread(void *ctx) {
     sleep(4);                                  // 等 backboardd 完全就绪
     FTDLogFmt("init thread start, stage=%d", g_stage);
 
-    if (g_stage >= 1) { if (!FTLoadSymbols())   goto done; }
+    if (g_stage >= 1) {
+        if (!FTLoadSymbols()) goto done;
+        // HID 事件系统客户端：高频注入通道（ZXTouch 验证）。创建失败则 FTInject 退化 re-feed。
+        if (p_ClientCreate) g_client = p_ClientCreate(kCFAllocatorDefault);
+        else if (p_ClientCreateWithType) g_client = p_ClientCreateWithType(kCFAllocatorDefault, 1);
+        FTDLogFmt("hid client=%p (create=%p createWithType=%p dispatch=%p)",
+                  (void *)g_client, (void *)p_ClientCreate, (void *)p_ClientCreateWithType,
+                  (void *)p_DispatchEvent);
+    }
     if (g_stage >= 2) { if (!FTLocateCallback()) goto done; }
     if (g_stage >= 3) { if (!FTInstallHook())    goto done; }
     if (g_stage >= 5) {
@@ -759,8 +808,8 @@ static void *FTInitThread(void *ctx) {
     // hook 命中体检：5 秒后若一次都没进回调，说明这个符号根本不在触摸路径上
     if (g_stage >= 3) {
         sleep(5);
-        FTDLogFmt("hook hits after 5s = %lu  (captured=%d, origOK=%d)",
-                  g_hits, g_captured ? 1 : 0, g_origOK ? 1 : 0);
+        FTDLogFmt("hook hits after 5s = %lu  (captured=%d, senderID=%llu, origOK=%d)",
+                  g_hits, g_captured ? 1 : 0, (unsigned long long)g_senderID, g_origOK ? 1 : 0);
         if (g_hits == 0)
             FTDLog("⚠️ 命中 0 次：hook 目标不在触摸事件路径上（不崩但无效），需换符号。"
                    " 提示：屏幕上真实点几下再看这行。");
@@ -782,8 +831,8 @@ done:
     }
 
     FTWriteGuard(g_stage, 0);
-    FTDLogFmt("SURVIVED -> stage %d marked SAFE (hits=%lu captured=%d origOK=%d)",
-              g_stage, g_hits, g_captured ? 1 : 0, g_origOK ? 1 : 0);
+    FTDLogFmt("SURVIVED -> stage %d marked SAFE (hits=%lu captured=%d senderID=%llu origOK=%d)",
+              g_stage, g_hits, g_captured ? 1 : 0, (unsigned long long)g_senderID, g_origOK ? 1 : 0);
     return NULL;
 }
 

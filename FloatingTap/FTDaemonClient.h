@@ -19,8 +19,9 @@ int FTDaemonPing(void);
 // 返回 1 = 已尝试 spawn（需再 ping 验证）；0 = spawn 失败/二进制不存在。
 int FTDaemonSpawn(void);
 
-// 开始连点：坐标归一化 0~1，intervalMs 毫秒间隔（>5ms）
-void FTDaemonStartClicking(double nx, double ny, double intervalMs);
+// 开始连点：坐标点坐标（SB 已按竖屏基准尺寸换算），intervalMs 毫秒间隔（>5ms），
+// sw/sh = 竖屏基准屏幕尺寸（供 backboardd 把点坐标归一化为 HID 0~1 坐标）
+void FTDaemonStartClicking(double nx, double ny, double intervalMs, double sw, double sh);
 
 // 停止连点
 void FTDaemonStopClicking(void);

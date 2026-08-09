@@ -860,7 +860,7 @@ static void FTStartClicking(void) {
         // v2.8.2：坐标换算成【点坐标】再发——backboardd 的 FTCreateEvent 把 x/y 直接当
         // IOHID 手指点坐标用；gClickLockX/Y 是归一化(0~1)，不换算会落在屏幕左上角(0.5,0.66)px。
         // 竖屏基准 gScreenW/H（834×1194）与 IOHID digitizer 归一化基准一致（ctor 已实锤）。
-        FTDaemonStartClicking(gClickLockX * gScreenW, gClickLockY * gScreenH, ms);
+        FTDaemonStartClicking(gClickLockX * gScreenW, gClickLockY * gScreenH, ms, gScreenW, gScreenH);
         FTApplyGRModes();
         FTLog("clicking started via backboard");
         return;
@@ -1202,31 +1202,10 @@ static void FTApplyClickPointAppearance(void) {
 }
 
 // v2.8.5：连击模式下「点击点」= 球正下方紧贴处——佳影式「按住球即在球那一带连点」。
-// 关键修正（v2.8.4 踩坑）：点击点【不能】落在球正中心！球 userInteractionEnabled=YES 是触发区，
-// 注入点击落在球 frame 内会被球自己拦截、到不了下层 App → 依旧「没效果」。故点击点必须落到球之外、
-// 由 userInteractionEnabled=NO 的绿圈承载（绿圈不拦截、触摸穿透到 App）。这里取球正下方
-// 球半径+8pt 处（紧贴球底），绿圈在此显示，用户把球拖到按钮上方即可命中。
-// 球贴屏幕底时点击点翻到球上方，避免出屏；拖动模式/已加载配置时跳过（保留独立定位）。
-static void FTSyncClickPointToBall(void) {
-    if (gDragMode || gCfgLoaded || !gBallView || !gClickPointView) return;
-    if (gScreenW <= 0 || gScreenH <= 0) return;
-    CGRect bf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
-    double cx = bf.origin.x + bf.size.width  * 0.5;
-    double cy = bf.origin.y + bf.size.height * 0.5;
-    double offset = bf.size.height * 0.5 + 8.0; // 球半径 + 8pt 间距，确保脱离球体命中区
-    double px = cx;
-    double py = cy + offset;
-    if (py > gScreenH - 4) py = cy - offset; // 球贴底：点击点翻到球上方
-    if (py < 4) py = 4;
-    gClickLockX = px / gScreenW;
-    gClickLockY = py / gScreenH;
-    if (gClickLockX < 0.001) gClickLockX = 0.001; if (gClickLockX > 0.999) gClickLockX = 0.999;
-    if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
-    CGRect mf = ((Msg_Frame)objc_msgSend)(gClickPointView, sel_registerName("frame"));
-    double m = (mf.size.width > 0) ? mf.size.width : 30.0;
-    ((Msg_SetFrame)objc_msgSend)(gClickPointView, sel_registerName("setFrame:"),
-        CGRectMake(px - m / 2, py - m / 2, m, m));
-}
+// v2.8.6：点击点与蓝圈【独立】（佳影式设计）。位置由用户在红色拖动模式里把绿圈拖到目标、
+// 或由 App 配置设定；连击模式下绝不自动吸附到球——否则用户摆好的点击点会在按住蓝圈时
+// 被强行拉回球上，导致「点了球而不是目标」。绿圈 userInteractionEnabled=NO，触摸穿透到下层 App。
+
 
 // v1.0.73：按下球 120ms 后的延时计时器回调——静止按住时 iOS 不投递 Moved/Stationary 事件，
 // 不能靠它们触发连点，改用此计时器。到时若手指仍按着（gBallTouch 未清空 = 同一根手指没抬起）
@@ -1245,8 +1224,7 @@ static void FTBallHoldTimer(void *ctx) {
         // 故 backboardd 可用时直接走，彻底绕开遗留探针；仅当 backboardd 不可用时才兜底走旧探针。
         if (FTDaemonProbe() == 1 || g_LockedSID != 0) {
             gBallTouchClicking = YES;
-            FTSyncClickPointToBall(); // v2.8.4：连击模式点击点=球心（按住球即在球位置连点）
-            FTStartClicking();
+            FTStartClicking();   // 点击点沿用用户在拖动模式里摆好的独立位置（佳影式）
         } else {
             FTStartProbing(); // 仅 backboardd 不可用时兜底：探测校准有效 SID（球变橙色）
         }
@@ -1720,7 +1698,6 @@ static void FTGRTapHandler(id self, SEL _cmd, id gr) {
         FTApplyGRModes();
         FTApplyBallAppearance();
         FTApplyClickPointAppearance();
-        FTSyncClickPointToBall(); // v2.8.4：切回连击模式时绿圈/点击点回到球心
         FTLog(gDragMode ? "double tap -> drag mode ON (red): drag ball / click-point to position" : "double tap -> combo mode ON (blue)");
     }
 }
@@ -1942,12 +1919,11 @@ static void FTSetupBall(void) {
     CGFloat d = 56.0;
     CGRect ballFrame = CGRectMake(gScreenW / 2 - d / 2, gScreenH / 2 - d / 2, d, d);
     // ⚠️ v1.0.116 历史：旧 SID 探测路径要求点击点与球分离（注入到球上会被拦截 → 零送达）。
-    // v2.8.5：连击模式点击点=球正下方紧贴处（FTSyncClickPointToBall 在 setup 末尾/按住时同步）。
-    // 注：点击点绝不可落在球正中心——球 userInteractionEnabled=YES 会拦截注入触摸（见 FTSyncClickPointToBall 注释）。
-    // 此处仅作无配置时的初值；连击模式会被 FTSyncClickPointToBall 覆盖为球下方偏移点。
+    // v2.8.6：点击点独立初值（佳影式）。无配置时落在屏幕中心偏下，与初始蓝圈分离、可见可拖；
+    // 用户在红色拖动模式里把它拖到目标按钮即可。连击模式绝不自动吸附到球。
     if (!gCfgLoaded) {
         gClickLockX = 0.5;
-        gClickLockY = 0.5; // 初值=屏幕中心=球初始位置（连击模式随即同步到球下方偏移点）
+        gClickLockY = 0.66; // 屏幕中心偏下，与初始蓝圈分离（避免被球盖住）
     }
 
     // v1.0.60：球必须挂到 _UISystemGestureWindow（系统手势层，始终在所有 App 之上），
@@ -2131,8 +2107,6 @@ static void FTSetupBall(void) {
 
     // v1.0.50：球创建后立即按 App 配置定位（若已加载配置）
     FTMoveBallToConfig();
-    // v2.8.4：连击模式点击点跟随球心（绿圈初始就坐在球上）
-    FTSyncClickPointToBall();
 }
 
 // v1.0.50：移动球到 App 配置位置（球心 = 配置点击点；未加载配置则居中不动）
@@ -2485,14 +2459,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.136 loaded (return-ratio eviction - enders <50%% return, stable >90%%; residual rebuild-ctx; v2.8.5 click-point below ball to avoid ball intercept)");
+    syslog(LOG_ERR, "FloatingTap v1.0.137 loaded (v2.8.6: inject sets hardware digitizer senderID + normalized 0..1 coords + IOHIDEventSystemClientDispatchEvent; click-point independent of ball)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.136 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; return-ratio eviction; v2.8.5 click-point below ball to avoid ball intercept)\n");
+            fprintf(mk, "FloatingTap v1.0.137 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; v2.8.6 senderID + normalized + client dispatch)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");

@@ -13,7 +13,7 @@
 //    读 /tmp/floatingtap_bbok      写 "1"（就绪标记，供 SB 探活）
 //
 //  命令文件一行一条：
-//    "start x y ms\n"   开始连点（x/y = 屏幕【点坐标】，由 SB 用竖屏基准尺寸换算好；ms 间隔）
+//    "start x y ms W H\n"   开始连点（x/y = 屏幕【点坐标】；W/H = 竖屏基准尺寸，供 backboardd 归一化坐标）
 //    "stop\n"           停止连点
 //    "tap x y\n"        单次 tap（诊断，x/y 同为此前点坐标）
 //
@@ -61,9 +61,9 @@ static void FTDSendCmd(const char *cmd) {
     notify_post(g_notifyName);
 }
 
-void FTDaemonStartClicking(double nx, double ny, double intervalMs) {
-    char line[128];
-    snprintf(line, sizeof(line), "start %.4f %.4f %d\n", nx, ny, (int)intervalMs);
+void FTDaemonStartClicking(double nx, double ny, double intervalMs, double sw, double sh) {
+    char line[160];
+    snprintf(line, sizeof(line), "start %.4f %.4f %d %.1f %.1f\n", nx, ny, (int)intervalMs, sw, sh);
     FTDSendCmd(line);
 }
 
