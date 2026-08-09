@@ -199,10 +199,6 @@ static uint32_t (*p_GetType)(FT_IOHIDEventRef);
 static void     (*p_SetSenderID)(FT_IOHIDEventRef, uint64_t);
 static uint64_t  (*p_GetSenderID)(FT_IOHIDEventRef);
 static CFTypeRef (*p_ServiceGetProperty)(void *, CFStringRef); // IOHIDServiceGetProperty（读 digitizer 硬件 SID）
-typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
-static IOHIDEventSystemClientRef (*p_ClientCreate)(CFAllocatorRef);
-static IOHIDEventSystemClientRef (*p_ClientCreateWithType)(CFAllocatorRef, uint32_t);
-static void (*p_DispatchEvent)(IOHIDEventSystemClientRef, FT_IOHIDEventRef);
 
 // MARK: - 状态
 
@@ -226,7 +222,6 @@ static void *g_refcon = NULL;
 static FT_IOHIDServiceRef g_service = NULL;
 static volatile bool g_captured = false;
 static uint64_t g_senderID = 0;                      // 真实触摸捕获的硬件 digitizer senderID（iOS 必需，否则事件被静默丢弃）
-static IOHIDEventSystemClientRef g_client = NULL;    // HID 事件系统客户端（高频注入通道，优先于 re-feed）
 static double g_screenW = 834.0, g_screenH = 1194.0; // 竖屏基准，SB 侧 start 命令传入
 
 static pthread_mutex_t g_injectLock = PTHREAD_MUTEX_INITIALIZER;
@@ -462,19 +457,18 @@ static bool FTLoadSymbols(void) {
     p_GetType         = (uint32_t (*)(FT_IOHIDEventRef))dlsym(h, "IOHIDEventGetType");
     p_SetSenderID     = (void (*)(FT_IOHIDEventRef, uint64_t))dlsym(h, "IOHIDEventSetSenderID");
     p_GetSenderID     = (uint64_t (*)(FT_IOHIDEventRef))dlsym(h, "IOHIDEventGetSenderID");
-    p_ClientCreate    = (IOHIDEventSystemClientRef (*)(CFAllocatorRef))dlsym(h, "IOHIDEventSystemClientCreate");
-    p_ClientCreateWithType = (IOHIDEventSystemClientRef (*)(CFAllocatorRef, uint32_t))dlsym(h, "IOHIDEventSystemClientCreateWithType");
-    p_DispatchEvent   = (void (*)(IOHIDEventSystemClientRef, FT_IOHIDEventRef))dlsym(h, "IOHIDEventSystemClientDispatchEvent");
     p_ServiceGetProperty = (CFTypeRef (*)(void *, CFStringRef))dlsym(h, "IOHIDServiceGetProperty");
 
-    // 事件创建 + senderID 打标是注入必需；HID 客户端为可选项（缺失时退化 re-feed 原始回调）。
+    // 事件创建 + senderID 打标是注入必需；HID 客户端【故意不】在 backboardd 内加载/使用
+    // （v2.2 实锤：backboardd 是 HID 服务端，内部 ClientCreate+DispatchEvent 自连 → 死锁/黑屏）。
+    // 注入走 re-feed 原始回调（与真实触摸同管线），senderID 由 SB 经命令推入。
     g_symOK = (p_CreateDigitizerEvent && p_CreateFingerEvent && p_AppendEvent && p_GetType
                && p_SetSenderID && p_GetSenderID);
-    FTDLogFmt("symbols: digi=%p finger=%p append=%p setInt=%p setFlt=%p getType=%p setSID=%p getSID=%p svcProp=%p client=%p disp=%p => %s",
+    FTDLogFmt("symbols: digi=%p finger=%p append=%p setInt=%p setFlt=%p getType=%p setSID=%p getSID=%p svcProp=%p => %s",
               (void *)p_CreateDigitizerEvent, (void *)p_CreateFingerEvent, (void *)p_AppendEvent,
               (void *)p_SetIntegerValue, (void *)p_SetFloatValue, (void *)p_GetType,
               (void *)p_SetSenderID, (void *)p_GetSenderID, (void *)p_ServiceGetProperty,
-              (void *)p_ClientCreate, (void *)p_DispatchEvent, g_symOK ? "OK" : "FAILED");
+              g_symOK ? "OK" : "FAILED");
     return g_symOK;
 }
 
