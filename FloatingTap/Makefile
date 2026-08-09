@@ -10,7 +10,7 @@ export ARCHS = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = FloatingTap
+TWEAK_NAME = FloatingTap BackboardSafeProbe
 
 # FloatingTap：SB 侧悬浮球 + 连点（UI/交互 + 连点引擎，纯 SB 注入）
 # ⚠️ v2.1 回退：BackboardInject（注入 backboardd）已移除——实测黑屏
@@ -22,5 +22,14 @@ FloatingTap_FILES = Tweak.xm HIDInject.c
 FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 FloatingTap_FRAMEWORKS = UIKit CoreGraphics
 FloatingTap_LDFLAGS = -lz
+
+# BackboardSafeProbe：backboardd 注入【加载安全】最小验证 dylib
+# ⚠️ 只测「ellekit 加载 backboardd dylib 本身是否黑屏」——constructor 只写日志，
+# 零 API 调用。装上重启后看 /tmp/bb_safe_probe.log：
+#   有 ctor 行 = 加载安全 → 下一步做佳影式服务回调注入；
+#   黑屏 = 加载环节就崩 → backboardd 注入路线彻底放弃。
+# 本文件必须与 FloatingTap 同 deb 打包（当前无功能冲突），黑屏时 Sileo 整体卸载。
+BackboardSafeProbe_FILES = BackboardSafeProbe.c
+BackboardSafeProbe_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 
 include $(THEOS_MAKE_PATH)/tweak.mk
