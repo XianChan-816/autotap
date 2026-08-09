@@ -120,6 +120,9 @@
 #include <time.h>
 #include <mach/mach_time.h>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
 #include <CoreFoundation/CoreFoundation.h>
 #if __has_include(<ptrauth.h>)
 #include <ptrauth.h>
@@ -196,6 +199,26 @@ static void (*p_SetIntegerValue)(FT_IOHIDEventRef, uint32_t, int64_t);
 static void (*p_SetFloatValue)(FT_IOHIDEventRef, uint32_t, double);
 static void (*p_AppendEvent)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits);
 static uint32_t (*p_GetType)(FT_IOHIDEventRef);
+// v2.9 新增：读【真实事件】用（纯只读，热路径安全，无分配）
+static CFArrayRef (*p_GetChildren)(FT_IOHIDEventRef);
+static int64_t    (*p_GetIntegerValue)(FT_IOHIDEventRef, uint32_t);
+static double     (*p_GetFloatValue)(FT_IOHIDEventRef, uint32_t);
+
+// MARK: - digitizer 字段号（IOHIDEventTypes.h 标准枚举：(type<<16)|offset，type=0x0B）
+#define FTF_X       0x0B0000
+#define FTF_Y       0x0B0001
+#define FTF_Z       0x0B0002
+#define FTF_BTNMASK 0x0B0003
+#define FTF_TYPE    0x0B0004
+#define FTF_INDEX   0x0B0005
+#define FTF_IDENT   0x0B0006
+#define FTF_MASK    0x0B0007
+#define FTF_RANGE   0x0B0008
+#define FTF_TOUCH   0x0B0009
+#define FTF_TILTX   0x0B000D      // v1 代码当作 X 写过（实为 TiltX，写了无害）
+#define FTF_TILTY   0x0B000E
+#define FTF_MAJORR  0x0B0014
+#define FTF_MINORR  0x0B0015
 
 // MARK: - 状态
 
@@ -225,6 +248,32 @@ static double g_tx = 0.5, g_ty = 0.5;
 static int64_t g_ms = 12;
 static volatile bool g_clickRun = false;
 static pthread_t g_clickTh;
+
+// MARK: - v2.9 真实手指快照（解决「注入即顶掉用户手指」）
+//
+// 根因：digitizer 父事件是【整只手的完整状态快照】。v1/v2 造的父事件下面只挂一根
+// 合成手指，下游 touch 状态机读到就理解成"屏幕上现在只有这一根手指"，于是把用户
+// 真按着的那根判定为抬起 → SB 收到 touchesEnded → 连点 0.1 秒就停。
+// 这与用 DispatchEvent 还是 origCall 无关 —— v1 顶掉、v2 照样顶掉，病根是同一个。
+//
+// 修法：hook 回调里持续记录"当前仍按在屏幕上的真实手指"，注入时先把它们原样复刻
+// 进父事件（eventMask=0 表示本帧无变化），再挂合成手指。下游看到的是
+// "真实手指还在 + 多了一根"，就不会判定抬起。
+//
+// 并发模型：单写者（hook 回调）+ 单读者（连点线程），故【不加锁】——热路径禁止
+// 任何可能阻塞的调用；读到略微陈旧的坐标无害（复刻时本就标记为未变化）。
+#define FT_MAXREAL 10
+static volatile uint32_t g_realIdx[FT_MAXREAL];
+static volatile double   g_realX[FT_MAXREAL];
+static volatile double   g_realY[FT_MAXREAL];
+static volatile int      g_realN = 0;         // 当前活跃真实手指数
+static volatile int      g_realSeen = 0;      // 是否曾成功解析到真实手指（诊断用）
+
+// 一次性字段快照：热路径只写全局，由命令线程打印（回调内严禁 fopen）
+static volatile int    g_dumpReady = 0;       // 0=未采 1=已采待打 2=已打
+static volatile int    g_dumpNKids = 0;
+static volatile long   g_dumpPInt[10], g_dumpCInt[10];
+static volatile double g_dumpPFlt[6],  g_dumpCFlt[6];
 
 // MARK: - 日志
 
@@ -450,13 +499,108 @@ static bool FTLoadSymbols(void) {
     p_SetFloatValue   = (void (*)(FT_IOHIDEventRef, uint32_t, double))dlsym(h, "IOHIDEventSetFloatValue");
     p_AppendEvent     = (void (*)(FT_IOHIDEventRef, FT_IOHIDEventRef, FT_IOOptionBits))dlsym(h, "IOHIDEventAppendEvent");
     p_GetType         = (uint32_t (*)(FT_IOHIDEventRef))dlsym(h, "IOHIDEventGetType");
+    // v2.9：读真实事件用。缺了不影响 stage<=5，只会让 stage 6 的手指共存降级。
+    p_GetChildren     = (CFArrayRef (*)(FT_IOHIDEventRef))dlsym(h, "IOHIDEventGetChildren");
+    p_GetIntegerValue = (int64_t (*)(FT_IOHIDEventRef, uint32_t))dlsym(h, "IOHIDEventGetIntegerValue");
+    p_GetFloatValue   = (double (*)(FT_IOHIDEventRef, uint32_t))dlsym(h, "IOHIDEventGetFloatValue");
 
     g_symOK = (p_CreateDigitizerEvent && p_CreateFingerEvent && p_AppendEvent && p_GetType);
     FTDLogFmt("symbols: digi=%p finger=%p append=%p setInt=%p setFlt=%p getType=%p => %s",
               (void *)p_CreateDigitizerEvent, (void *)p_CreateFingerEvent, (void *)p_AppendEvent,
               (void *)p_SetIntegerValue, (void *)p_SetFloatValue, (void *)p_GetType,
               g_symOK ? "OK" : "FAILED");
+    FTDLogFmt("symbols v2.9(read): children=%p getInt=%p getFlt=%p => %s",
+              (void *)p_GetChildren, (void *)p_GetIntegerValue, (void *)p_GetFloatValue,
+              (p_GetChildren && p_GetIntegerValue && p_GetFloatValue) ? "OK(手指共存可用)"
+                                                                      : "MISSING(stage6 将降级)");
     return g_symOK;
+}
+
+// MARK: - 自解析符号表（替代 MSFindSymbol，ellekit 不导出 MS* 时可用）
+
+// Dopamine+ellekit 环境下：
+//   · dlsym(RTLD_DEFAULT, "___IOHIDServiceEventCallback") 查不到 —— 它是 IOKit 的【私有符号】，
+//     不在动态导出表里（IMPORT 表里没有，只有 LC_SYMTAB 静态符号表里有）。
+//   · MSFindSymbol 能读到它，但 ellekit 不导出 MSFindSymbol/MSGetImageByName。
+// 因此自己用 dyld 遍历已加载 image，解析目标 image 的 LC_SYMTAB，
+// 在 nlist 里按名匹配 -> 得到带 preferred-vmaddr 的 n_value，加 slide 即为运行时地址。
+// 这正是 MSFindSymbol 内部做的事，纯内存读取，安全。
+static void *FTFindSymbolDyld(const char *imgSubstr, const char *symName) {
+    int n = (int)_dyld_image_count();
+    FTDLogFmt("dyld-symtab: scan %d images (substr=%s sym=%s)", n, imgSubstr, symName);
+    for (int i = 0; i < n; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, imgSubstr)) continue;
+        FTDLogFmt("dyld-symtab: hit i=%d name=%s", i, name);
+
+        const struct mach_header_64 *hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!hdr || hdr->magic != MH_MAGIC_64) continue;
+        uintptr_t base = (uintptr_t)hdr;
+        int64_t  slide = _dyld_get_image_vmaddr_slide(i);
+
+        // 遍历 load commands 找 LC_SYMTAB 与 __LINKEDIT 段（用于正确计算符号表运行时地址）
+        uintptr_t lcLimit = base + sizeof(struct mach_header_64) + hdr->sizeofcmds;
+        const struct load_command *lc = (const struct load_command *)(base + sizeof(struct mach_header_64));
+        struct symtab_command symtab = {0};
+        struct segment_command_64 segLE = {0};
+        bool foundSym = false, foundLE = false;
+        for (uint32_t j = 0; j < hdr->ncmds; j++) {
+            if ((uintptr_t)lc < base || (uintptr_t)lc + sizeof(*lc) > lcLimit) break;   // 越界保护
+            if (lc->cmdsize < sizeof(struct load_command)) break;                        // 损坏保护，防死循环
+            if (lc->cmd == LC_SYMTAB) { symtab = *(const struct symtab_command *)lc; foundSym = true; }
+            else if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+                if (strcmp(seg->segname, "__LINKEDIT") == 0) { segLE = *seg; foundLE = true; }
+            }
+            lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+        }
+        FTDLogFmt("dyld-symtab: image[%d] %s foundSym=%d foundLE=%d ncmds=%u",
+                  i, name, foundSym, foundLE, hdr->ncmds);
+        if (!foundSym || !foundLE) {
+            FTDLogFmt("dyld-symtab: image[%d] %s skipped (no symtab/linkedit)", i, name);
+            continue;
+        }
+        if (symtab.nsyms == 0 || symtab.symoff == 0 || symtab.stroff == 0 || symtab.strsize == 0) {
+            FTDLogFmt("dyld-symtab: image[%d] %s skipped (empty symtab nsyms=%u)", i, name, symtab.nsyms);
+            continue;
+        }
+
+        // 符号表运行时基址 = 镜像基址 + (__LINKEDIT.vmaddr - __LINKEDIT.fileoff)
+        uintptr_t linkedit_base = base + segLE.vmaddr - segLE.fileoff;
+        // 边界保护：符号表/字符串表必须落在 __LINKEDIT 文件范围内，越界则跳过该 image（绝不裸访问）
+        if (symtab.symoff < segLE.fileoff ||
+            symtab.symoff + (uintptr_t)symtab.nsyms * sizeof(struct nlist_64) > segLE.fileoff + segLE.filesize) {
+            FTDLogFmt("dyld-symtab: image[%d] %s skipped (symtab range)", i, name);
+            continue;
+        }
+        if (symtab.stroff < segLE.fileoff ||
+            symtab.stroff + symtab.strsize > segLE.fileoff + segLE.filesize) {
+            FTDLogFmt("dyld-symtab: image[%d] %s skipped (strtab range)", i, name);
+            continue;
+        }
+
+        const struct nlist_64 *syms = (const struct nlist_64 *)(linkedit_base + symtab.symoff);
+        const char *strs = (const char *)(linkedit_base + symtab.stroff);
+
+        for (uint32_t k = 0; k < symtab.nsyms; k++) {
+            uint8_t type = syms[k].n_type;
+            if (type & N_STAB) continue;                       // 调试符号
+            if ((type & N_TYPE) != N_SECT) continue;           // 只取已定义段内符号
+            if (syms[k].n_value == 0) continue;
+            int32_t strx = syms[k].n_un.n_strx;
+            if (strx <= 0 || (uint32_t)strx >= symtab.strsize) continue;
+            const char *s = strs + strx;
+            if (s[0] == '\0') continue;
+            if (strcmp(s, symName) == 0) {
+                FTDLogFmt("dyld-symtab: hit k=%u sym=%s n_value=%p +slide=%p",
+                          k, symName, (void*)syms[k].n_value,
+                          (void*)((uintptr_t)syms[k].n_value + (uintptr_t)slide));
+                return (void *)((uintptr_t)syms[k].n_value + (uintptr_t)slide);  // n_value 是未 slide 的 vm 地址
+            }
+        }
+    }
+    FTDLog("dyld-symtab: symbol NOT FOUND in any IOKit image");
+    return NULL;
 }
 
 // MARK: - 定位 ___IOHIDServiceEventCallback（stage >= 2）
@@ -464,41 +608,136 @@ static bool FTLoadSymbols(void) {
 static bool FTLocateCallback(void) {
     if (g_cbAddr) return true;
 
+    // 符号解析分两条路：
+    //  · app 进程（SpringBoard）：ellekit 已把 unmangled MS* 注册进 RTLD_DEFAULT 全局表，
+    //    dlsym(RTLD_DEFAULT) 直接成功。
+    //  · daemon 进程（backboardd）：ellekit 不注册全局别名，且 libellekit 文件级导出的是
+    //    C++ mangled 名（MSFindSymbolySVSgAC_ACtF 等）。所以必须从 libellekit 的 dlopen
+    //    handle 上按 unmangled + mangled 候选名逐一试取。
+    // 之前用 extern 编译期链接会 link failed（libellekit 不导出 unmangled 给链接器）。
     FT_MSGetImageByName fGetImage = (FT_MSGetImageByName)dlsym(RTLD_DEFAULT, "MSGetImageByName");
     FT_MSFindSymbol     fFindSym  = (FT_MSFindSymbol)dlsym(RTLD_DEFAULT, "MSFindSymbol");
     if (!fGetImage || !fFindSym) {
-        // 路径不带 /var/jb：运行时自动前缀 jbroot（写了反而变 <jbroot>/var/jb/... 死角）
-        const char *libs[] = { "/usr/lib/libellekit.dylib",
-                               "/usr/lib/libsubstrate.dylib", NULL };
-        for (int i = 0; libs[i] && (!fGetImage || !fFindSym); i++) {
-            void *lh = dlopen(libs[i], RTLD_LAZY);
-            if (!lh) continue;
-            if (!fGetImage) fGetImage = (FT_MSGetImageByName)dlsym(lh, "MSGetImageByName");
-            if (!fFindSym)  fFindSym  = (FT_MSFindSymbol)dlsym(lh, "MSFindSymbol");
+        // backboardd 的 /usr/lib 视图与 SSH 不同（rootless 隔离），固定路径 dlopen 报
+        // "no such file"。但本 dylib 已依赖 libellekit 且被成功加载，说明它就在已加载
+        // 镜像里。改为遍历已加载镜像，收集 libellekit/substrate 在【本进程视图】的真实
+        // 路径，再 dlopen 该路径（与 SB 进程用 RTLD_DEFAULT 等价，只是 daemon 要走 handle）。
+        // v2.8.10 诊断：先穷举所有含关键字的已加载镜像名，确认真实路径。
+        int nimg = (int)_dyld_image_count();
+        for (int i = 0; i < nimg; i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (!nm) continue;
+            if (strstr(nm, "ellekit") || strstr(nm, "substrate") ||
+                strstr(nm, "TweakInject") || strstr(nm, "AutoPatch") ||
+                strstr(nm, "roothide") || strstr(nm, "jbroot")) {
+                FTDLogFmt("loaded-img[%d] %s", i, nm);
+            }
         }
-    }
-    if (!fGetImage || !fFindSym) { FTDLog("MSGetImageByName/MSFindSymbol NOT FOUND"); return false; }
-
-    const char *images[] = { "/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit",
-                             "/System/Library/Frameworks/IOKit.framework/IOKit",
-                             "/usr/lib/libIOKit.dylib", NULL };
-    const char *names[]  = { "___IOHIDServiceEventCallback",
-                             "__IOHIDServiceEventCallback",
-                             "_IOHIDServiceEventCallback", NULL };
-    FTDLogFmt("MS api: getImage=%p findSym=%p", (void *)fGetImage, (void *)fFindSym);
-    for (int i = 0; images[i] && !g_cbRaw; i++) {
-        void *img = fGetImage(images[i]);
-        FTDLogFmt("image[%d] %s => %p", i, images[i], img);
-        if (!img) continue;
-        for (int j = 0; names[j] && !g_cbRaw; j++) {
-            void *sym = fFindSym(img, names[j]);
-            if (sym) {
-                g_cbRaw = sym;
-                FTDLogFmt("MSFindSymbol %s => raw %p (image=%s)", names[j], sym, images[i]);
+        const char *libs[12]; int nl = 0;
+        libs[nl++] = "/usr/lib/libellekit.dylib";
+        libs[nl++] = "/var/jb/usr/lib/libellekit.dylib";
+        libs[nl++] = "/usr/lib/libsubstrate.dylib";
+        for (int i = 0; i < nimg && nl < 11; i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (!nm) continue;
+            if (strstr(nm, "libellekit") || strstr(nm, "libsubstrate") || strstr(nm, "libroothide")) {
+                bool dup = false;
+                for (int k = 0; k < nl; k++) if (libs[k] && strcmp(libs[k], nm) == 0) { dup = true; break; }
+                if (!dup) libs[nl++] = nm;
+            }
+        }
+        // roothide 把 libellekit 重定向为 libroothide 加载，但真实 MS 符号在 jbroot 下与
+        // libroothide 同目录的 libellekit.dylib 里。从已加载 libroothide 路径推导同目录
+        // libellekit.dylib 一并尝试 dlopen。
+        for (int i = 0; i < nl; i++) {
+            if (libs[i] && strstr(libs[i], "libroothide")) {
+                const char *sl = strrchr(libs[i], '/');
+                if (sl) {
+                    int pre = (int)(sl - libs[i]) + 1;
+                    static char buf[1024];
+                    if (pre > 0 && pre + 16 < (int)sizeof(buf)) {
+                        memcpy(buf, libs[i], pre);
+                        strcpy(buf + pre, "libellekit.dylib");
+                        bool dup = false;
+                        for (int k = 0; k < nl; k++) if (libs[k] && strcmp(libs[k], buf) == 0) { dup = true; break; }
+                        if (!dup && nl < 11) libs[nl++] = buf;
+                    }
+                }
+            }
+        }
+        libs[nl] = NULL;
+        const char *gn[] = { "MSGetImageByName", "MSGetImageByNameySVSgSVF", NULL };
+        const char *fs[] = { "MSFindSymbol", "MSFindSymbolySVSgAC_ACtF", NULL };
+        for (int i = 0; libs[i] && (!fGetImage || !fFindSym); i++) {
+            void *lh = dlopen(libs[i], RTLD_LAZY | RTLD_LOCAL);
+            const char *e = dlerror();
+            FTDLogFmt("dlopen[%d] %s -> lh=%p dlerror=%s", i, libs[i], lh, e ? e : "(none)");
+            if (!lh) continue;
+            if (!fGetImage) for (int j = 0; gn[j]; j++) {
+                void *p = dlsym(lh, gn[j]);
+                FTDLogFmt("  dlsym gn[%d]=%s -> %p", j, gn[j], p);
+                if (p) { fGetImage = (FT_MSGetImageByName)p; break; }
+            }
+            if (!fFindSym) for (int j = 0; fs[j]; j++) {
+                void *p = dlsym(lh, fs[j]);
+                FTDLogFmt("  dlsym fs[%d]=%s -> %p", j, fs[j], p);
+                if (p) { fFindSym = (FT_MSFindSymbol)p; break; }
             }
         }
     }
-    if (!g_cbRaw) { FTDLog("___IOHIDServiceEventCallback NOT FOUND"); return false; }
+
+    // 路径 A：substrate / ellekit 导出 MS* 符号 → 走符号表查回调地址
+    FTDLogFmt("MS locate: getImage=%p findSym=%p", (void *)fGetImage, (void *)fFindSym);
+    if (fGetImage && fFindSym) {
+        const char *images[] = { "/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit",
+                                 "/System/Library/Frameworks/IOKit.framework/IOKit",
+                                 "/usr/lib/libIOKit.dylib", NULL };
+        const char *names[]  = { "___IOHIDServiceEventCallback",
+                                 "__IOHIDServiceEventCallback",
+                                 "_IOHIDServiceEventCallback", NULL };
+        FTDLogFmt("MS api: getImage=%p findSym=%p", (void *)fGetImage, (void *)fFindSym);
+        for (int i = 0; images[i] && !g_cbRaw; i++) {
+            void *img = fGetImage(images[i]);
+            FTDLogFmt("image[%d] %s => %p", i, images[i], img);
+            if (!img) continue;
+            for (int j = 0; names[j] && !g_cbRaw; j++) {
+                void *sym = fFindSym(img, names[j]);
+                if (sym) {
+                    g_cbRaw = sym;
+                    FTDLogFmt("MSFindSymbol %s => raw %p (image=%s)", names[j], sym, images[i]);
+                }
+            }
+        }
+    } else {
+        FTDLog("MSGetImageByName/MSFindSymbol NOT FOUND — 改走 dlsym 兜底（ellekit 环境）");
+    }
+
+    // 路径 B（v2.8.3 新增）：ellekit 不导出 MS* 符号时，直接 dlsym 按名取裸地址。
+    // 返回的指针可能带 PAC，交给下方 FTResolvePlain 用 dli_saddr 阶梯剥离。
+    if (!g_cbRaw) {
+        const char *names[] = { "___IOHIDServiceEventCallback",
+                                "__IOHIDServiceEventCallback",
+                                "_IOHIDServiceEventCallback", NULL };
+        for (int i = 0; names[i] && !g_cbRaw; i++) {
+            void *sym = dlsym(RTLD_DEFAULT, names[i]);
+            if (sym) {
+                g_cbRaw = sym;
+                FTDLogFmt("dlsym %s => raw %p", names[i], sym);
+            }
+        }
+    }
+    // 路径 C（v2.8.3 新增）：dlsym 找不到的私有符号，自己解析 IOKit 的 LC_SYMTAB。
+    // 这是 MSFindSymbol 的内部做法，ellekit 不导出 MS* 时唯一可靠的取法。
+    if (!g_cbRaw) {
+        void *sym = FTFindSymbolDyld("IOKit", "___IOHIDServiceEventCallback");
+        if (!sym) sym = FTFindSymbolDyld("IOKit", "__IOHIDServiceEventCallback");
+        if (!sym) sym = FTFindSymbolDyld("IOKit", "_IOHIDServiceEventCallback");
+        if (sym) {
+            g_cbRaw = sym;
+            FTDLogFmt("dyld-symtab ___IOHIDServiceEventCallback => raw %p", sym);
+        }
+    }
+    if (!g_cbRaw) { FTDLog("___IOHIDServiceEventCallback NOT FOUND (MS* / dlsym / dyld-symtab 均失败)"); return false; }
 
     // ---- v2.5：候选阶梯求裸地址（dli_saddr 优先），读不通就不 hook ----
     void *plain = FTResolvePlain(g_cbRaw, "cbAddr");
@@ -509,6 +748,65 @@ static bool FTLocateCallback(void) {
     g_cbAddr = plain;
     FTDLogFmt("callback target LOCKED @ %p  (raw was %p)", g_cbAddr, g_cbRaw);
     return true;
+}
+
+// MARK: - v2.9 真实手指快照（stage >= 6，HID 热路径内执行）
+//
+// 热路径纪律：只做 CF 只读查询 + 写全局数组。
+//   · 零 malloc / 零 fopen / 零 syslog / 零锁
+//   · CFGetTypeID 自校验，绝不裸解引用非数组对象
+//   · 任何一步不可信就整帧放弃（宁可不复刻，也不能崩 backboardd → 黑屏）
+static void FTSnapshotReal(FT_IOHIDEventRef ev) {
+    if (!p_GetChildren || !p_GetIntegerValue || !p_GetFloatValue) return;
+
+    CFArrayRef kids = p_GetChildren(ev);
+    if (!kids) { g_realN = 0; return; }
+    if (CFGetTypeID(kids) != CFArrayGetTypeID()) return;    // 类型自保
+    CFIndex n = CFArrayGetCount(kids);
+    if (n < 0 || n > 32) return;                            // 数量离谱 → 不信
+
+    int out = 0;
+    for (CFIndex i = 0; i < n && out < FT_MAXREAL; i++) {
+        FT_IOHIDEventRef ch = (FT_IOHIDEventRef)CFArrayGetValueAtIndex(kids, i);
+        if (!ch) continue;
+
+        int64_t touch = p_GetIntegerValue(ch, FTF_TOUCH);
+        int64_t range = p_GetIntegerValue(ch, FTF_RANGE);
+        if (!touch && !range) continue;                     // 已抬起 → 不进快照
+
+        double x = p_GetFloatValue(ch, FTF_X);
+        double y = p_GetFloatValue(ch, FTF_Y);
+        if (x <= 0.0 && y <= 0.0) {                         // 主字段读不到 → 退回 v1 用的字段
+            x = p_GetFloatValue(ch, FTF_TILTX);
+            y = p_GetFloatValue(ch, FTF_TILTY);
+        }
+        if (x <= 0.0 && y <= 0.0) continue;                 // 坐标不可信 → 宁可不复刻
+
+        g_realIdx[out] = (uint32_t)p_GetIntegerValue(ch, FTF_INDEX);
+        g_realX[out]   = x;
+        g_realY[out]   = y;
+        out++;
+    }
+    g_realN = out;                                          // 计数最后写：读者绝不会读到半成品
+    if (out > 0) g_realSeen = 1;
+
+    // ---- 一次性字段/坐标空间取证（热路径只写全局，命令线程负责打印）----
+    // 同时回答两个问题：① 各字段号在 iOS 15.5 上的真实含义 ② 坐标是归一化还是点
+    if (g_dumpReady == 0 && n > 0) {
+        FT_IOHIDEventRef c0 = (FT_IOHIDEventRef)CFArrayGetValueAtIndex(kids, 0);
+        for (int f = 0; f < 10; f++) {
+            uint32_t fid = 0x0B0003u + (uint32_t)f;          // 0x0B0003..0x0B000C
+            g_dumpPInt[f] = (long)p_GetIntegerValue(ev, fid);
+            g_dumpCInt[f] = c0 ? (long)p_GetIntegerValue(c0, fid) : 0;
+        }
+        static const uint32_t ff[6] = { FTF_X, FTF_Y, FTF_Z, FTF_TILTX, FTF_TILTY, FTF_MAJORR };
+        for (int f = 0; f < 6; f++) {
+            g_dumpPFlt[f] = p_GetFloatValue(ev, ff[f]);
+            g_dumpCFlt[f] = c0 ? p_GetFloatValue(c0, ff[f]) : 0.0;
+        }
+        g_dumpNKids = (int)n;
+        g_dumpReady = 1;
+    }
 }
 
 // MARK: - Hook 回调（stage >= 3）——捕获真实 digitizer 三件套
@@ -525,12 +823,16 @@ static void FTServiceEventCallbackNew(void *target, void *refcon,
         FTProbe("[cb] gettype\n");
         uint32_t ty = (event && p_GetType) ? p_GetType(event) : 0;
         FTProbe("[cb] gettype ok\n");
-        if (ty == 11 && !g_captured) {
-            g_target  = target;
-            g_refcon  = refcon;
-            g_service = service;
-            g_captured = true;
-            FTProbe("[cb] CAPTURED\n");
+        if (ty == 11) {
+            if (!g_captured) {
+                g_target  = target;
+                g_refcon  = refcon;
+                g_service = service;
+                g_captured = true;
+                FTProbe("[cb] CAPTURED\n");
+            }
+            // v2.9：记录当前仍按在屏幕上的真实手指，供注入时复刻（stage 6 起生效）
+            if (g_stage >= 6) FTSnapshotReal(event);
         }
     }
 
@@ -546,13 +848,53 @@ static void FTServiceEventCallbackNew(void *target, void *refcon,
 static bool FTInstallHook(void) {
     if (g_hooked) return true;
     if (!g_cbAddr) return false;
+    // 同 FTLocateCallback：先从 RTLD_DEFAULT 取（app 进程），失败则从 libellekit handle
+    // 按 unmangled + mangled 候选名取（backboardd 等 daemon 进程）。
     FT_MSHookFunction fHook = (FT_MSHookFunction)dlsym(RTLD_DEFAULT, "MSHookFunction");
     if (!fHook) {
-        const char *libs[] = { "/usr/lib/libellekit.dylib",
-                               "/usr/lib/libsubstrate.dylib", NULL };
+        const char *libs[8]; int nl = 0;
+        libs[nl++] = "/usr/lib/libellekit.dylib";
+        libs[nl++] = "/var/jb/usr/lib/libellekit.dylib";
+        libs[nl++] = "/usr/lib/libsubstrate.dylib";
+        int nimg = (int)_dyld_image_count();
+        for (int i = 0; i < nimg && nl < 7; i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (!nm) continue;
+            if (strstr(nm, "libellekit") || strstr(nm, "libsubstrate") || strstr(nm, "libroothide")) {
+                bool dup = false;
+                for (int k = 0; k < nl; k++) if (libs[k] && strcmp(libs[k], nm) == 0) { dup = true; break; }
+                if (!dup) libs[nl++] = nm;
+            }
+        }
+        // 同 FTLocateCallback：从已加载 libroothide 推导同目录 libellekit.dylib 一并尝试
+        for (int i = 0; i < nl; i++) {
+            if (libs[i] && strstr(libs[i], "libroothide")) {
+                const char *sl = strrchr(libs[i], '/');
+                if (sl) {
+                    int pre = (int)(sl - libs[i]) + 1;
+                    static char buf2[1024];
+                    if (pre > 0 && pre + 16 < (int)sizeof(buf2)) {
+                        memcpy(buf2, libs[i], pre);
+                        strcpy(buf2 + pre, "libellekit.dylib");
+                        bool dup = false;
+                        for (int k = 0; k < nl; k++) if (libs[k] && strcmp(libs[k], buf2) == 0) { dup = true; break; }
+                        if (!dup && nl < 11) libs[nl++] = buf2;
+                    }
+                }
+            }
+        }
+        libs[nl] = NULL;
+        const char *hs[] = { "MSHookFunction", "MSHookFunctionyySv_SvSpySvSgGSgtF", NULL };
         for (int i = 0; libs[i] && !fHook; i++) {
-            void *lh = dlopen(libs[i], RTLD_LAZY);
-            if (lh) fHook = (FT_MSHookFunction)dlsym(lh, "MSHookFunction");
+            void *lh = dlopen(libs[i], RTLD_LAZY | RTLD_LOCAL);
+            const char *e = dlerror();
+            FTDLogFmt("dlopen[hook][%d] %s -> lh=%p dlerror=%s", i, libs[i], lh, e ? e : "(none)");
+            if (!lh) continue;
+            for (int j = 0; hs[j]; j++) {
+                void *p = dlsym(lh, hs[j]);
+                FTDLogFmt("  dlsym hs[%d]=%s -> %p", j, hs[j], p);
+                if (p) { fHook = (FT_MSHookFunction)p; break; }
+            }
         }
     }
     if (!fHook) { FTDLog("MSHookFunction NOT FOUND"); return false; }
@@ -617,13 +959,53 @@ static FT_IOHIDEventRef FTCreateEvent(bool down, double x, double y, uint32_t in
     FT_IOHIDEventRef parent = p_CreateDigitizerEvent(kCFAllocatorDefault, ts, 3, 99, 1, 0, 0,
                                                      0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0);
     if (!parent) { CFRelease(child); return NULL; }
+
+    // ---- v2.9 关键：先把仍按在屏幕上的真实手指复刻进这一帧快照 ----
+    // 不这么做，父事件就等于在宣告"屏幕上只剩合成手指"，用户的手指会被判定抬起。
+    // eventMask=0 表示"这根手指本帧无变化"，range/touch=1 表示"它还在屏幕上"。
+    int realAppended = 0;
+    if (g_stage >= 6) {
+        int rn = g_realN;
+        if (rn > FT_MAXREAL) rn = FT_MAXREAL;
+        for (int i = 0; i < rn; i++) {
+            uint32_t ri = g_realIdx[i];
+            double   rx = g_realX[i], ry = g_realY[i];
+            if (ri == index) continue;                  // 与合成手指撞号 → 让合成的用
+            if (rx <= 0.0 && ry <= 0.0) continue;       // 坐标不可信 → 不复刻
+            FT_IOHIDEventRef rc = p_CreateFingerEvent(kCFAllocatorDefault, ts, ri, 3,
+                                                      0,                  // eventMask=0：本帧无变化
+                                                      rx, ry, 0.0, 0.0, 0.0,
+                                                      1, 1, 0);           // range=1 touch=1：仍在屏幕上
+            if (!rc) continue;
+            if (p_SetFloatValue) {
+                p_SetFloatValue(rc, FTF_MAJORR, 0.04);
+                p_SetFloatValue(rc, FTF_MINORR, 0.04);
+                p_SetFloatValue(rc, FTF_TILTX, rx);
+                p_SetFloatValue(rc, FTF_TILTY, ry);
+            }
+            if (p_SetIntegerValue) {
+                p_SetIntegerValue(rc, 0x0B0007, 0);     // EventMask = 无变化
+                p_SetIntegerValue(rc, 0x0B0006, 1);
+                p_SetIntegerValue(rc, 0x0B0008, 1);
+                p_SetIntegerValue(rc, 0x0B0019, 3);
+                p_SetIntegerValue(rc, 0x0B0017, 1);
+            }
+            p_AppendEvent(parent, rc, 0);
+            CFRelease(rc);
+            realAppended++;
+        }
+    }
+
+    // 父手的 range/touch 是所有子手指的并集：合成手指抬起时，只要还有真实手指按着，
+    // 父事件就必须继续声明"这只手还在触摸"，否则等于把真实手指一起抬了。
+    bool anyTouch = down || (realAppended > 0);
     if (p_SetIntegerValue) {
         p_SetIntegerValue(parent, 0x0B0017, 1);
         p_SetIntegerValue(parent, 0x0B0019, 1);
         p_SetIntegerValue(parent, 0x4, 1);
         p_SetIntegerValue(parent, 0x0B0007, down ? 0x23 : 0x02);
-        p_SetIntegerValue(parent, 0x0B0006, down ? 1 : 0);
-        p_SetIntegerValue(parent, 0x0B0008, down ? 1 : 0);
+        p_SetIntegerValue(parent, 0x0B0006, anyTouch ? 1 : 0);
+        p_SetIntegerValue(parent, 0x0B0008, anyTouch ? 1 : 0);
     }
     p_AppendEvent(parent, child, 0);
     CFRelease(child);
@@ -644,20 +1026,35 @@ static void FTInject(bool down, double x, double y, uint32_t index) {
 
 // MARK: - 连点线程（独立 pthread，绝不碰 backboardd 主线程）
 
+// v2.9：合成手指编号在 2..9 循环，但必须避开真实手指正在占用的编号——
+// 撞号会让复刻逻辑丢掉那根真实手指，等于又把用户顶掉。
+static uint32_t FTNextIndex(uint32_t cur) {
+    for (int t = 0; t < 8; t++) {
+        cur = (cur % 8) + 2;
+        int rn = g_realN;
+        if (rn > FT_MAXREAL) rn = FT_MAXREAL;
+        bool clash = false;
+        for (int i = 0; i < rn; i++) if (g_realIdx[i] == cur) { clash = true; break; }
+        if (!clash) return cur;
+    }
+    return cur;
+}
+
 static void *FTClickThread(void *arg) {
     (void)arg;
     uint32_t idx = 2;
-    FTDLogFmt("click thread start @(%.3f,%.3f) ms=%lld", g_tx, g_ty, (long long)g_ms);
+    FTDLogFmt("click thread start @(%.4f,%.4f) ms=%lld realN=%d",
+              g_tx, g_ty, (long long)g_ms, g_realN);
     while (g_clickRun) {
         double x = g_tx, y = g_ty;
         int64_t ms = g_ms;
         int64_t downMs = ms / 2;
         if (downMs > 12) downMs = 12;
         if (downMs < 2)  downMs = 2;
+        idx = FTNextIndex(idx);
         FTInject(true, x, y, idx);
         usleep((useconds_t)(downMs * 1000));
         FTInject(false, x, y, idx);
-        idx = (idx % 8) + 2;
         int64_t rest = ms - downMs;
         if (rest < 1) rest = 1;
         usleep((useconds_t)(rest * 1000));
@@ -682,6 +1079,18 @@ static void FTStop(void) {
     g_clickRun = false;
 }
 
+// v2.9 关键修正：IOHID digitizer 的坐标是【归一化 0~1】，不是点坐标。
+// v1（HIDInject.c:472，实测能打进游戏）传的就是 x/screenW、y/screenH。
+// v2.8.2 误改成让 SB 发点坐标（如 417,788），backboardd 原样塞进事件 →
+// 归一化空间里 417 远超 1.0 → 合成手指落到屏幕外 → v2 从未打出过一次有效点击。
+// 现改回归一化；同时对"仍在发点坐标的旧 SB"自动折算，避免版本错配又白跑一轮。
+static double FTNormCoord(double v, double base) {
+    if (v > 1.5 && base > 1.0) v /= base;      // 旧版 SB 发的点坐标 → 自愈折算
+    if (v < 0.001) v = 0.001;
+    if (v > 0.999) v = 0.999;
+    return v;
+}
+
 // MARK: - 命令通道（stage 5，Darwin 通知 + 共享文件，零 socket）
 // backboardd 是强沙盒进程，内部 bind AF_UNIX socket 会被沙盒 SIGKILL（v2.7.1 实测黑屏）。
 // 改由 SpringBoard 写命令文件 + notify_post，backboardd 轮询 notify_check 后读文件执行。
@@ -696,6 +1105,7 @@ static void *FTCommandThread(void *arg) {
     if (rf) { fprintf(rf, "1\n"); fclose(rf); }
     FTDLogFmt("notify channel ready (token=%d)", token);
 
+    unsigned tick = 0;
     while (g_stage >= 5) {
         int signalled = 0;
         if (token >= 0) notify_check(token, &signalled);
@@ -707,14 +1117,11 @@ static void *FTCommandThread(void *arg) {
                     if (strncmp(line, "start", 5) == 0) {
                         double x = 0.5, y = 0.5; long long ms = 12;
                         sscanf(line + 5, "%lf %lf %lld", &x, &y, &ms);
-                        // v2.8.2：x/y 现在为【点坐标】（SB 已按竖屏基准尺寸换算），
-                        // 旧 clamp(0.001~0.999) 会把点坐标(如 417)压成 0.999 → 落左上角。
-                        // 改为点范围安全钳制。
-                        if (x < 0) x = 0; if (x > 4096) x = 4096;
-                        if (y < 0) y = 0; if (y > 4096) y = 4096;
+                        x = FTNormCoord(x, 834.0);
+                        y = FTNormCoord(y, 1194.0);
                         if (ms < 5) ms = 5;
-                        FTDLogFmt("cmd: start @(%.1f,%.1f) ms=%lld (captured=%d)",
-                                  x, y, (long long)ms, g_captured ? 1 : 0);
+                        FTDLogFmt("cmd: start @(%.4f,%.4f) ms=%lld (captured=%d realN=%d)",
+                                  x, y, (long long)ms, g_captured ? 1 : 0, g_realN);
                         FTStart(x, y, (int64_t)ms);
                     } else if (strncmp(line, "stop", 4) == 0) {
                         FTDLog("cmd: stop");
@@ -722,13 +1129,48 @@ static void *FTCommandThread(void *arg) {
                     } else if (strncmp(line, "tap", 3) == 0) {
                         double x = 0.5, y = 0.5;
                         sscanf(line + 3, "%lf %lf", &x, &y);
-                        FTInject(true, x, y, 2);
+                        x = FTNormCoord(x, 834.0);
+                        y = FTNormCoord(y, 1194.0);
+                        FTInject(true, x, y, FTNextIndex(2));
                         usleep(10 * 1000);
-                        FTInject(false, x, y, 2);
-                        FTDLog("cmd: tap");
+                        FTInject(false, x, y, FTNextIndex(2));
+                        FTDLogFmt("cmd: tap @(%.4f,%.4f)", x, y);
                     }
                 }
                 fclose(f);
+            }
+        }
+
+        tick++;
+        if ((tick % 33) == 0) {
+            // ---- v2.9 ①：stage 热切换（5 <-> 6），不必重启 backboardd ----
+            // hook 在 init 时已装好，6 只是打开"真实手指复刻"这段逻辑，
+            // 所以可以安全热改；出问题写回 5 即刻退回旧行为。
+            int st = FTReadIntFile(g_stagePath, -1);
+            if (st >= 5 && st <= 9 && st != g_stage) {
+                FTDLogFmt("stage hot-switch %d -> %d (手指共存 %s)",
+                          g_stage, st, st >= 6 ? "开" : "关");
+                g_stage = st;
+            }
+            // ---- v2.9 ②：真实事件字段取证（只打一次）----
+            if (g_dumpReady == 1) {
+                FTDLogFmt("REAL parent kids=%d int[0x0B0003..000C]="
+                          "%ld %ld %ld %ld %ld %ld %ld %ld %ld %ld",
+                          g_dumpNKids,
+                          g_dumpPInt[0], g_dumpPInt[1], g_dumpPInt[2], g_dumpPInt[3], g_dumpPInt[4],
+                          g_dumpPInt[5], g_dumpPInt[6], g_dumpPInt[7], g_dumpPInt[8], g_dumpPInt[9]);
+                FTDLogFmt("REAL parent flt X=%.4f Y=%.4f Z=%.4f tiltX=%.4f tiltY=%.4f majR=%.4f",
+                          g_dumpPFlt[0], g_dumpPFlt[1], g_dumpPFlt[2],
+                          g_dumpPFlt[3], g_dumpPFlt[4], g_dumpPFlt[5]);
+                FTDLogFmt("REAL child0 int[0x0B0003..000C]="
+                          "%ld %ld %ld %ld %ld %ld %ld %ld %ld %ld",
+                          g_dumpCInt[0], g_dumpCInt[1], g_dumpCInt[2], g_dumpCInt[3], g_dumpCInt[4],
+                          g_dumpCInt[5], g_dumpCInt[6], g_dumpCInt[7], g_dumpCInt[8], g_dumpCInt[9]);
+                FTDLogFmt("REAL child0 flt X=%.4f Y=%.4f Z=%.4f tiltX=%.4f tiltY=%.4f majR=%.4f"
+                          "   <= 坐标空间判据：<=1 归一化 / >1 点坐标",
+                          g_dumpCFlt[0], g_dumpCFlt[1], g_dumpCFlt[2],
+                          g_dumpCFlt[3], g_dumpCFlt[4], g_dumpCFlt[5]);
+                g_dumpReady = 2;
             }
         }
         usleep(30 * 1000);
@@ -794,7 +1236,7 @@ static void FTBCtor(void) {
     const char *proc = getprogname();
     FILE *mk = fopen(g_logPath, "a");
     if (mk) {
-        fprintf(mk, "\n===== [BackboardInject v2.8] ctor pid=%d proc=%s slice=%s ptrauth=%s "
+        fprintf(mk, "\n===== [BackboardInject v2.8.12] ctor pid=%d proc=%s slice=%s ptrauth=%s "
                     "build=%s(0x%08x) =====\n",
                 (int)getpid(), proc ? proc : "?",
 #if defined(__arm64e__)

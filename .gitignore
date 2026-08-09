@@ -15,3 +15,16 @@ wf.json
 arts.json
 jobs.json
 build-log.zip
+
+# theos 构建中间产物（每次 make 重生成）
+FloatingTap/.theos/
+*.deb
+
+# 竞品逆向素材（123MB，本地分析用，不入库）
+佳影/
+
+# 本地编出来的 arm64e 小工具（二进制不入库）
+notifypost
+
+# SSH 诊断/部署脚本：内含设备局域网 IP 与 root 密码，只在本机用，不入库
+ssh_*.py

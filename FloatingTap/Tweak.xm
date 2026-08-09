@@ -863,10 +863,11 @@ static void FTStartClicking(void) {
             snprintf(dbgS, sizeof(dbgS), "backboard SID <- SB locked 0x%llx", (unsigned long long)g_LockedSID);
             FTLog(dbgS);
         }
-        // v2.8.2：坐标换算成【点坐标】再发——backboardd 的 FTCreateEvent 把 x/y 直接当
-        // IOHID 手指点坐标用；gClickLockX/Y 是归一化(0~1)，不换算会落在屏幕左上角(0.5,0.66)px。
-        // 竖屏基准 gScreenW/H（834×1194）与 IOHID digitizer 归一化基准一致（ctor 已实锤）。
-        FTDaemonStartClicking(gClickLockX * gScreenW, gClickLockY * gScreenH, ms);
+        // ⚠️ v2.9 修正（撤销 v2.8.2 的错误换算）：IOHID digitizer 坐标是【归一化 0~1】，
+        // 不是点坐标。v1 的 HIDInject.c 传的就是归一化值，且实测能打进游戏。
+        // v2.8.2 误发点坐标（417,788）→ 在归一化空间里远超 1.0 → 合成手指落到屏幕外 →
+        // v2 背板注入从来没有产生过一次有效点击。这里发回归一化原值。
+        FTDaemonStartClicking(gClickLockX, gClickLockY, ms);
         FTApplyGRModes();
         FTLog("clicking started via backboard");
         return;
@@ -2458,14 +2459,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.135 loaded (return-ratio eviction - enders <50%% return, stable >90%%; residual rebuild-ctx)");
+    syslog(LOG_ERR, "FloatingTap v2.9.0 loaded (backboard coexist: real-finger snapshot + normalized coords)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.135 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; return-ratio eviction)\n");
+            fprintf(mk, "FloatingTap v2.9.0 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; backboard coexist + normalized coords)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
