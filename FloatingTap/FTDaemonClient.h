@@ -1,5 +1,6 @@
 //
-//  FTDaemonClient.h — FloatingTapDaemon XPC 客户端接口（纯 C）
+//  FTDaemonClient.h — FloatingTap SB 侧控制通道接口（纯 C）
+//  v2.8 起：通过 Darwin 通知 + 共享命令文件驱动 backboardd 内注入（不再用 socket）。
 //
 
 #ifndef FTDAEMONCLIENT_H

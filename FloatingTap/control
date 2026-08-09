@@ -1,6 +1,6 @@
 Package: com.floatingtap.tweak
 Name: FloatingTap
-Version: 2.7.1-default5
+Version: 2.8.0-nosock
 Architecture: iphoneos-arm64
 Description: 全局悬浮球自动点击器（v2.7.1：stage 文件移到持久目录 /var/jb/Library/FloatingTap 且默认 5，装完即高频，无需 Filza 手动改；v2.6 已修复 rootless 路径双前缀导致自愈保险被永久锁死）
 Maintainer: FloatingTap

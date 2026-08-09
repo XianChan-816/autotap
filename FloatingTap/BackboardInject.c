@@ -1,5 +1,5 @@
 //
-//  BackboardInject.c — FloatingTap v2.6 backboardd 内注入（佳影同源架构，纯 C）
+//  BackboardInject.c — FloatingTap v2.8 backboardd 内注入（佳影同源架构，纯 C；v2.8 控制通道改 Darwin 通知，移除 backboardd 内 socket）
 //
 //  ==================== v2.6 头号教训：rootless 路径双前缀 ====================
 //  注入 dylib 内的绝对路径，会被 rootless 运行时自动前缀 jbroot：
@@ -124,6 +124,7 @@
 #if __has_include(<ptrauth.h>)
 #include <ptrauth.h>
 #endif
+#include <notify.h>   // Darwin 通知（stage 5 控制通道，沙盒安全，替代 backboardd 内 bind socket）
 
 // MARK: - 类型
 
@@ -150,7 +151,6 @@ typedef void  (*FT_MSHookFunction)(void *symbol, void *replace, void **result);
 //    v2.5 的 guard 就是栽在这：postinst 清的是前者，dylib 读的是后者，
 //    残留的 "3 1" 永久生效 -> 每次开机都被自愈保险禁用。
 static const char *g_ctrlDir   = "/Library/FloatingTap";               // 持久目录：jbroot /Library 重启不清
-static const char *g_sockPath  = "/tmp/floatingtapd.sock";
 static const char *g_logPath   = "/tmp/backboard_inject.log";
 // v2.7 关键修复：stage 文件从 /tmp 移到持久目录。/var/jb/tmp 重启会被清空，
 // 而 ftb_stage 是唯一不被 dylib 重新生成的文件 -> 重启即丢 -> 永远回退默认 stage 3。
@@ -158,6 +158,14 @@ static const char *g_logPath   = "/tmp/backboard_inject.log";
 static const char *g_stagePath = "/Library/FloatingTap/ftb_stage";
 static const char *g_guardPath = "/tmp/ftb_guard";
 static const char *g_piPath    = "/tmp/ftb_pi";        // postinst 落的握手标记
+// v2.8：stage 5 控制通道改为 Darwin 通知 + 共享命令文件（backboardd 沙盒禁止 bind socket）。
+//   · g_cmdPath   —— SB 写命令（start/stop/tap），backboardd 读
+//   · g_readyPath —— backboardd 起来后写 "1"，SB 探活用（替代 socket ping）
+//   · g_notifyName—— SB notify_post，backboardd notify_check 轮询
+// 路径都用 /tmp（jbroot 视图，SB 与 backboardd 两侧一致）。
+static const char *g_cmdPath    = "/tmp/floatingtap_cmd";   // SB 写 / backboardd 读
+static const char *g_readyPath  = "/tmp/floatingtap_bbok";  // backboardd 写 "1" / SB 探活读
+static const char *g_notifyName = "com.floatingtap.cmd";    // Darwin 通知名
 // v2.5 遗留死角，ctor 里主动清掉（此处必须保留双前缀写法才能命中）
 static const char *g_deadGuard = "/var/jb/tmp/ftb_guard";
 static const char *g_deadStage = "/var/jb/tmp/ftb_stage";
@@ -213,7 +221,6 @@ static volatile bool g_captured = false;
 
 static pthread_mutex_t g_injectLock = PTHREAD_MUTEX_INITIALIZER;
 
-static int    g_listenFd = -1;
 static double g_tx = 0.5, g_ty = 0.5;
 static int64_t g_ms = 12;
 static volatile bool g_clickRun = false;
@@ -661,10 +668,10 @@ static void *FTClickThread(void *arg) {
 }
 
 static void FTStart(double x, double y, int64_t ms) {
-    if (!g_captured) { FTDLog("start: no captured service yet (先在屏幕上真实触摸一次)"); return; }
     if (ms < 5) ms = 5;
     if (ms > 60000) ms = 60000;
     g_tx = x; g_ty = y; g_ms = ms;
+    if (!g_captured) FTDLog("start: captured 尚未就绪，先空转等首次真实触摸（不影响连点启动）");
     if (g_clickRun) return;             // 已在连点，只更新坐标
     g_clickRun = true;
     if (pthread_create(&g_clickTh, NULL, FTClickThread, NULL) == 0) pthread_detach(g_clickTh);
@@ -675,84 +682,57 @@ static void FTStop(void) {
     g_clickRun = false;
 }
 
-// MARK: - socket 服务（stage 4，独立 pthread 阻塞 accept，零 GCD）
+// MARK: - 命令通道（stage 5，Darwin 通知 + 共享文件，零 socket）
+// backboardd 是强沙盒进程，内部 bind AF_UNIX socket 会被沙盒 SIGKILL（v2.7.1 实测黑屏）。
+// 改由 SpringBoard 写命令文件 + notify_post，backboardd 轮询 notify_check 后读文件执行。
+// 全程不建任何 socket，沙盒安全。
 
-static void FTHandleLine(int fd, const char *line) {
-    char reply[128]; reply[0] = 0;
-    if (strncmp(line, "ping", 4) == 0) {
-        snprintf(reply, sizeof(reply), g_captured ? "pong\n" : "pong-nocap\n");
-    } else if (strncmp(line, "start", 5) == 0) {
-        double x = 0.5, y = 0.5; long long ms = 12;
-        sscanf(line + 5, "%lf %lf %lld", &x, &y, &ms);
-        if (x < 0.001) x = 0.001; if (x > 0.999) x = 0.999;
-        if (y < 0.001) y = 0.001; if (y > 0.999) y = 0.999;
-        FTStart(x, y, (int64_t)ms);
-        snprintf(reply, sizeof(reply), "ok\n");
-    } else if (strncmp(line, "stop", 4) == 0) {
-        FTStop();
-        snprintf(reply, sizeof(reply), "ok\n");
-    } else if (strncmp(line, "tap", 3) == 0) {
-        double x = 0.5, y = 0.5;
-        sscanf(line + 3, "%lf %lf", &x, &y);
-        if (x < 0.001) x = 0.001; if (x > 0.999) x = 0.999;
-        if (y < 0.001) y = 0.001; if (y > 0.999) y = 0.999;
-        FTInject(true, x, y, 2);
-        usleep(10 * 1000);
-        FTInject(false, x, y, 2);
-        snprintf(reply, sizeof(reply), "ok\n");
-    } else if (strncmp(line, "set_sid", 7) == 0) {
-        snprintf(reply, sizeof(reply), "ok\n");   // v2.3 复用真实 service，无需 SID
-    } else {
-        snprintf(reply, sizeof(reply), "unknown\n");
-    }
-    if (reply[0]) { ssize_t w = write(fd, reply, strlen(reply)); (void)w; }
-}
-
-static void *FTSocketThread(void *arg) {
+static void *FTCommandThread(void *arg) {
     (void)arg;
-    while (g_listenFd >= 0) {
-        int cfd = accept(g_listenFd, NULL, NULL);
-        if (cfd < 0) { if (errno == EINTR) continue; break; }
-        fd_set rfds; FD_ZERO(&rfds); FD_SET(cfd, &rfds);
-        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 500 * 1000;
-        char buf[512];
-        if (select(cfd + 1, &rfds, NULL, NULL, &tv) > 0) {
-            ssize_t n = read(cfd, buf, sizeof(buf) - 1);
-            if (n > 0) {
-                buf[n] = 0;
-                char *save = NULL;
-                for (char *tok = strtok_r(buf, "\n", &save); tok; tok = strtok_r(NULL, "\n", &save))
-                    FTHandleLine(cfd, tok);
+    int token = -1;
+    notify_register_check(g_notifyName, &token);
+    // 就绪标记：SB 探活（FTDaemonPing 读这个文件判断 backboard 注入是否可用）
+    FILE *rf = fopen(g_readyPath, "w");
+    if (rf) { fprintf(rf, "1\n"); fclose(rf); }
+    FTDLogFmt("notify channel ready (token=%d)", token);
+
+    while (g_stage >= 5) {
+        int signalled = 0;
+        if (token >= 0) notify_check(token, &signalled);
+        if (signalled) {
+            FILE *f = fopen(g_cmdPath, "r");
+            if (f) {
+                char line[256];
+                if (fgets(line, sizeof(line), f)) {
+                    if (strncmp(line, "start", 5) == 0) {
+                        double x = 0.5, y = 0.5; long long ms = 12;
+                        sscanf(line + 5, "%lf %lf %lld", &x, &y, &ms);
+                        if (x < 0.001) x = 0.001; if (x > 0.999) x = 0.999;
+                        if (y < 0.001) y = 0.001; if (y > 0.999) y = 0.999;
+                        if (ms < 5) ms = 5;
+                        FTDLogFmt("cmd: start @(%.3f,%.3f) ms=%lld (captured=%d)",
+                                  x, y, (long long)ms, g_captured ? 1 : 0);
+                        FTStart(x, y, (int64_t)ms);
+                    } else if (strncmp(line, "stop", 4) == 0) {
+                        FTDLog("cmd: stop");
+                        FTStop();
+                    } else if (strncmp(line, "tap", 3) == 0) {
+                        double x = 0.5, y = 0.5;
+                        sscanf(line + 3, "%lf %lf", &x, &y);
+                        FTInject(true, x, y, 2);
+                        usleep(10 * 1000);
+                        FTInject(false, x, y, 2);
+                        FTDLog("cmd: tap");
+                    }
+                }
+                fclose(f);
             }
         }
-        close(cfd);
+        usleep(30 * 1000);
     }
-    FTDLog("socket thread exit");
+    unlink(g_readyPath);
+    FTDLog("command thread exit");
     return NULL;
-}
-
-static bool FTSetupSocket(void) {
-    unlink(g_sockPath);
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) { FTDLogFmt("socket() failed: %s", strerror(errno)); return false; }
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, g_sockPath, sizeof(addr.sun_path) - 1);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        FTDLogFmt("bind failed: %s (backboardd 沙盒可能禁止)", strerror(errno));
-        close(fd); return false;
-    }
-    chmod(g_sockPath, 0777);
-    if (listen(fd, 8) != 0) {
-        FTDLogFmt("listen failed: %s", strerror(errno));
-        close(fd); return false;
-    }
-    g_listenFd = fd;
-    pthread_t th;
-    if (pthread_create(&th, NULL, FTSocketThread, NULL) == 0) pthread_detach(th);
-    FTDLog("socket listening");
-    return true;
 }
 
 // MARK: - 后台初始化线程
@@ -766,7 +746,10 @@ static void *FTInitThread(void *ctx) {
     if (g_stage >= 1) { if (!FTLoadSymbols())   goto done; }
     if (g_stage >= 2) { if (!FTLocateCallback()) goto done; }
     if (g_stage >= 3) { if (!FTInstallHook())    goto done; }
-    if (g_stage >= 5) { FTSetupSocket(); }
+    if (g_stage >= 5) {
+        pthread_t cth;
+        if (pthread_create(&cth, NULL, FTCommandThread, NULL) == 0) pthread_detach(cth);
+    }
 
     FTDLogFmt("stage %d init complete", g_stage);
 
@@ -808,7 +791,7 @@ static void FTBCtor(void) {
     const char *proc = getprogname();
     FILE *mk = fopen(g_logPath, "a");
     if (mk) {
-        fprintf(mk, "\n===== [BackboardInject v2.6] ctor pid=%d proc=%s slice=%s ptrauth=%s "
+        fprintf(mk, "\n===== [BackboardInject v2.8] ctor pid=%d proc=%s slice=%s ptrauth=%s "
                     "build=%s(0x%08x) =====\n",
                 (int)getpid(), proc ? proc : "?",
 #if defined(__arm64e__)

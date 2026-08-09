@@ -19,7 +19,7 @@ LC="/var/jb/usr/bin/launchctl"
 "$LC" bootout system/com.floatingtap.daemon 2>>"$LOG" || true
 rm -f /var/jb/usr/libexec/floatingtapd 2>>"$LOG" || true
 rm -f /var/jb/Library/LaunchDaemons/com.floatingtap.daemon.plist 2>>"$LOG" || true
-rm -f /var/jb/tmp/floatingtapd.sock 2>>"$LOG" || true
+rm -f /var/jb/tmp/floatingtapd.sock /var/jb/tmp/floatingtap_cmd /var/jb/tmp/floatingtap_bbok 2>>"$LOG" || true
 
 mkdir -p /var/jb/tmp 2>/dev/null || true
 mkdir -p /var/jb/Library/FloatingTap 2>/dev/null || true

@@ -43,24 +43,25 @@
 // FTLog 定义于文件后部（诊断日志），此处前向声明供 daemon 探测函数使用
 static void FTLog(const char *msg);
 
-// MARK: - v2.2 backboardd 注入探测
+// MARK: - v2.8 backboardd 注入探测
 // 连点注入优先走 BackboardInject（注入 backboardd 的 dylib，佳影式同源注入）。
-// socket 由 BackboardInject 提供（/var/jb/tmp/floatingtapd.sock）。
-// 探测失败（BackboardInject 未加载/黑屏保护自动关 socket）→ 回退 SB 注入。
+// 控制通道 = Darwin 通知 + 共享命令文件（/tmp/floatingtap_cmd），不再用 socket
+// （backboardd 沙盒禁止 bind socket，v2.7.1 实测黑屏）。
+// 探测失败（BackboardInject 未加载 / 未就绪 / 自愈保险已禁用）→ 回退 SB 注入。
 static int g_DaemonMode = 0;
-static int g_DaemonProbed = 0;
 
 static int FTDaemonProbe(void) {
-    if (g_DaemonProbed) return g_DaemonMode;
-    g_DaemonProbed = 1;
-    if (FTDaemonPing()) {
+    // v2.8：每次都重新探活（读 backboardd 写的就绪标记），只在状态切换时打日志。
+    // 不永久缓存失败结果——避免“首次探测时 backboardd 还没就绪”导致以后再也用不上高频。
+    int ok = FTDaemonPing();
+    if (ok && g_DaemonMode != 1) {
         g_DaemonMode = 1;
         FTLog("backboard inject available - clicking via backboardd");
-    } else {
+    } else if (!ok && g_DaemonMode != -1) {
         g_DaemonMode = -1;
         FTLog("backboard inject unavailable - fallback to SB inject");
     }
-    return g_DaemonMode;
+    return ok ? 1 : -1;
 }
 
 // MARK: - objc_msgSend 类型化函数指针（ARM64 下结构体参数需与目标方法签名一致）
