@@ -1,8 +1,8 @@
 Package: com.floatingtap.tweak
 Name: FloatingTap
-Version: 2.8.3-decouple
+Version: 2.8.4-ball-lock
 Architecture: iphoneos-arm64
-Description: 全局悬浮球自动点击器（v2.8.3：解耦 backboardd 连点与遗留 SB 侧 SID 探针——按住球直接走 backboardd 注入，不再依赖 g_LockedSID（旧探针每次停止会清零+拉黑该 SID，导致「第一次变黄能用、后面再按没反应」）。v2.8.2 修了坐标换算；v2.8 控制通道改 Darwin 通知+文件避开沙盒禁 socket 黑屏）
+Description: 全局悬浮球自动点击器（v2.8.4：连击模式点击点锁定球心——按住球即在球位置连点，绿圈标记跟随球，不再落在 190px 下方空处导致「没效果」。v2.8.3 解耦 backboardd 与遗留 SID 探针；v2.8.2 修坐标换算；v2.8 控制通道改 Darwin 通知+文件避开沙盒禁 socket 黑屏）
 Maintainer: FloatingTap
 Author: FloatingTap
 Section: Tweaks

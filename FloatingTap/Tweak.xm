@@ -1204,6 +1204,26 @@ static void FTApplyClickPointAppearance(void) {
     if (dot) ((Msg_SetBackgroundColor)objc_msgSend)(dot, sel_registerName("setBackgroundColor:"), color);
 }
 
+// v2.8.4：连击模式下把「点击点」锁定到球心——佳影式「按住球即在球位置连点」。
+// 旧实现点击点与球解耦、默认落在屏幕中心偏下(0.5,0.66)≈(417,788)，用户按住球却点在 190px 下方空处 → 没效果。
+// 现在：连击模式点击点=球当前中心，绿圈标记也移到球上（idle 直观显示「点这里」，连点时按设计隐藏防误触）。
+// 例外：① 拖动模式保留独立标记（可偏移定位）；② 已加载 App 配置时尊重配置点击点（球会偏上 150px 不挡目标），不同步。
+static void FTSyncClickPointToBall(void) {
+    if (gDragMode || gCfgLoaded || !gBallView || !gClickPointView) return;
+    if (gScreenW <= 0 || gScreenH <= 0) return;
+    CGRect bf = ((Msg_Frame)objc_msgSend)(gBallView, sel_registerName("frame"));
+    double cx = bf.origin.x + bf.size.width  * 0.5;
+    double cy = bf.origin.y + bf.size.height * 0.5;
+    gClickLockX = cx / gScreenW;
+    gClickLockY = cy / gScreenH;
+    if (gClickLockX < 0.001) gClickLockX = 0.001; if (gClickLockX > 0.999) gClickLockX = 0.999;
+    if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
+    CGRect mf = ((Msg_Frame)objc_msgSend)(gClickPointView, sel_registerName("frame"));
+    double m = (mf.size.width > 0) ? mf.size.width : 30.0;
+    ((Msg_SetFrame)objc_msgSend)(gClickPointView, sel_registerName("setFrame:"),
+        CGRectMake(cx - m / 2, cy - m / 2, m, m));
+}
+
 // v1.0.73：按下球 120ms 后的延时计时器回调——静止按住时 iOS 不投递 Moved/Stationary 事件，
 // 不能靠它们触发连点，改用此计时器。到时若手指仍按着（gBallTouch 未清空 = 同一根手指没抬起）
 // 且非拖动模式：已锁定有效 SID → 直接连点；未锁定（v1.0.101）→ 进入 SID 自动探测校准。
@@ -1221,6 +1241,7 @@ static void FTBallHoldTimer(void *ctx) {
         // 故 backboardd 可用时直接走，彻底绕开遗留探针；仅当 backboardd 不可用时才兜底走旧探针。
         if (FTDaemonProbe() == 1 || g_LockedSID != 0) {
             gBallTouchClicking = YES;
+            FTSyncClickPointToBall(); // v2.8.4：连击模式点击点=球心（按住球即在球位置连点）
             FTStartClicking();
         } else {
             FTStartProbing(); // 仅 backboardd 不可用时兜底：探测校准有效 SID（球变橙色）
@@ -1695,6 +1716,7 @@ static void FTGRTapHandler(id self, SEL _cmd, id gr) {
         FTApplyGRModes();
         FTApplyBallAppearance();
         FTApplyClickPointAppearance();
+        FTSyncClickPointToBall(); // v2.8.4：切回连击模式时绿圈/点击点回到球心
         FTLog(gDragMode ? "double tap -> drag mode ON (red): drag ball / click-point to position" : "double tap -> combo mode ON (blue)");
     }
 }
@@ -1915,14 +1937,13 @@ static void FTSetupBall(void) {
     }
     CGFloat d = 56.0;
     CGRect ballFrame = CGRectMake(gScreenW / 2 - d / 2, gScreenH / 2 - d / 2, d, d);
-    // ⚠️ v1.0.116 定案（ctor-13 实锤）：默认点击点必须与球分离！
-    // 旧默认 gClickLock=(0.5,0.5)=屏幕中心=球位置：探测 tap 注入到点击点=注入到球上，
-    // 球是 userInteractionEnabled=YES 的手势窗口 subview → 合成触摸被球拦截永不路由 →
-    // 全扫 768 个 SID 零送达 → 变不了蓝。点击点标记 userInteractionEnabled=NO（穿透），
-    // 只要点击点不在球上，注入即可送达。无配置时默认放到球下方 ~1/6 屏（竖屏基准）。
+    // ⚠️ v1.0.116 历史：旧 SID 探测路径要求点击点与球分离（注入到球上会被拦截 → 零送达）。
+    // v2.8.4 起连击模式点击点锁定球心（FTSyncClickPointToBall 在 setup 末尾/按住时同步），
+    // backboardd 注入走真实 HID 管道、不路由到球 GR，故「点击点=球心」不再触发拦截问题。
+    // 此处仅作无配置时的初值；连击模式会被 FTSyncClickPointToBall 覆盖为球心。
     if (!gCfgLoaded) {
         gClickLockX = 0.5;
-        gClickLockY = 0.66; // 球下方 ~190px（1194×0.16）
+        gClickLockY = 0.5; // 初值=屏幕中心=球初始位置（连击模式随即同步到球心）
     }
 
     // v1.0.60：球必须挂到 _UISystemGestureWindow（系统手势层，始终在所有 App 之上），
@@ -2106,6 +2127,8 @@ static void FTSetupBall(void) {
 
     // v1.0.50：球创建后立即按 App 配置定位（若已加载配置）
     FTMoveBallToConfig();
+    // v2.8.4：连击模式点击点跟随球心（绿圈初始就坐在球上）
+    FTSyncClickPointToBall();
 }
 
 // v1.0.50：移动球到 App 配置位置（球心 = 配置点击点；未加载配置则居中不动）
@@ -2458,14 +2481,14 @@ static void FTTweakInitCallback(void *ctx) {
 
 __attribute__((constructor))
 static void FTTweakCtor(void) {
-    syslog(LOG_ERR, "FloatingTap v1.0.135 loaded (return-ratio eviction - enders <50%% return, stable >90%%; residual rebuild-ctx)");
+    syslog(LOG_ERR, "FloatingTap v1.0.136 loaded (return-ratio eviction - enders <50%% return, stable >90%%; residual rebuild-ctx; v2.8.4 click-point locked to ball center)");
 
     // v1.0.50：对接 AutoTap App——App 是启动器（选目标 App/位置/间隔），tweak 执行。
     if (FTIsBundle("com.apple.springboard")) {
         // 【诊断标记】SB 进程覆盖写
         FILE *mk = fopen("/tmp/floatingtap_ctor.log", "w");
         if (mk) {
-            fprintf(mk, "FloatingTap v1.0.135 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; return-ratio eviction)\n");
+            fprintf(mk, "FloatingTap v1.0.136 ctor run (arm64e, pure C, ball on _UISystemGestureWindow; return-ratio eviction; v2.8.4 click-point locked to ball center)\n");
             fclose(mk);
         }
         syslog(LOG_ERR, "FloatingTap role: SpringBoard controller");
