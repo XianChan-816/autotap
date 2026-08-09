@@ -863,7 +863,10 @@ static void FTStartClicking(void) {
             snprintf(dbgS, sizeof(dbgS), "backboard SID <- SB locked 0x%llx", (unsigned long long)g_LockedSID);
             FTLog(dbgS);
         }
-        FTDaemonStartClicking(gClickLockX, gClickLockY, ms);
+        // v2.8.2：坐标换算成【点坐标】再发——backboardd 的 FTCreateEvent 把 x/y 直接当
+        // IOHID 手指点坐标用；gClickLockX/Y 是归一化(0~1)，不换算会落在屏幕左上角(0.5,0.66)px。
+        // 竖屏基准 gScreenW/H（834×1194）与 IOHID digitizer 归一化基准一致（ctor 已实锤）。
+        FTDaemonStartClicking(gClickLockX * gScreenW, gClickLockY * gScreenH, ms);
         FTApplyGRModes();
         FTLog("clicking started via backboard");
         return;

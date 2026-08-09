@@ -707,10 +707,13 @@ static void *FTCommandThread(void *arg) {
                     if (strncmp(line, "start", 5) == 0) {
                         double x = 0.5, y = 0.5; long long ms = 12;
                         sscanf(line + 5, "%lf %lf %lld", &x, &y, &ms);
-                        if (x < 0.001) x = 0.001; if (x > 0.999) x = 0.999;
-                        if (y < 0.001) y = 0.001; if (y > 0.999) y = 0.999;
+                        // v2.8.2：x/y 现在为【点坐标】（SB 已按竖屏基准尺寸换算），
+                        // 旧 clamp(0.001~0.999) 会把点坐标(如 417)压成 0.999 → 落左上角。
+                        // 改为点范围安全钳制。
+                        if (x < 0) x = 0; if (x > 4096) x = 4096;
+                        if (y < 0) y = 0; if (y > 4096) y = 4096;
                         if (ms < 5) ms = 5;
-                        FTDLogFmt("cmd: start @(%.3f,%.3f) ms=%lld (captured=%d)",
+                        FTDLogFmt("cmd: start @(%.1f,%.1f) ms=%lld (captured=%d)",
                                   x, y, (long long)ms, g_captured ? 1 : 0);
                         FTStart(x, y, (int64_t)ms);
                     } else if (strncmp(line, "stop", 4) == 0) {

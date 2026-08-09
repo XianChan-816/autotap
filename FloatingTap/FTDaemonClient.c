@@ -13,9 +13,9 @@
 //    读 /tmp/floatingtap_bbok      写 "1"（就绪标记，供 SB 探活）
 //
 //  命令文件一行一条：
-//    "start x y ms\n"   开始连点（x/y 归一化 0~1，ms 间隔）
+//    "start x y ms\n"   开始连点（x/y = 屏幕【点坐标】，由 SB 用竖屏基准尺寸换算好；ms 间隔）
 //    "stop\n"           停止连点
-//    "tap x y\n"        单次 tap（诊断）
+//    "tap x y\n"        单次 tap（诊断，x/y 同为此前点坐标）
 //
 //  ⚠️ 纯 C：无 ObjC、无 block。失败静默返回，绝不阻塞 SB 主线程。
 //  ⚠️ 路径铁律同 BackboardInject：SB 与 backboardd 都写 "/tmp/X"，
