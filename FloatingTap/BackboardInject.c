@@ -1236,7 +1236,7 @@ static void FTBCtor(void) {
     const char *proc = getprogname();
     FILE *mk = fopen(g_logPath, "a");
     if (mk) {
-        fprintf(mk, "\n===== [BackboardInject v2.8.12] ctor pid=%d proc=%s slice=%s ptrauth=%s "
+        fprintf(mk, "\n===== [BackboardInject v2.9.0-coexist] ctor pid=%d proc=%s slice=%s ptrauth=%s "
                     "build=%s(0x%08x) =====\n",
                 (int)getpid(), proc ? proc : "?",
 #if defined(__arm64e__)
