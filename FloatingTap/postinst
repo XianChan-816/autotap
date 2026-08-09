@@ -1,5 +1,5 @@
 #!/bin/bash
-# FloatingTap postinst — v2.3
+# FloatingTap postinst — v2.4
 # BackboardInject 注入 backboardd（Dopamine/ellekit 自动加载），无需 launchctl。
 #   · 清理 v2.0 时代遗留的独立 daemon（floatingtapd，已废弃）
 #   · 初始化分级开关 ftb_stage（默认 1 = 最保守的可用档）
@@ -16,11 +16,10 @@ rm -f /var/jb/tmp/floatingtapd.sock 2>>"$LOG" || true
 
 mkdir -p /var/jb/tmp 2>/dev/null || true
 
-# 分级开关：不存在才写默认值 4（完整功能，有自愈保险兜底）；保留用户手动设定的档位
-if [ ! -f /var/jb/tmp/ftb_stage ] && [ ! -f /tmp/ftb_stage ]; then
-  echo 4 > /var/jb/tmp/ftb_stage 2>/dev/null || true
-  echo 4 > /tmp/ftb_stage 2>/dev/null || true
-fi
+# 分级开关：v2.4 强制重置为 3（装 hook 但纯透传，先证明 hook 安全再往上爬）
+# 注意这里是无条件覆盖：v2.3 遗留的 stage=4 会让新版直接跳过纯透传验证。
+echo 3 > /var/jb/tmp/ftb_stage 2>/dev/null || true
+echo 3 > /tmp/ftb_stage 2>/dev/null || true
 chmod 666 /var/jb/tmp/ftb_stage /tmp/ftb_stage 2>/dev/null || true
 
 # 自愈保险清零：新版本 = 新机会

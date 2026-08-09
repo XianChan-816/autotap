@@ -1,5 +1,5 @@
 //
-//  BackboardInject.c — FloatingTap v2.3 backboardd 内注入（佳影同源架构，纯 C）
+//  BackboardInject.c — FloatingTap v2.4 backboardd 内注入（佳影同源架构，纯 C）
 //
 //  ============================ 教训链（必读） ============================
 //  · v2.1 黑屏：constructor 里调用 dispatch_after_f（GCD）→ 违反铁律。
@@ -36,11 +36,25 @@
 //  3) 【分级开关】改 /var/jb/tmp/ftb_stage 即可推进/回退，无需重新编译安装：
 //       0 = 只写日志（等于关闭）
 //       1 = dlopen IOKit + 解析事件构造符号（不碰任何 HID 对象）
-//       2 = 1 + 定位 ___IOHIDServiceEventCallback 地址（只打印，不 hook）
-//       3 = 2 + 装 hook，真实触摸时捕获 service/target/refcon 并记日志（不注入）
-//       4 = 3 + 开 socket 服务 + 真正连点注入（完整功能）← 默认
+//       2 = 1 + 定位 ___IOHIDServiceEventCallback + 地址校验 + 指令 dump（不 hook）
+//       3 = 2 + 装 hook，回调【纯透传】，只用裸 write 打探针  ← v2.4 默认
+//       4 = 3 + 回调内调 IOHIDEventGetType 并捕获 service/target/refcon
+//       5 = 4 + 开 socket 服务 + 真正连点注入（完整功能）
 //     改完 stage 会自动获得一次新的尝试机会（guard 按 stage 记账）。
-//     默认直接 4：每一步都有日志打点，崩了看日志就知道死在哪，不必逐级试。
+//
+//  ============================ v2.4 崩溃防线 ============================
+//  v2.3 崩溃点：日志停在 "hook installed=1 orig=0xd051f08113efc000"，
+//  socket listening / bind failed 两行都没有 → 死在 hook 装上后的几微秒内，
+//  即【第一个 HID 事件进回调就崩】。且两个地址高位异常：
+//      cbAddr = 0x8a514a818d8268a4   orig = 0xd051f08113efc000
+//  低 47 位也不像合法 image 地址 → 强烈怀疑 MSFindSymbol 返回值不可用 / 带 PAC。
+//  本版四道防线：
+//    ① dladdr 校验：地址不在任何已加载 image 内 → 直接拒绝 hook（不再盲装）
+//    ② PAC 剥离：ptrauth_strip（arm64e）或手工清高位，剥离后再校验一次
+//    ③ mach_vm_read_overwrite 安全读：dump 入口 16 字节，看是否 pacibsp(d503237f)
+//    ④ g_origOK 门禁：orig 未通过校验就绝不调用，回调直接 return
+//       （代价：触摸暂时失效；收益：不崩，日志完整留存）
+//  回调内严禁 fopen/malloc/syslog/CF —— 只用预开 fd 的裸 write()。
 //  4) 全程零 GCD：socket 用独立 pthread 阻塞 accept，连点用独立 pthread 定时。
 //     绝不占用 backboardd 主线程/主队列。
 //
@@ -64,7 +78,11 @@
 #include <syslog.h>
 #include <time.h>
 #include <mach/mach_time.h>
+#include <mach/mach.h>
 #include <CoreFoundation/CoreFoundation.h>
+#if __has_include(<ptrauth.h>)
+#include <ptrauth.h>
+#endif
 
 // MARK: - 类型
 
@@ -113,16 +131,22 @@ static uint32_t (*p_GetType)(FT_IOHIDEventRef);
 
 static int   g_stage = 1;
 static bool  g_symOK = false;
-static void *g_cbAddr = NULL;                        // ___IOHIDServiceEventCallback
+static void *g_cbRaw  = NULL;                        // MSFindSymbol 原始返回（可能带 PAC）
+static void *g_cbAddr = NULL;                        // strip + 校验后的可用地址
 static FT_ServiceEventCallback g_origCB = NULL;      // MSHookFunction 保存的原函数
 static bool  g_hooked = false;
+
+// 回调内零 I/O 探针：init 阶段预开 fd，回调里只用裸 write()
+static int   g_probeFd = -1;
+static volatile int g_probeLeft = 16;                // 只打前 16 行，避免刷爆
+static volatile unsigned long g_hits = 0;            // hook 命中计数
+static volatile bool g_origOK = false;               // orig 指针校验通过才允许调用
 
 // 真实触摸时捕获的三件套（佳影 _touchEventService 同款）
 static void *g_target = NULL;
 static void *g_refcon = NULL;
 static FT_IOHIDServiceRef g_service = NULL;
 static volatile bool g_captured = false;
-static int   g_capLogCount = 0;
 
 static pthread_mutex_t g_injectLock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -149,6 +173,71 @@ static void FTDLogFmt(const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     FTDLog(buf);
+}
+
+// MARK: - 回调内零 I/O 探针（HID 热路径专用：不 fopen / 不 malloc / 不 syslog）
+
+static void FTProbe(const char *tag) {
+    if (g_probeFd < 0) return;
+    if (g_probeLeft <= 0) return;
+    // 注意：不做原子递减也无妨，多打几行不影响判断
+    g_probeLeft--;
+    ssize_t w = write(g_probeFd, tag, strlen(tag));
+    (void)w;
+}
+
+// MARK: - PAC 处理与地址安全校验
+
+static void *FTStripPtr(void *p) {
+#if defined(__arm64e__) && __has_feature(ptrauth_calls)
+    return ptrauth_strip(p, ptrauth_key_function_pointer);
+#else
+    uintptr_t v = (uintptr_t)p;
+    if (v >> 47) v &= 0x00007FFFFFFFFFFFULL;   // 手工清 PAC 位
+    return (void *)v;
+#endif
+}
+
+// 安全读取目标地址内存：地址非法时返回 false 而不是崩溃
+// vm_read_overwrite 在 iOS SDK 里必定可用（mach/mach.h → vm_map.h）
+static bool FTSafeRead(void *addr, void *out, size_t len) {
+    vm_size_t got = 0;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                                         (vm_address_t)(uintptr_t)addr,
+                                         (vm_size_t)len,
+                                         (vm_address_t)(uintptr_t)out,
+                                         &got);
+    return (kr == KERN_SUCCESS && got == (vm_size_t)len);
+}
+
+// 地址是否落在某个已加载 image 内（dladdr 只查 image 区间，不解引用 → 安全）
+static bool FTAddrInImage(void *addr, char *outDesc, size_t descLen) {
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    if (dladdr(addr, &info) == 0) {
+        if (outDesc) snprintf(outDesc, descLen, "NOT-IN-ANY-IMAGE");
+        return false;
+    }
+    if (outDesc) {
+        const char *fn = info.dli_fname ? info.dli_fname : "?";
+        const char *sn = info.dli_sname ? info.dli_sname : "?";
+        const char *base = strrchr(fn, '/');
+        snprintf(outDesc, descLen, "image=%s sym=%s symaddr=%p",
+                 base ? base + 1 : fn, sn, info.dli_saddr);
+    }
+    return true;
+}
+
+// dump 目标函数入口前 16 字节（arm64e 函数头通常是 pacibsp = 0xd503237f）
+static void FTDumpInsns(void *addr) {
+    uint32_t w[4] = {0, 0, 0, 0};
+    if (!FTSafeRead(addr, w, sizeof(w))) {
+        FTDLogFmt("insn dump @%p: UNREADABLE（地址无效，绝不可 hook）", addr);
+        return;
+    }
+    FTDLogFmt("insn dump @%p: %08x %08x %08x %08x%s",
+              addr, w[0], w[1], w[2], w[3],
+              (w[0] == 0xd503237f) ? "  (pacibsp ✓ 函数入口)" : "");
 }
 
 // MARK: - 控制文件（stage / guard）
@@ -242,19 +331,53 @@ static bool FTLocateCallback(void) {
     const char *names[]  = { "___IOHIDServiceEventCallback",
                              "__IOHIDServiceEventCallback",
                              "_IOHIDServiceEventCallback", NULL };
-    for (int i = 0; images[i] && !g_cbAddr; i++) {
+    FTDLogFmt("MS api: getImage=%p findSym=%p", (void *)fGetImage, (void *)fFindSym);
+    for (int i = 0; images[i] && !g_cbRaw; i++) {
         void *img = fGetImage(images[i]);
+        FTDLogFmt("image[%d] %s => %p", i, images[i], img);
         if (!img) continue;
-        for (int j = 0; names[j] && !g_cbAddr; j++) {
+        for (int j = 0; names[j] && !g_cbRaw; j++) {
             void *sym = fFindSym(img, names[j]);
             if (sym) {
-                g_cbAddr = sym;
-                FTDLogFmt("found %s @ %p (image=%s)", names[j], sym, images[i]);
+                g_cbRaw = sym;
+                FTDLogFmt("MSFindSymbol %s => raw %p (image=%s)", names[j], sym, images[i]);
             }
         }
     }
-    if (!g_cbAddr) FTDLog("___IOHIDServiceEventCallback NOT FOUND");
-    return g_cbAddr != NULL;
+    if (!g_cbRaw) { FTDLog("___IOHIDServiceEventCallback NOT FOUND"); return false; }
+
+    // ---- v2.4 新增：PAC 剥离 + 三重校验，地址不合法就绝不 hook ----
+    char desc[256];
+    void *cand = g_cbRaw;
+    bool ok = FTAddrInImage(cand, desc, sizeof(desc));
+    FTDLogFmt("verify raw  %p -> %s", cand, desc);
+
+    if (!ok) {
+        void *st = FTStripPtr(g_cbRaw);
+        if (st != g_cbRaw) {
+            ok = FTAddrInImage(st, desc, sizeof(desc));
+            FTDLogFmt("verify strip %p -> %s", st, desc);
+            if (ok) cand = st;
+        }
+    }
+
+    if (!ok) {
+        FTDLogFmt("REJECT: 地址 %p 不在任何已加载 image 内（MSFindSymbol 返回值不可用）。"
+                  " 不安装 hook，进程保持健康。", g_cbRaw);
+        FTDumpInsns(g_cbRaw);
+        return false;
+    }
+
+    FTDumpInsns(cand);
+    uint32_t first = 0;
+    if (!FTSafeRead(cand, &first, sizeof(first))) {
+        FTDLogFmt("REJECT: %p 不可读，不安装 hook。", cand);
+        return false;
+    }
+
+    g_cbAddr = cand;
+    FTDLogFmt("callback target LOCKED @ %p", g_cbAddr);
+    return true;
 }
 
 // MARK: - Hook 回调（stage >= 3）——捕获真实 digitizer 三件套
@@ -262,20 +385,31 @@ static bool FTLocateCallback(void) {
 static void FTServiceEventCallbackNew(void *target, void *refcon,
                                       FT_IOHIDServiceRef service,
                                       FT_IOHIDEventRef event) {
-    // kIOHIDEventTypeDigitizer == 11
-    if (event && p_GetType && p_GetType(event) == 11) {
-        if (!g_captured) {
-            g_target = target;
-            g_refcon = refcon;
+    // ⚠️ HID 热路径：只允许裸 write()，禁止 fopen / malloc / syslog / CF 调用
+    g_hits++;
+    FTProbe("[cb] enter\n");
+
+    // stage 3 = 纯透传，连 event 都不碰（验证 hook 本身与 orig 调用是否安全）
+    if (g_stage >= 4) {
+        FTProbe("[cb] gettype\n");
+        uint32_t ty = (event && p_GetType) ? p_GetType(event) : 0;
+        FTProbe("[cb] gettype ok\n");
+        if (ty == 11 && !g_captured) {
+            g_target  = target;
+            g_refcon  = refcon;
             g_service = service;
             g_captured = true;
-            FTDLogFmt("CAPTURED target=%p refcon=%p service=%p", target, refcon, (void *)service);
-        } else if (g_capLogCount < 3) {
-            g_capLogCount++;
-            FTDLogFmt("real touch #%d (service=%p)", g_capLogCount, (void *)service);
+            FTProbe("[cb] CAPTURED\n");
         }
     }
-    if (g_origCB) g_origCB(target, refcon, service, event);
+
+    // g_origOK 只有在 orig 指针通过校验后才置位。
+    // 未通过 → 直接 return（丢几个事件，屏幕短暂无响应），绝不盲调导致崩溃。
+    if (!g_origOK) { FTProbe("[cb] orig-SKIP\n"); return; }
+
+    FTProbe("[cb] pre-orig\n");
+    g_origCB(target, refcon, service, event);
+    FTProbe("[cb] post-orig\n");
 }
 
 static bool FTInstallHook(void) {
@@ -292,9 +426,45 @@ static bool FTInstallHook(void) {
         }
     }
     if (!fHook) { FTDLog("MSHookFunction NOT FOUND"); return false; }
+
+    // 探针 fd 必须在 hook 之前就绪：hook 生效的瞬间事件就可能进来
+    if (g_probeFd < 0) {
+        g_probeFd = open(g_logPath, O_WRONLY | O_APPEND | O_CREAT, 0666);
+        FTDLogFmt("probe fd=%d", g_probeFd);
+    }
+
+    FTDLogFmt("about to MSHookFunction(%p, %p)", g_cbAddr, (void *)FTServiceEventCallbackNew);
     fHook(g_cbAddr, (void *)FTServiceEventCallbackNew, (void **)&g_origCB);
     g_hooked = (g_origCB != NULL);
-    FTDLogFmt("hook installed=%d orig=%p", g_hooked ? 1 : 0, (void *)g_origCB);
+    FTDLogFmt("hook installed=%d origRaw=%p", g_hooked ? 1 : 0, (void *)g_origCB);
+    if (!g_hooked) return false;
+
+    // ---- v2.4：校验 orig 指针，通过才允许回调调用它 ----
+    void *op = (void *)g_origCB;
+    char desc[256];
+    bool ok = FTAddrInImage(op, desc, sizeof(desc));
+    FTDLogFmt("verify orig %p -> %s", op, desc);
+
+    if (!ok) {
+        void *st = FTStripPtr(op);
+        if (st != op) {
+            ok = FTAddrInImage(st, desc, sizeof(desc));
+            FTDLogFmt("verify orig strip %p -> %s", st, desc);
+            if (ok) { g_origCB = (FT_ServiceEventCallback)st; op = st; }
+        }
+    }
+    // trampoline 通常不属于任何 image，可读即认为可用
+    if (!ok) {
+        uint32_t probe = 0;
+        if (FTSafeRead(op, &probe, sizeof(probe))) {
+            FTDLogFmt("orig 不在 image 内但可读（应为 trampoline），首指令=%08x", probe);
+            ok = true;
+        }
+    }
+
+    g_origOK = ok;
+    FTDLogFmt("orig usable=%d  %s", ok ? 1 : 0,
+              ok ? "(回调将正常透传)" : "(⚠️ 回调将丢弃事件，触摸会失效但不会崩)");
     return g_hooked;
 }
 
@@ -481,18 +651,29 @@ static void *FTInitThread(void *ctx) {
     sleep(6);                                  // 等 backboardd 完全就绪（比 v2.2 更保守）
     FTDLogFmt("init thread start, stage=%d", g_stage);
 
-    if (g_stage >= 1) { if (!FTLoadSymbols()) goto done; }
+    if (g_stage >= 1) { if (!FTLoadSymbols())   goto done; }
     if (g_stage >= 2) { if (!FTLocateCallback()) goto done; }
-    if (g_stage >= 3) { if (!FTInstallHook())   goto done; }
-    if (g_stage >= 4) { FTSetupSocket(); }
+    if (g_stage >= 3) { if (!FTInstallHook())    goto done; }
+    if (g_stage >= 5) { FTSetupSocket(); }
 
     FTDLogFmt("stage %d init complete", g_stage);
+
+    // hook 命中体检：5 秒后若一次都没进回调，说明这个符号根本不在触摸路径上
+    if (g_stage >= 3) {
+        sleep(5);
+        FTDLogFmt("hook hits after 5s = %lu  (captured=%d, origOK=%d)",
+                  g_hits, g_captured ? 1 : 0, g_origOK ? 1 : 0);
+        if (g_hits == 0)
+            FTDLog("⚠️ 命中 0 次：hook 目标不在触摸事件路径上（不崩但无效），需换符号。"
+                   " 提示：屏幕上真实点几下再看这行。");
+    }
 
 done:
     // 存活确认：再撑 25 秒不崩 → 把 guard 标记为「本 stage 已验证安全」
     sleep(25);
     FTWriteGuard(g_stage, 0);
-    FTDLogFmt("SURVIVED 30s -> stage %d marked SAFE", g_stage);
+    FTDLogFmt("SURVIVED -> stage %d marked SAFE (hits=%lu captured=%d)",
+              g_stage, g_hits, g_captured ? 1 : 0);
     return NULL;
 }
 
@@ -503,7 +684,7 @@ static void FTBCtor(void) {
     const char *proc = getprogname();
     FILE *mk = fopen(g_logPath, "a");
     if (mk) {
-        fprintf(mk, "\n===== [BackboardInject v2.3] ctor pid=%d proc=%s =====\n",
+        fprintf(mk, "\n===== [BackboardInject v2.4] ctor pid=%d proc=%s =====\n",
                 (int)getpid(), proc ? proc : "?");
         fclose(mk);
     }
@@ -512,8 +693,8 @@ static void FTBCtor(void) {
     // 需要二分排查时手动降到 1/2/3）
     int st = FTReadIntFile(g_stageA, -1);
     if (st < 0) st = FTReadIntFile(g_stageB, -1);
-    if (st < 0) st = 4;
-    if (st > 4) st = 4;
+    if (st < 0) st = 3;                 // v2.4 默认 3：装 hook 但纯透传，先证明 hook 本身安全
+    if (st > 5) st = 5;
     g_stage = st;
 
     // 【开机自愈保险】本 stage 上次尝试过但没撑过 30 秒 → 判定为会崩，直接禁用

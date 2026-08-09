@@ -18,7 +18,13 @@ FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 FloatingTap_FRAMEWORKS = UIKit CoreGraphics
 FloatingTap_LDFLAGS = -lz
 
-# BackboardInject v2.3：backboardd 内注入（佳影同源架构）
+# BackboardInject v2.4：backboardd 内注入（佳影同源架构 + hook 前地址校验）
+#   4) v2.3 黑屏根因 = 盲信 MSFindSymbol 返回值。日志里 cbAddr=0x8a514a818d8268a4、
+#      orig=0xd051f08113efc000，高位异常、低 47 位也不像合法 image 地址
+#      → hook 装上后第一个 HID 事件进回调即崩（socket 那两行日志都没来得及打）。
+#      v2.4 对策：dladdr 校验 + ptrauth_strip + vm_read_overwrite 试读，
+#      三关任一不过就【拒绝 hook】；orig 另设 g_origOK 门禁，不合法宁可丢事件也不盲调。
+#      回调内严禁 fopen/malloc/syslog，只用预开 fd 的裸 write() 打探针。
 # 黑屏教训链：
 #   1) SafeProbe（ctor 只 fopen）→ 加载安全，实测不黑屏
 #   2) v2.1 黑屏根因 = ctor 里 dispatch_after_f（GCD API）
@@ -31,7 +37,8 @@ FloatingTap_LDFLAGS = -lz
 #   · 注入 = 直接调用原始回调把事件喂回 backboardd 管线（零客户端、零 SID 探测）
 #   · 全程零 GCD：socket 用阻塞 accept 线程，连点用独立 pthread
 #   · 开机自愈保险：崩一次→下次开机自动禁用（不用进安全模式）
-#   · 分级开关 /var/jb/tmp/ftb_stage（0关闭 1符号 2定位 3挂钩 4完整）
+#   · 分级开关 /var/jb/tmp/ftb_stage
+#     0关闭 1符号 2定位+校验 3挂钩纯透传(默认) 4加GetType捕获 5socket+注入
 # SB 侧 FTDaemonClient 协议不变（socket /var/jb/tmp/floatingtapd.sock）
 BackboardInject_FILES = BackboardInject.c
 BackboardInject_CFLAGS = -Wno-deprecated-declarations
