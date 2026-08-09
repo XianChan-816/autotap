@@ -18,19 +18,23 @@ FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 FloatingTap_FRAMEWORKS = UIKit CoreGraphics
 FloatingTap_LDFLAGS = -lz
 
-# BackboardInject v2.2：backboardd 内注入（佳影式，第二阶段）
-# 安全链已验证：
-#   1) SafeProbe（ctor 只 fopen）→ 加载安全，不黑屏（bb_safe_probe.log 实测）
-#   2) v2.1 黑屏根因 = ctor 里 dispatch_after_f（GCD API），违反报告 §三铁律
-# 本版：
-#   · constructor 只写日志（验证安全）
-#   · pthread_create 后台线程（纯 POSIX，ctor 阶段安全）sleep 3s 后初始化
-#   · 佳影同源事件构造（IOHIDEventCreateDigitizerEvent 字段与佳影 0xd46c 一致）
-#   · backboardd 进程内有 HID entitlement → DispatchEvent 应有效
-#   · 连续 50 次失败自动关 socket → SB 回退旧注入（防死锁）
+# BackboardInject v2.3：backboardd 内注入（佳影同源架构）
+# 黑屏教训链：
+#   1) SafeProbe（ctor 只 fopen）→ 加载安全，实测不黑屏
+#   2) v2.1 黑屏根因 = ctor 里 dispatch_after_f（GCD API）
+#   3) v2.2 黑屏根因 = 在 backboardd 内调用 IOHIDEventSystemClientCreate
+#      （backboardd 本身是 HID 服务端，自己连自己 → 死锁 → 看门狗杀进程）
+#      实锤：佳影导入表【没有】ClientCreate/DispatchEvent
+# 本版改为佳影真实路线：
+#   · MSHookFunction hook IOKit 私有函数 ___IOHIDServiceEventCallback
+#   · 真实触摸时捕获 (target, refcon, IOHIDServiceRef) 三件套
+#   · 注入 = 直接调用原始回调把事件喂回 backboardd 管线（零客户端、零 SID 探测）
+#   · 全程零 GCD：socket 用阻塞 accept 线程，连点用独立 pthread
+#   · 开机自愈保险：崩一次→下次开机自动禁用（不用进安全模式）
+#   · 分级开关 /var/jb/tmp/ftb_stage（0关闭 1符号 2定位 3挂钩 4完整）
 # SB 侧 FTDaemonClient 协议不变（socket /var/jb/tmp/floatingtapd.sock）
 BackboardInject_FILES = BackboardInject.c
-BackboardInject_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+BackboardInject_CFLAGS = -Wno-deprecated-declarations
 BackboardInject_FRAMEWORKS = CoreFoundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk

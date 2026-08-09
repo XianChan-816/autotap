@@ -1,8 +1,8 @@
 Package: com.floatingtap.tweak
 Name: FloatingTap
-Version: 2.2.0-bbprobe3
+Version: 2.3.0-hookcb
 Architecture: iphoneos-arm64
-Description: 全局悬浮球自动点击器（v2.2：BackboardInject 佳影式 backboardd 注入——pthread 延迟初始化防黑屏，同源构造高频连点；失败自动回退 SB 注入）
+Description: 全局悬浮球自动点击器（v2.3：佳影同源架构——hook IOKit ___IOHIDServiceEventCallback，复用真实 digitizer service 注入，零 HID 客户端；带开机自愈保险+分级开关）
 Maintainer: FloatingTap
 Author: FloatingTap
 Section: Tweaks

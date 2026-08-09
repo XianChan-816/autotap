@@ -1,9 +1,11 @@
 #!/bin/bash
-# FloatingTap postinst — v2.1
-# BackboardInject 是注入 backboardd 的 tweak（由 Dopamine/ellekit 自动加载），
-# 无需 launchctl。清理旧版独立 daemon（floatingtapd，v2.0 时代遗留，已废弃）。
+# FloatingTap postinst — v2.3
+# BackboardInject 注入 backboardd（Dopamine/ellekit 自动加载），无需 launchctl。
+#   · 清理 v2.0 时代遗留的独立 daemon（floatingtapd，已废弃）
+#   · 初始化分级开关 ftb_stage（默认 1 = 最保守的可用档）
+#   · 清空自愈保险 ftb_guard，给新版本一次干净的尝试机会
 LOG="/tmp/backboard_inject.log"
-echo "[postinst] v2.1: cleaning old floatingtapd daemon" >> "$LOG" 2>/dev/null || true
+echo "[postinst] v2.3 start" >> "$LOG" 2>/dev/null || true
 
 LC="/var/jb/usr/bin/launchctl"
 [ -x "$LC" ] || LC="launchctl"
@@ -12,5 +14,17 @@ rm -f /var/jb/usr/libexec/floatingtapd 2>>"$LOG" || true
 rm -f /var/jb/Library/LaunchDaemons/com.floatingtap.daemon.plist 2>>"$LOG" || true
 rm -f /var/jb/tmp/floatingtapd.sock 2>>"$LOG" || true
 
-echo "[postinst] v2.1 done (BackboardInject auto-loads into backboardd)" >> "$LOG" 2>/dev/null || true
+mkdir -p /var/jb/tmp 2>/dev/null || true
+
+# 分级开关：不存在才写默认值 4（完整功能，有自愈保险兜底）；保留用户手动设定的档位
+if [ ! -f /var/jb/tmp/ftb_stage ] && [ ! -f /tmp/ftb_stage ]; then
+  echo 4 > /var/jb/tmp/ftb_stage 2>/dev/null || true
+  echo 4 > /tmp/ftb_stage 2>/dev/null || true
+fi
+chmod 666 /var/jb/tmp/ftb_stage /tmp/ftb_stage 2>/dev/null || true
+
+# 自愈保险清零：新版本 = 新机会
+rm -f /var/jb/tmp/ftb_guard /tmp/ftb_guard 2>/dev/null || true
+
+echo "[postinst] v2.3 done (stage=$(cat /var/jb/tmp/ftb_stage 2>/dev/null || cat /tmp/ftb_stage 2>/dev/null || echo '?'), guard cleared)" >> "$LOG" 2>/dev/null || true
 exit 0
