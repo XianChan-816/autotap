@@ -25,8 +25,8 @@ mkdir -p /var/jb/tmp 2>/dev/null || true
 mkdir -p /var/jb/Library/FloatingTap 2>/dev/null || true
 
 # 分级开关：v2.7 起 stage 文件移到持久目录 /var/jb/Library/FloatingTap/（/var/jb/tmp 重启清空，
-# stage 是唯一不自愈的文件 -> 放 /tmp 会每次重启回退默认 3）。强制重置为 3。
-echo 3 > /var/jb/Library/FloatingTap/ftb_stage 2>/dev/null || true
+# stage 是唯一不自愈的文件 -> 放 /tmp 会每次重启回退默认 3）。v2.7.1 起默认 5（装完即高频）。
+echo 5 > /var/jb/Library/FloatingTap/ftb_stage 2>/dev/null || true
 chmod 666 /var/jb/Library/FloatingTap/ftb_stage 2>/dev/null || true
 
 # 自愈保险清零。guard 现在带 build id，新构建本就自动作废，这里只是顺手扫干净。

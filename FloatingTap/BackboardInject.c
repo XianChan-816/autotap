@@ -835,7 +835,7 @@ static void FTBCtor(void) {
 
     // 读 stage（持久目录 /Library/FloatingTap/ftb_stage，等价于 shell 侧 /var/jb/Library/FloatingTap/ftb_stage）
     int st = FTReadIntFile(g_stagePath, -1);
-    if (st < 0) st = 3;                 // 默认 3：装 hook 但纯透传，先证明 hook 本身安全
+    if (st < 0) st = 5;                 // v2.7.1 起默认 5：装完即高频（用户无法可靠用 Filza 改文件，直接默认到目标态）
     if (st > 5) st = 5;
     g_stage = st;
     FTWriteIntFile(g_stagePath, g_stage);   // 自愈：把当前 stage 写回持久目录，下次开机一定读得到
