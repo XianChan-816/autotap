@@ -10,29 +10,17 @@ export ARCHS = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = FloatingTap BackboardInject
+TWEAK_NAME = FloatingTap
 
-# FloatingTap：SB 侧悬浮球 + 连点（UI/交互 + socket 客户端）
-# v2.0: 增加 FTDaemonClient（socket 客户端，连点注入走 backboardd 内 BackboardInject）
-FloatingTap_FILES = Tweak.xm HIDInject.c FTDaemonClient.c
+# FloatingTap：SB 侧悬浮球 + 连点（UI/交互 + 连点引擎，纯 SB 注入）
+# ⚠️ v2.1 回退：BackboardInject（注入 backboardd）已移除——实测黑屏
+#（backboardd 注入即使延迟初始化仍有 ellekit/PAC 崩溃风险）。触摸注入
+# 回到绝对安全的 SB 进程内（崩 = 安全模式，永不黑屏）。
+# v2.0 的 FTDaemonClient（socket 客户端）一并移除——独立 daemon 无 HID
+# entitlement（dispatch 全 0x1），backboardd 注入黑屏，两条路都走不通。
+FloatingTap_FILES = Tweak.xm HIDInject.c
 FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 FloatingTap_FRAMEWORKS = UIKit CoreGraphics
 FloatingTap_LDFLAGS = -lz
 
-# BackboardInject：注入 backboardd 的触摸注入 dylib（v2.1 根治方案）
-# 参考佳影 BackboardService.dylib：在 backboardd 进程内部创建/派发 digitizer 事件，
-# 继承 backboardd 的系统 HID entitlement → dispatch 有效（独立 daemon 无 entitlement，
-# ret=0x1 被拒，floatingtapd v2.0-daemon1/2/3 全失败实锤）。
-# ⚠️ backboardd = 危险等级 1（报告 §三）：constructor 只写日志，IOHID 初始化延迟到
-# 主队列就绪后（BackboardInject.c 内 dispatch_after 重试），绝不能在 ctor 早期
-# dlopen/dispatch（BackboardProbe 黑屏事故）。
-BackboardInject_FILES = BackboardInject.c
-BackboardInject_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
-BackboardInject_FRAMEWORKS = CoreFoundation
-
 include $(THEOS_MAKE_PATH)/tweak.mk
-
-# ⚠️ 已移除：floatingtapd 独立 daemon（TOOL）——独立进程无 HID entitlement，
-# IOHIDEventSystemClientDispatchEvent 全 ret=0x1 被拒（v2.0-daemon1/2/3 实测）。
-# 触摸注入只能在 backboardd 进程内部做（继承其 entitlement），即 BackboardInject。
-# 同时移除：BackboardProbe（backboardd 内 constructor 早期初始化 → 黑屏，报告 §一）。
