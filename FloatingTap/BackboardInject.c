@@ -1,25 +1,25 @@
 //
-//  FloatingTapDaemon.c — FloatingTap v2 独立注入 daemon（纯 C，Unix socket IPC）
+//  BackboardInject.c — FloatingTap v2 注入 backboardd 的触摸注入 dylib（纯 C）
 //
-//  目的（根治连点断连/顶掉问题，对应构建安全报告 §七.2 首选路线）：
-//    · 独立 launchd daemon 进程持有 IOHIDEventSystemClient + DispatchEvent，
-//      不在 SB 进程内注入 → 不参与 SB 手势窗口路由 → 崩了只崩 daemon 自己。
-//    · daemon 进程内用【真实 digitizer 服务 SID（registryID）】注入，
-//      系统把合成事件当真实触摸 → 不顶掉用户手指 → 不需要 SID 探测。
-//    · SB 端 tweak 通过 Unix socket（/var/jb/run/floatingtapd.sock）通知 daemon：
-//      开始连点(坐标+间隔)/停止连点/单次 tap/设置 SID。daemon 内部用 dispatch
-//      timer 高频注入。
+//  参考佳影 BackboardService.dylib 逆向结论（2026-08-09）：
+//    佳影 = BackboardService.dylib 直接注入 backboardd 进程内部（Filter:
+//    com.apple.backboardd + backboardd）。dylib 运行在 backboardd 上下文，
+//    继承 backboardd 的系统 HID entitlement → IOHIDEventSystemClientDispatchEvent
+//    才有效（独立 daemon 进程无此 entitlement，ret=0x1 被拒——floatingtapd
+//    v2.0-daemon1/2/3 全失败的根因）。
+//    事件结构用 IOHIDEventCreateDigitizerEvent/FingerEvent/AppendEvent 系列
+//    （佳影符号表确认同款），与真实触摸同源 → 不顶掉用户手指 → 无需 SID 探测。
 //
-//  ⚠️ IPC 选型：Unix domain socket（而非 XPC）——XPC event handler 强制 block，
-//     而 SB 侧注入 dylib 受「零 ObjC 元数据 / 无 block」铁律约束（arm64e PAC）。
-//     daemon 是独立进程，本身无此限制，但保持同一纯 C 风格便于维护。
+//  本文件 = 独立 daemon 引擎(FloatingTapDaemon.c) 改造为注入 dylib：
+//    · constructor 只写日志（报告 §三铁律：backboardd 危险等级 1，ctor 严禁
+//      dlopen/dispatch/API 调用——否则黑屏）。
+//    · IOHID client 创建 + socket 监听延迟到主队列就绪后（dispatch_after 主队列
+//      3 次重试：2s/6s/15s），完全对齐报告 §三「危险等级 1 要求」。
+//    · socket 路径 /var/jb/tmp/floatingtapd.sock 不变 → SB 侧 FTDaemonClient 零改动。
+//    · 协议不变：ping/start x y ms/stop/tap x y/set_sid 0x...（一行一条）。
 //
-//  协议（一行一条）：
-//    "ping\n"            → 回 "pong\n"
-//    "start x y ms\n"    → 开始连点（x/y 归一化 0~1）
-//    "stop\n"            → 停止连点
-//    "tap x y\n"         → 单次 tap（诊断）
-//    "set_sid 0x...\n"   → 设置注入 SID（可选）
+//  ⚠️ 铁律：注入 backboardd 后，本 dylib 与系统触摸分发核心同进程——任何崩溃
+//      = 黑屏。所有操作必须保守：非阻塞 socket、纯 C、日志先行。
 //
 
 #include <stdio.h>
@@ -60,7 +60,7 @@ enum {
 };
 
 static const char *g_sockPath = "/var/jb/tmp/floatingtapd.sock";
-static const char *g_logPath = "/tmp/floatingtap_daemon.log";
+static const char *g_logPath = "/tmp/backboard_inject.log";
 
 // MARK: - 私有函数指针（dlopen 动态解析）
 
@@ -105,7 +105,7 @@ static void FTDLog(const char *msg) {
     snprintf(line, sizeof(line), "[%.1f] %s", t, msg);
     FILE *f = fopen(g_logPath, "a");
     if (f) { fprintf(f, "%s\n", line); fclose(f); }
-    syslog(LOG_ERR, "floatingtapd: %s", msg);
+    syslog(LOG_ERR, "BackboardInject: %s", msg);
 }
 
 static void FTDLogFmt(const char *fmt, ...) {
@@ -242,8 +242,18 @@ static void FTDDispatch(FT_IOHIDEventRef ev) {
     if (p_IOHIDEventSetIntegerValue) p_IOHIDEventSetIntegerValue(ev, 0x0B0018, (int64_t)sid);
     FT_IOReturn ret = p_IOHIDEventSystemClientDispatchEvent(g_client, ev);
     if (ret != FT_kIOReturnSuccess) {
+        // ⚠️ 连续失败保护：backboardd 内 dispatch 若持续被拒（ret=0x1），说明该
+        // 方案在本进程无效（或 SID 仍不被认领）。累计 ≥50 次失败 → 关闭 socket，
+        // 让 SB 侧 FTDaemonPing 失败 → 自动回退旧 SB 注入路径（至少能点）。
+        // 避免"daemon 模式但零点击"的死锁。
         static int sFail = 0;
         if ((sFail++ % 20) == 0) FTDLogFmt("dispatch ret=0x%x", (unsigned)ret);
+        if (sFail >= 50 && g_listenFd >= 0) {
+            FTDLog("dispatch failed 50x - closing socket, SB will fallback");
+            close(g_listenFd);
+            g_listenFd = -1;
+            unlink(g_sockPath);
+        }
     }
     CFRelease(ev);
 }
@@ -438,21 +448,55 @@ static int FTDSetupSocket(void) {
     return 0;
 }
 
-// MARK: - 入口
+// MARK: - 延迟初始化（constructor 只写日志，IOHID 初始化延迟到主队列就绪）
+// ⚠️ backboardd 危险等级 1（报告 §三）：constructor 阶段 dlopen/dispatch/API
+// 调用会黑屏（BackboardProbe 事故）。必须延迟到进程就绪后。
+// 用 dispatch_after 主队列重试：2s/6s/15s，每次检查 client 是否建立成功。
 
-int main(int argc, char **argv) {
-    (void)argc; (void)argv;
-    // 客户端 fire-and-forget 后可能立即断开：写 reply 触发 SIGPIPE 会杀死 daemon，
+static void FTBInitOnce(void *ctx) {
+    (void)ctx;
+    if (g_client) return;
+    // 客户端 fire-and-forget 后可能立即断开：写 reply 触发 SIGPIPE 会杀死进程，
     // 必须忽略（write 返回 EPIPE 即可）。
     signal(SIGPIPE, SIG_IGN);
-    FTDLogFmt("floatingtapd start pid=%d", getpid());
-    if (!FTLoadSymbols()) return 0;
+    if (!FTLoadSymbols()) { FTDLog("init: symbol load failed"); return; }
     g_client = p_IOHIDEventSystemClientCreate(kCFAllocatorDefault);
-    if (!g_client) { FTDLog("client create failed"); return 0; }
+    if (!g_client) { FTDLog("init: client create failed (retry later)"); return; }
     FTEnumerateServices();
-    FTDLogFmt("client ready, registrySID=0x%llx", (unsigned long long)g_registrySID);
-    if (FTDSetupSocket() != 0) { FTDLog("socket setup failed"); return 0; }
-    FTDLog("daemon ready");
-    dispatch_main(); // never returns
-    return 0;
+    FTDLogFmt("init: client ready, registrySID=0x%llx", (unsigned long long)g_registrySID);
+    if (FTDSetupSocket() != 0) { FTDLog("init: socket setup failed"); return; }
+    FTDLog("BackboardInject ready (inject in backboardd)");
+}
+
+static void FTBRetry2(void *ctx) {
+    (void)ctx;
+    FTBInitOnce(NULL);
+    if (!g_client) {
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                         dispatch_get_main_queue(), NULL, FTBRetry3);
+    }
+}
+
+static void FTBRetry3(void *ctx) {
+    (void)ctx;
+    FTBInitOnce(NULL);
+}
+
+__attribute__((constructor))
+static void FTBBackboardCtor(void) {
+    // ⚠️ 铁律（报告 §三 + 黑屏事故）：constructor 阶段【只写文件日志】。
+    // 严禁 dlopen / dispatch / IOKit API / ObjC——backboardd 加载早期
+    // IOKit/GCD 未就绪，任何一步崩 = backboardd 启动失败 = 整机黑屏。
+    FILE *mk = fopen("/tmp/backboard_inject.log", "a");
+    if (mk) {
+        fprintf(mk, "[BackboardInject] ctor pid=%d proc=%s\n", getpid(), getprogname() ? getprogname() : "?");
+        fclose(mk);
+    }
+    // 排延迟初始化（主队列，backboardd 就绪后执行）
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), NULL, FTBInitOnce);
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), NULL, FTBRetry2);
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)),
+                     dispatch_get_main_queue(), NULL, FTBRetry3);
 }

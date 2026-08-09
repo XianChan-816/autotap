@@ -1,25 +1,16 @@
 #!/bin/bash
-# FloatingTap postinst — 启动 floatingtapd 独立注入 daemon（尽力而为，失败不阻塞安装）
-# ⚠️ daemon 崩不影响系统（独立进程）；SB 侧 FTDaemonSpawn() 也会兜底拉起。
-# rootless 下 LaunchDaemons plist 实际位于 /var/jb/Library/LaunchDaemons/
-# Dopamine 的 launchctl 在 /var/jb/usr/bin/launchctl（PATH 可能没有 /var/jb/usr/bin）
+# FloatingTap postinst — v2.1
+# BackboardInject 是注入 backboardd 的 tweak（由 Dopamine/ellekit 自动加载），
+# 无需 launchctl。清理旧版独立 daemon（floatingtapd，v2.0 时代遗留，已废弃）。
+LOG="/tmp/backboard_inject.log"
+echo "[postinst] v2.1: cleaning old floatingtapd daemon" >> "$LOG" 2>/dev/null || true
 
-LOG="/tmp/floatingtap_daemon.log"
-echo "[postinst] start" >> "$LOG" 2>/dev/null || true
-
-# launchctl 完整路径（rootless）
 LC="/var/jb/usr/bin/launchctl"
 [ -x "$LC" ] || LC="launchctl"
-
-PLIST="/var/jb/Library/LaunchDaemons/com.floatingtap.daemon.plist"
-
-# 先卸载旧实例（幂等），再加载新的
 "$LC" bootout system/com.floatingtap.daemon 2>>"$LOG" || true
-"$LC" bootstrap system "$PLIST" 2>>"$LOG" || {
-  echo "[postinst] bootstrap failed, will rely on SB-side spawn" >> "$LOG" 2>/dev/null || true
-}
-"$LC" kickstart -k system/com.floatingtap.daemon 2>>"$LOG" || true
+rm -f /var/jb/usr/libexec/floatingtapd 2>>"$LOG" || true
+rm -f /var/jb/Library/LaunchDaemons/com.floatingtap.daemon.plist 2>>"$LOG" || true
+rm -f /var/jb/tmp/floatingtapd.sock 2>>"$LOG" || true
 
-echo "[postinst] done" >> "$LOG" 2>/dev/null || true
-
+echo "[postinst] v2.1 done (BackboardInject auto-loads into backboardd)" >> "$LOG" 2>/dev/null || true
 exit 0

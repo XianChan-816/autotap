@@ -5,36 +5,34 @@
 
 export THEOS_PACKAGE_SCHEME = rootless
 export TARGET := iphone:clang:latest:15.0
-# 必须 arm64 arm64e 双架构：M1 的 SpringBoard 是 arm64e 进程，纯 arm64 无法注入。
+# 必须 arm64 arm64e 双架构：M1 的 SpringBoard/backboardd 是 arm64e 进程，纯 arm64 无法注入。
 export ARCHS = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = FloatingTap
+TWEAK_NAME = FloatingTap BackboardInject
 
-# FloatingTap：SB 侧悬浮球 + 连点（现有逻辑）
-# v2.0: 增加 FTDaemonClient（XPC 客户端，连点注入走独立 daemon floatingtapd）
+# FloatingTap：SB 侧悬浮球 + 连点（UI/交互 + socket 客户端）
+# v2.0: 增加 FTDaemonClient（socket 客户端，连点注入走 backboardd 内 BackboardInject）
 FloatingTap_FILES = Tweak.xm HIDInject.c FTDaemonClient.c
 FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 FloatingTap_FRAMEWORKS = UIKit CoreGraphics
 FloatingTap_LDFLAGS = -lz
-# XPC 是系统库（libxpc），Tweak 链接不需要额外框架；libSystem 自带
+
+# BackboardInject：注入 backboardd 的触摸注入 dylib（v2.1 根治方案）
+# 参考佳影 BackboardService.dylib：在 backboardd 进程内部创建/派发 digitizer 事件，
+# 继承 backboardd 的系统 HID entitlement → dispatch 有效（独立 daemon 无 entitlement，
+# ret=0x1 被拒，floatingtapd v2.0-daemon1/2/3 全失败实锤）。
+# ⚠️ backboardd = 危险等级 1（报告 §三）：constructor 只写日志，IOHID 初始化延迟到
+# 主队列就绪后（BackboardInject.c 内 dispatch_after 重试），绝不能在 ctor 早期
+# dlopen/dispatch（BackboardProbe 黑屏事故）。
+BackboardInject_FILES = BackboardInject.c
+BackboardInject_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+BackboardInject_FRAMEWORKS = CoreFoundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk
 
-# ---- floatingtapd：独立注入 daemon（v2.0 根治方案） ----
-# 独立 launchd daemon 进程持有 IOHIDEventSystemClient + DispatchEvent，
-# 不在 SB 进程内注入 → 不参与 SB 手势窗口路由 → 崩了只崩 daemon 自己。
-# 对应构建安全报告 §七.2 首选路线（独立 daemon 验证"不顶掉"）。
-TOOL_NAME = floatingtapd
-
-floatingtapd_FILES = FloatingTapDaemon.c
-floatingtapd_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
-floatingtapd_FRAMEWORKS = CoreFoundation
-floatingtapd_INSTALL_PATH = /usr/libexec
-
-include $(THEOS_MAKE_PATH)/tool.mk
-
-# ⚠️ BackboardProbe（backboardd 内注入原型）已从构建中移除——
-# 它在 constructor 早期 dlopen+dispatch 导致 backboardd 启动失败 → 整机黑屏
-#（见 FloatingTap构建安全报告 §一）。注入验证一律走 floatingtapd 独立 daemon。
+# ⚠️ 已移除：floatingtapd 独立 daemon（TOOL）——独立进程无 HID entitlement，
+# IOHIDEventSystemClientDispatchEvent 全 ret=0x1 被拒（v2.0-daemon1/2/3 实测）。
+# 触摸注入只能在 backboardd 进程内部做（继承其 entitlement），即 BackboardInject。
+# 同时移除：BackboardProbe（backboardd 内 constructor 早期初始化 → 黑屏，报告 §一）。
