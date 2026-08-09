@@ -38,6 +38,35 @@
 #import <CoreGraphics/CoreGraphics.h>
 
 #include "HIDInject.h"
+#include "FTDaemonClient.h"
+
+// FTLog 定义于文件后部（诊断日志），此处前向声明供 daemon 探测函数使用
+static void FTLog(const char *msg);
+
+// MARK: - v2.0 daemon 注入开关
+// 根治方案：连点注入优先走独立 daemon（floatingtapd，Unix socket IPC）。
+// daemon 在独立进程内用真实 digitizer SID 注入 → 不顶掉用户手指 → 不需要
+// SID 探测/verify/stab/残留清理（那些都是 SB 端注入的权宜之计）。
+// 运行策略：
+//   0 = 未探测（首次连点前 ping 一次）；
+//   1 = daemon 可用（连点走 daemon 注入，跳过 SB 端整套探测/残留逻辑）；
+//   -1 = daemon 不可用（回退旧 SB 端注入路径）。
+static int g_DaemonMode = 0;
+static int g_DaemonProbed = 0;
+
+// 探测 daemon 是否可用（只测一次，结果缓存）。失败回退 SB 注入，不影响使用。
+static int FTDaemonProbe(void) {
+    if (g_DaemonProbed) return g_DaemonMode;
+    g_DaemonProbed = 1;
+    if (FTDaemonPing()) {
+        g_DaemonMode = 1;
+        FTLog("daemon available - clicking via daemon");
+    } else {
+        g_DaemonMode = -1;
+        FTLog("daemon unavailable - fallback to SB inject");
+    }
+    return g_DaemonMode;
+}
 
 // MARK: - objc_msgSend 类型化函数指针（ARM64 下结构体参数需与目标方法签名一致）
 
@@ -820,8 +849,22 @@ static void FTRaiseResidualUps(void);
 
 // v1.0.48：SB 端恢复直接注入（不再写任务文件）。坐标锁定 = App 配置点（v1.0.50）
 // 或长按开始时球心（无配置时）。
+// v2.0：连点注入优先走独立 daemon（floatingtapd）——daemon 在独立进程内注入，
+// 不参与 SB 手势窗口路由、用真实 digitizer SID → 不顶掉用户手指 → 无需探测。
 static void FTStartClicking(void) {
     if (gIsClicking) return;
+    // v2.0：daemon 可用时走 daemon 注入（一碰即点，无 SB 端探测/残留开销）
+    if (FTDaemonProbe() == 1) {
+        gIsClicking = YES;
+        gClickCount = 0;
+        if (gClickLockX < 0.001) gClickLockX = 0.001; if (gClickLockX > 0.999) gClickLockX = 0.999;
+        if (gClickLockY < 0.001) gClickLockY = 0.001; if (gClickLockY > 0.999) gClickLockY = 0.999;
+        double ms = FTIntervalMs();
+        FTDaemonStartClicking(gClickLockX, gClickLockY, ms);
+        FTApplyGRModes();
+        FTLog("clicking started via daemon");
+        return;
+    }
     if (!FT_HIDConnect()) {
         FTLog("clicking failed: HID connect failed");
         return;
@@ -996,6 +1039,15 @@ static void FTStopClicking(const char *reason) {
     if (!gIsClicking) return;
     gIsClicking = NO;
     gStopGracePending = NO; // 取消任何待决的松手宽限
+    // v2.0：daemon 路径 → 通知 daemon 停止，恢复手势，无需 SB 端残留清理
+    if (g_DaemonProbed && g_DaemonMode == 1) {
+        FTDaemonStopClicking();
+        FTApplyGRModes();
+        char dbgD[96];
+        snprintf(dbgD, sizeof(dbgD), "clicking stopped via daemon (%s)", reason ? reason : "?");
+        FTLog(dbgD);
+        return;
+    }
     // ⚠️ v1.0.132（ctor-29 实锤）：touches-ended 停止【保留 verify】——让定时器到期裁决
     // 「该轮是否有送达回流」（g_VerifySawSynthetic）：顶掉循环（无回流）→ 淘汰 SID；
     // 快速短按（有回流）→ 保持锁定。v1.0.129 epoch 保护：用户松手后 0.8s 内重按 →

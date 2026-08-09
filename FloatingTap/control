@@ -1,8 +1,8 @@
 Package: com.floatingtap.tweak
 Name: FloatingTap
-Version: 2.0.0-bbprobe1
+Version: 2.0.0-daemon1
 Architecture: iphoneos-arm64
-Description: 全局悬浮球自动点击器（v2 原型：backboardd 源头注入验证——不顶掉用户手指）
+Description: 全局悬浮球自动点击器（v2.0：独立 daemon 注入——根治顶掉/断连，不再依赖 SID 探测）
 Maintainer: FloatingTap
 Author: FloatingTap
 Section: Tweaks

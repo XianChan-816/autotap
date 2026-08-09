@@ -10,18 +10,31 @@ export ARCHS = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
-TWEAK_NAME = FloatingTap BackboardProbe
+TWEAK_NAME = FloatingTap
 
 # FloatingTap：SB 侧悬浮球 + 连点（现有逻辑）
-FloatingTap_FILES = Tweak.xm HIDInject.c
+# v2.0: 增加 FTDaemonClient（XPC 客户端，连点注入走独立 daemon floatingtapd）
+FloatingTap_FILES = Tweak.xm HIDInject.c FTDaemonClient.c
 FloatingTap_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 FloatingTap_FRAMEWORKS = UIKit CoreGraphics
 FloatingTap_LDFLAGS = -lz
-
-# BackboardProbe：backboardd 进程内 IOHID 注入最小原型（v2.0 方向验证）
-# 目的：验证「在触摸分发源头(backboardd)注入 → 系统当真实触摸 → 不顶掉用户手指」
-BackboardProbe_FILES = BackboardProbe.c
-BackboardProbe_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
-BackboardProbe_FRAMEWORKS = CoreFoundation
+# XPC 是系统库（libxpc），Tweak 链接不需要额外框架；libSystem 自带
 
 include $(THEOS_MAKE_PATH)/tweak.mk
+
+# ---- floatingtapd：独立注入 daemon（v2.0 根治方案） ----
+# 独立 launchd daemon 进程持有 IOHIDEventSystemClient + DispatchEvent，
+# 不在 SB 进程内注入 → 不参与 SB 手势窗口路由 → 崩了只崩 daemon 自己。
+# 对应构建安全报告 §七.2 首选路线（独立 daemon 验证"不顶掉"）。
+TOOL_NAME = floatingtapd
+
+floatingtapd_FILES = FloatingTapDaemon.c
+floatingtapd_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+floatingtapd_FRAMEWORKS = CoreFoundation
+floatingtapd_INSTALL_PATH = /usr/libexec
+
+include $(THEOS_MAKE_PATH)/tool.mk
+
+# ⚠️ BackboardProbe（backboardd 内注入原型）已从构建中移除——
+# 它在 constructor 早期 dlopen+dispatch 导致 backboardd 启动失败 → 整机黑屏
+#（见 FloatingTap构建安全报告 §一）。注入验证一律走 floatingtapd 独立 daemon。
